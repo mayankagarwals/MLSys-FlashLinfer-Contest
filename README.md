@@ -20,6 +20,10 @@ Create high-performance GPU kernels for state-of-the-art LLM architectures on NV
 
 [FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) is our official framework to evaluate your AI-generated kernels.
 
+## Updates
+
+* 2026.02.05: Full dataset for definitions and workloads are released at [HuggingFace](https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest)
+
 ## Competition Tracks
 
 The competition features three tracks, each targeting a critical LLM operation:
