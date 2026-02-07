@@ -1,231 +1,146 @@
-# [FlashInfer AI Kernel Generation Contest @ MLSys 2026](http://mlsys26.flashinfer.ai/)
+# FlashInfer Competition Starter (Fast Local Iteration)
 
-Create high-performance GPU kernels for state-of-the-art LLM architectures on NVIDIA Blackwell GPUs with humans and/or AI agents.
+This repo is set up for fast local benchmarking with `uv` and `flashinfer-bench`.
 
----
-
-<p align="center">
-  <a href="https://www.nvidia.com"><img src="images/nvidia-logo.svg" alt="NVIDIA" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://modal.com"><img src="images/modal-logo.png" alt="Modal" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://mlsys.org"><img src="images/mlsys-logo.svg" alt="MLSys" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/flashinfer-ai/flashinfer"><img src="images/flashinfer-logo.png" alt="FlashInfer" height="50"/></a>
-  &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/flashinfer-ai/flashinfer-bench"><img src="images/fib_logo.png" alt="FlashInfer-Bench" height="50"/></a>
-</p>
+Working examples in this repo:
+- Triton MoE: `solution/triton/moe_le_fused_entry.py`
+- Pure Python GDN decode: `solution/python/gdn_decode_reference.py`
 
 ---
 
-[FlashInfer-Bench](https://github.com/flashinfer-ai/flashinfer-bench) is our official framework to evaluate your AI-generated kernels.
-
-## Updates
-
-* 2026.02.05: Full dataset for definitions and workloads are released at [HuggingFace](https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest)
-
-## Competition Tracks
-
-The competition features three tracks, each targeting a critical LLM operation:
-
-| Track | Description |
-|-------|-------------|
-| **fused_moe** | Fused Mixture-of-Experts kernel for efficient expert routing and computation |
-| **sparse_attention** | Sparse attention mechanisms for long-context inference |
-| **gated_delta_net** | Gated delta network operations for efficient state updates |
-
-**Fork this template once per track** you want to compete in (separate repos for each track).
-
-## Getting Started
-
-### 1. Fork This Template
-
-Click "Use this template" or fork this repository to create your solution repo.
-
-### 2. Install Dependencies
+## 1) Quick Setup (uv)
 
 ```bash
-conda create -n fi-bench python=3.12
-conda activate fi-bench
-pip install flashinfer-bench modal
+uv venv
+uv pip install flashinfer-bench
 ```
 
-### 3. Download the TraceSet
-
-We provide kernel definitions and workloads in [FlashInfer-Trace format](https://bench.flashinfer.ai/docs/flashinfer-trace). Clone the competition dataset from HuggingFace:
+If you hit `No module named 'flashinfer_bench.agents'`:
 
 ```bash
-git lfs install
-git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest
+uv pip install git+https://github.com/flashinfer-ai/flashinfer-bench.git
 ```
 
-Set the environment variable:
+Set dataset path:
 
 ```bash
-export FIB_DATASET_PATH=/path/to/flashinfer-trace
+export FIB_DATASET_PATH=/home/simon/flashinfer-competition/mlsys26-contest
 ```
 
-### 4. Configure Your Solution
+Run benchmark:
 
-Edit `config.toml` to set your track and team info:
+```bash
+uv run python scripts/run_local.py
+```
+
+---
+
+## 2) Working Workload Examples
+
+## A) MoE (Triton)
+
+File:
+- `solution/triton/moe_le_fused_entry.py`
+
+Config:
 
 ```toml
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "moe-triton-example"
+definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+author = "team-name"
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "triton"
+entry_point = "moe_le_fused_entry.py::kernel"
 ```
 
-### 5. Implement Your Kernel
-
-**For Triton:**
-Edit `solution/triton/kernel.py` with your implementation.
-
-**For CUDA:**
-Edit `solution/cuda/kernel.cu` and `solution/cuda/binding.py` with your implementation.
-
-## Development Workflow
-
-### Pack Your Solution
-
-Generate `solution.json` from your source files:
+Mini benchmark:
 
 ```bash
-python scripts/pack_solution.py
+FIB_DATASET_PATH=$PWD/mini_datasets/moe_single uv run python scripts/run_local.py
 ```
 
-### Run Local Benchmarks
-
-Test your solution on your local GPU:
+Full benchmark:
 
 ```bash
-python scripts/run_local.py
+FIB_DATASET_PATH=/home/simon/flashinfer-competition/mlsys26-contest uv run python scripts/run_local.py
 ```
 
-Requires: Local CUDA-capable GPU and `FIB_DATASET_PATH` environment variable.
+How to add a new Triton workload:
+1. Put the entry file directly in `solution/triton/`.
+2. Implement callable matching destination-passing style (`inputs..., outputs...`) unless you intentionally switch style.
+3. Set exact definition name and `entry_point = "<file>.py::<fn>"` in `config.toml`.
 
-### Run Cloud Benchmarks (Modal)
+## B) GDN Decode (Pure Python)
 
-Test your solution on NVIDIA B200 GPUs via Modal:
+File:
+- `solution/python/gdn_decode_reference.py`
 
-**One-time setup:**
+Config:
+
+```toml
+[solution]
+name = "gdn-decode-python-reference"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "team-name"
+
+[build]
+language = "python"
+entry_point = "gdn_decode_reference.py::run"
+destination_passing_style = false
+```
+
+Mini benchmark:
 
 ```bash
-modal setup
-modal volume create flashinfer-trace
-modal volume put flashinfer-trace /path/to/flashinfer-trace
+FIB_DATASET_PATH=$PWD/mini_datasets/gdn_decode_single uv run python scripts/run_local.py
 ```
 
-**Run benchmark:**
+Full benchmark:
 
 ```bash
-modal run scripts/run_modal.py
+FIB_DATASET_PATH=/home/simon/flashinfer-competition/mlsys26-contest uv run python scripts/run_local.py
 ```
 
-## Submission
+How to add a new Python workload:
+1. Put file directly in `solution/python/`.
+2. For value-returning mode, set `destination_passing_style = false` and return outputs as `tuple` for multi-output definitions.
+3. Set exact definition name and `entry_point = "<file>.py::<fn>"`.
 
-To submit your solution for evaluation:
+---
 
-1. Ensure your implementation is complete and tested
-2. Run `python scripts/pack_solution.py` to generate `solution.json`
-3. Commit and push your changes
-4. Tag your commit for evaluation (e.g., `git tag submission-v1`)
+## 3) How Mini-Benchmarks Were Created
 
-## Project Structure
+Each mini dataset keeps one definition + one workload line for fast debugging.
 
-```
-flashinfer-bench-starter-kit/
-├── README.md                    # This file
-├── config.toml                  # Track configuration (edit this)
-├── solution/                    # Solution source files
-│   ├── triton/                  # Triton implementation
-│   │   └── kernel.py           # Your Triton kernel
-│   └── cuda/                    # CUDA implementation
-│       ├── kernel.cu           # Your CUDA kernel
-│       └── binding.py          # TVM FFI bindings
-├── scripts/                     # Utility scripts
-│   ├── run_local.py            # Local benchmark runner
-│   ├── run_modal.py            # Modal cloud benchmark runner
-│   └── pack_solution.py        # Pack source files into solution.json
-└── images/                      # Sponsor logos
+Template:
+
+```bash
+NAME=<definition_name>
+OP=<op_dir>  # e.g. moe, gdn, dsa_paged
+ROOT=mini_datasets/${NAME}_single
+SRC=/home/simon/flashinfer-competition/mlsys26-contest
+
+mkdir -p "$ROOT/definitions/$OP" "$ROOT/workloads/$OP"
+cp "$SRC/definitions/$OP/$NAME.json" "$ROOT/definitions/$OP/"
+head -n 1 "$SRC/workloads/$OP/$NAME.jsonl" > "$ROOT/workloads/$OP/$NAME.jsonl"
+ln -sfn "$SRC/blob" "$ROOT/blob"
 ```
 
-## Additional Resources
+Why the `blob` symlink matters:
+- workload JSONL references `./blob/...`; without this symlink, safetensor inputs fail to load.
 
-### Solution Handling API
+---
 
-```python
-from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files, extract_solution_to_files
+## 4) Keep in Mind
 
-# Pack source files into a Solution object
-spec = BuildSpec(
-    language="triton",  # or "cuda"
-    target_hardware=["cuda"],
-    entry_point="my_kernel",
-)
-solution = pack_solution_from_files(
-    path="./my_solution_dir",
-    spec=spec,
-    name="my_solution_v1",
-    definition="fused_moe",
-    author="your_name",
-)
-
-# Extract a Solution to files in a working directory
-extract_solution_to_files(solution, "./output_dir")
-```
-
-### Running Sanitizers
-
-```python
-from flashinfer_bench.agents import flashinfer_bench_run_sanitizer
-
-output = flashinfer_bench_run_sanitizer(
-    solution=solution,
-    workload=workload,
-    sanitizer_types=["memcheck", "racecheck", "synccheck", "initcheck"],
-    timeout=300,
-)
-print(output)
-```
-
-### NCU Profiling
-
-```python
-from flashinfer_bench.agents import flashinfer_bench_run_ncu
-
-output = flashinfer_bench_run_ncu(
-    solution=solution,
-    workload=workload,
-    set="detailed",
-    page="details",
-    timeout=120,
-)
-print(output)
-```
-
-### List Available Tools
-
-```python
-from flashinfer_bench.agents import get_all_tool_schemas
-
-schemas = get_all_tool_schemas()
-# Returns list of OpenAI-compatible function schemas
-```
-
-## Notes
-
-### Kernel Signature Requirements
-
-When implementing kernels using Destination Passing Style (DPS), ensure you specify the kernel signature type in your `BuildSpec` and adjust the build configuration accordingly.
-
-**Important:** Avoid using variadic input arguments in your kernel signatures, as they will fail the builder validation check.
-
-### CUDA Kernel Bindings
-
-For CUDA kernel implementations, we recommend using [TVM FFI](https://tvm.apache.org/ffi/) for Python bindings. The `flashinfer_bench.agents` module provides TVM FFI agent instruction prompts to assist with development.
+- `definition` must be an exact dataset definition name (no aliases like `fused_moe`).
+- `entry_point` format is strict: `"<file_path>::<function_name>"`.
+- `scripts/pack_solution.py` packs top-level files only (non-recursive) in language folder.
+- Status meanings:
+  - `RUNTIME_ERROR`: callable or kernel crashed.
+  - `COMPILE_ERROR`: build/signature mismatch.
+  - `INCORRECT_NUMERICAL`: runs, but incorrect outputs.
+  - `PASSED`: correctness check passed.
+- Trace details are written under `FIB_DATASET_PATH/traces/...`.
