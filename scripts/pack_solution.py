@@ -2,7 +2,7 @@
 Pack solution source files into solution.json.
 
 Reads configuration from config.toml and packs the appropriate source files
-(Triton or CUDA) into a Solution JSON file for submission.
+(Python, Triton, or CUDA) into a Solution JSON file for submission.
 """
 
 import sys
@@ -42,7 +42,9 @@ def pack_solution(output_path: Path = None) -> Path:
     entry_point = build_config["entry_point"]
 
     # Determine source directory based on language
-    if language == "triton":
+    if language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "python"
+    elif language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
@@ -52,11 +54,14 @@ def pack_solution(output_path: Path = None) -> Path:
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
+    destination_passing_style = build_config.get("destination_passing_style", True)
+
     # Create build spec
     spec = BuildSpec(
         language=language,
         target_hardware=["cuda"],
         entry_point=entry_point,
+        destination_passing_style=destination_passing_style,
     )
 
     # Pack the solution
@@ -78,6 +83,7 @@ def pack_solution(output_path: Path = None) -> Path:
     print(f"  Definition: {solution.definition}")
     print(f"  Author: {solution.author}")
     print(f"  Language: {language}")
+    print(f"  Destination Passing Style: {destination_passing_style}")
 
     return output_path
 
