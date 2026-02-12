@@ -23,6 +23,16 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
+
+
+# ============================================================================
+# Constants
+# ============================================================================
+LN2 = 0.6931471805599453
+LOG2E = 1.4426950408889634
+
 
 # ============================================================================
 # Global configuration for PRETRANSPOSE version ([B*HV, V, K])
@@ -32,6 +42,39 @@ TILE_K = 128
 NUM_STAGES = 2
 NUM_THREADS = 128  # 4 warps
 NUM_BLOCKS_PER_STATE = 8
+
+
+# ============================================================================
+# Small PTX wrappers
+# ============================================================================
+@dsl_user_op
+def ex2(a: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            "ex2.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def lg2(a: float | cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            "lg2.approx.f32 $0, $1;",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 
 @cute.kernel
@@ -184,9 +227,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
         if beta_x <= softplus_threshold:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
             # Compute in Float32
-            exp_beta_x = cute.exp(beta_x, fastmath=True)
+            exp_beta_x = ex2(beta_x * LOG2E)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
+            log_result = cutlass.Float32(lg2(log_input) * LN2)
             softplus_x = cutlass.Float32(
                 (cutlass.Float32(1.0) / softplus_beta) * log_result
             )
@@ -194,13 +237,13 @@ def gdn_decode_kernel_small_batch_pretranspose(
             softplus_x = x
 
         # Compute g = exp(A_log) * softplus_x
-        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+        r_g_value = -ex2(r_A_log * LOG2E) * softplus_x
 
         # Compute beta = 1 / (1 + exp(-b))
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+        r_beta = 1.0 / (1.0 + ex2((-r_b) * LOG2E))
 
         # Store to scalar (Float32)
-        r_g = cute.exp(r_g_value, fastmath=True)
+        r_g = ex2(r_g_value * LOG2E)
 
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
@@ -454,9 +497,9 @@ def gdn_decode_kernel_big_batch_pretranspose(
         if beta_x <= softplus_threshold:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
             # Compute in Float32
-            exp_beta_x = cute.exp(beta_x, fastmath=True)
+            exp_beta_x = ex2(beta_x * LOG2E)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
-            log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
+            log_result = cutlass.Float32(lg2(log_input) * LN2)
             softplus_x = cutlass.Float32(
                 (cutlass.Float32(1.0) / softplus_beta) * log_result
             )
@@ -464,13 +507,13 @@ def gdn_decode_kernel_big_batch_pretranspose(
             softplus_x = x
 
         # Compute g = exp(A_log) * softplus_x
-        r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
+        r_g_value = -ex2(r_A_log * LOG2E) * softplus_x
 
         # Compute beta = 1 / (1 + exp(-b))
-        r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
+        r_beta = 1.0 / (1.0 + ex2((-r_b) * LOG2E))
 
         # Store to scalar (Float32)
-        r_g = cute.exp(r_g_value, fastmath=True)
+        r_g = ex2(r_g_value * LOG2E)
 
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
