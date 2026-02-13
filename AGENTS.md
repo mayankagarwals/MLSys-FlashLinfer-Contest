@@ -2,6 +2,31 @@
 
 Concise operating guide for AI agents in this repo.
 
+## Quick Commands
+- Create mini dataset:
+  ```bash
+  bash_scripts/create_mini.sh <definition_name> <op_dir>
+  ```
+- `<op_dir>` values: `dsa_paged`, `gdn`, `moe`
+- `<definition_name>` values:
+  - `dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64`
+  - `dsa_topk_indexer_fp8_h64_d128_topk2048_ps64`
+  - `gdn_decode_qk4_v8_d128_k_last`
+  - `gdn_prefill_qk4_v8_d128_k_last`
+  - `moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048`
+- Run benchmark:
+  ```bash
+  bash_scripts/run_local.sh mini
+  bash_scripts/run_local.sh full
+  ```
+- Run benchmark + dump current run trace to markdown:
+  ```bash
+  bash_scripts/run_local.sh mini-dump-trace-md
+  bash_scripts/run_local.sh full-dump-trace-md
+  ```
+  - Writes markdown log file to `logs/<definition>_<run-timestamp>.md`
+  - Override output folder with `FIB_RUN_LOG_DIR`
+
 ## Goal
 - Fast local iteration on FlashInfer-Bench workloads.
 - Prefer reproducible commands and minimal config changes.
@@ -21,36 +46,51 @@ Concise operating guide for AI agents in this repo.
 ## Dataset
 - Full dataset path:
   - `/home/simon/flashinfer-competition/mlsys26-contest`
-- Default env:
+- Default env for wrapper scripts:
   ```bash
-  export FIB_DATASET_PATH=/home/simon/flashinfer-competition/mlsys26-contest
+  export FIB_FULL_DATASET_PATH=/home/simon/flashinfer-competition/mlsys26-contest
   ```
 
 ## Core Workflow
 1. Update `config.toml` for target kernel entrypoint.
-2. Run:
+2. Run on full dataset:
    ```bash
-   uv run python scripts/run_local.py
+   bash_scripts/run_local.sh full
    ```
-3. Validate status (`PASSED`/`INCORRECT_NUMERICAL`/etc.).
+3. Dump current full run trace to markdown (optional):
+   ```bash
+   bash_scripts/run_local.sh full-dump-trace-md
+   ```
+4. Validate status (`PASSED`/`INCORRECT_NUMERICAL`/etc.).
 
 ## Mini Dataset Workflow
 - Use mini datasets for fast iteration: one definition JSON + one workload JSONL row.
-- Template:
+- Create:
   ```bash
-  NAME=<definition_name>
-  OP=<op_dir>
-  ROOT=mini_datasets/${NAME}_single
-  SRC=/home/simon/flashinfer-competition/mlsys26-contest
-
-  mkdir -p "$ROOT/definitions/$OP" "$ROOT/workloads/$OP"
-  cp "$SRC/definitions/$OP/$NAME.json" "$ROOT/definitions/$OP/"
-  head -n 1 "$SRC/workloads/$OP/$NAME.jsonl" > "$ROOT/workloads/$OP/$NAME.jsonl"
-  ln -sfn "$SRC/blob" "$ROOT/blob"
+  bash_scripts/create_mini.sh <definition_name> <op_dir> [output_dir]
   ```
-- Run with mini dataset:
+- `<op_dir>` values: `dsa_paged`, `gdn`, `moe`
+- `<definition_name>` values:
+  - `dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64`
+  - `dsa_topk_indexer_fp8_h64_d128_topk2048_ps64`
+  - `gdn_decode_qk4_v8_d128_k_last`
+  - `gdn_prefill_qk4_v8_d128_k_last`
+  - `moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048`
+- Run with mini dataset (`mini_dataset_name` defaults to `<definition>_single` from `config.toml`):
   ```bash
-  FIB_DATASET_PATH=$PWD/mini_datasets/${NAME}_single uv run python scripts/run_local.py
+  bash_scripts/run_local.sh mini [mini_dataset_name]
+  bash_scripts/run_local.sh mini-dump-trace-md [mini_dataset_name]
+  ```
+- Run on full dataset and dump full trace log to markdown:
+  ```bash
+  bash_scripts/run_local.sh full-dump-trace-md
+  ```
+  - Writes markdown log file to `logs/<definition>_<run-timestamp>.md`
+
+## Manual Command (Equivalent)
+- Direct runner invocation remains available:
+  ```bash
+  FIB_DATASET_PATH=<dataset_path> uv run python scripts/run_local.py
   ```
 
 ## Generic Config Pattern

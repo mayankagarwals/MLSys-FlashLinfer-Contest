@@ -2,6 +2,33 @@
 
 Minimal local workflow for iterating on kernels with `flashinfer-bench`.
 
+## Quick Commands
+
+```bash
+# Create mini dataset
+bash_scripts/create_mini.sh <definition_name> <op_dir>
+
+# Run
+bash_scripts/run_local.sh mini
+bash_scripts/run_local.sh full
+
+# Run + dump current run trace to markdown
+bash_scripts/run_local.sh mini-dump-trace-md
+bash_scripts/run_local.sh full-dump-trace-md
+```
+
+`<op_dir>` values:
+- `dsa_paged`
+- `gdn`
+- `moe`
+
+`<definition_name>` values:
+- `dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64`
+- `dsa_topk_indexer_fp8_h64_d128_topk2048_ps64`
+- `gdn_decode_qk4_v8_d128_k_last`
+- `gdn_prefill_qk4_v8_d128_k_last`
+- `moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048`
+
 ## 1) Environment Setup
 
 ```bash
@@ -17,63 +44,68 @@ uv pip install git+https://github.com/flashinfer-ai/flashinfer-bench.git
 
 ## 2) Dataset Path
 
-Full dataset path used in this repo:
+Default full dataset path used by scripts:
 
 ```bash
-export FIB_DATASET_PATH=/home/simon/flashinfer-competition/mlsys26-contest
+/home/simon/flashinfer-competition/mlsys26-contest
 ```
 
-## 3) Run Benchmark
+Override with:
 
 ```bash
-uv run python scripts/run_local.py
+export FIB_FULL_DATASET_PATH=/your/full/dataset/path
+```
+
+## 3) Create a Mini Dataset (Single Workload Row)
+
+```bash
+bash_scripts/create_mini.sh <definition_name> <op_dir> [output_dir]
+```
+
+`<op_dir>` values:
+- `dsa_paged`
+- `gdn`
+- `moe`
+
+`<definition_name>` values:
+- `dsa_sparse_attention_h16_ckv512_kpe64_topk2048_ps64`
+- `dsa_topk_indexer_fp8_h64_d128_topk2048_ps64`
+- `gdn_decode_qk4_v8_d128_k_last`
+- `gdn_prefill_qk4_v8_d128_k_last`
+- `moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048`
+
+Example:
+
+```bash
+bash_scripts/create_mini.sh gdn_decode_qk4_v8_d128_k_last gdn
+```
+
+This creates `mini_datasets/<definition_name>_single` by default.
+
+## 4) Run Benchmarks
+
+All run modes are in one script:
+
+```bash
+bash_scripts/run_local.sh full
+bash_scripts/run_local.sh mini [mini_dataset_name]
+bash_scripts/run_local.sh full-dump-trace-md
+bash_scripts/run_local.sh mini-dump-trace-md [mini_dataset_name]
+```
+
+Notes:
+- `mini_dataset_name` defaults to `<definition>_single` from `config.toml`.
+- `*-dump-trace-md` runs the benchmark, then writes trace entries from the current run to a timestamped markdown file in `logs/`.
+  - File pattern: `logs/<definition>_<run-timestamp>.md`
+  - Override output folder with: `FIB_RUN_LOG_DIR=/your/path`
+
+## 5) Manual Command (Equivalent)
+
+```bash
+FIB_DATASET_PATH=<dataset_path> uv run python scripts/run_local.py
 ```
 
 `run_local.py` calls `scripts/pack_solution.py` automatically.
-
-## 4) Create a Mini Dataset (Single Workload Row)
-
-Use this for fast debug loops.
-
-```bash
-NAME=<definition_name>
-OP=<op_dir>  # e.g. gdn, moe, dsa_paged
-ROOT=mini_datasets/${NAME}_single
-SRC=/home/simon/flashinfer-competition/mlsys26-contest
-
-mkdir -p "$ROOT/definitions/$OP" "$ROOT/workloads/$OP"
-cp "$SRC/definitions/$OP/$NAME.json" "$ROOT/definitions/$OP/"
-head -n 1 "$SRC/workloads/$OP/$NAME.jsonl" > "$ROOT/workloads/$OP/$NAME.jsonl"
-ln -sfn "$SRC/blob" "$ROOT/blob"
-```
-
-Run with mini dataset:
-
-```bash
-FIB_DATASET_PATH=$PWD/mini_datasets/${NAME}_single uv run python scripts/run_local.py
-```
-
-## 5) Generic Config Update for a New Kernel Run
-
-Edit `config.toml`:
-
-```toml
-[solution]
-name = "my-kernel-run"
-definition = "<exact_definition_name>"
-author = "team-name"
-
-[build]
-language = "python"  # or "triton"
-entry_point = "<file_name>.py::<function_name>"
-destination_passing_style = false  # for value-returning Python callables
-```
-
-Rules:
-- `definition` must exactly match a dataset definition name.
-- `entry_point` must be `"<file>::<function>"`.
-- Put entry files directly in `solution/python/` or `solution/triton/`.
-- For value-returning Python kernels, keep `destination_passing_style = false` and return a tuple for multi-output workloads.
 
 ## 6) Common Status Meanings
 
