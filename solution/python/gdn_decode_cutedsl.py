@@ -21,7 +21,6 @@ import torch
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
-from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -42,6 +41,25 @@ TILE_K = 128
 NUM_STAGES = 2
 NUM_THREADS = 128  # 4 warps
 NUM_BLOCKS_PER_STATE = 8
+
+
+_TORCH_TO_CUTLASS_DTYPE = {
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+    torch.int32: cutlass.Int32,
+}
+
+
+def _make_fake_row_major_tensor(tensor: torch.Tensor, *, assumed_align: int = 16):
+    # Workload definition constrains tensors to bf16/f32/i32 dtypes.
+    cutlass_dtype = _TORCH_TO_CUTLASS_DTYPE[tensor.dtype]
+    stride_order = tuple(reversed(range(tensor.dim())))
+    return cute.runtime.make_fake_compact_tensor(
+        cutlass_dtype,
+        tuple(tensor.shape),
+        stride_order=stride_order,
+        assumed_align=assumed_align,
+    )
 
 
 # ============================================================================
@@ -956,20 +974,19 @@ def gated_delta_rule_decode_pretranspose(
     cu_seqlens = cache["cu_seqlens"]
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-        # Convert tensors to CuTe format for compilation only
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
-        A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16)
-        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16)
-        k_tensor = from_dlpack(k, assumed_align=16)
-        v_tensor = from_dlpack(v, assumed_align=16)
-        b_tensor = from_dlpack(b, assumed_align=16)
-        o_tensor = from_dlpack(output, assumed_align=16)
-        h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
-        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        # Compile against fake tensors to reduce TVM FFI call overhead.
+        h0_source_tensor = _make_fake_row_major_tensor(h0_source)
+        A_log_tensor = _make_fake_row_major_tensor(A_log)
+        a_tensor = _make_fake_row_major_tensor(a)
+        dt_bias_tensor = _make_fake_row_major_tensor(dt_bias)
+        q_tensor = _make_fake_row_major_tensor(q)
+        k_tensor = _make_fake_row_major_tensor(k)
+        v_tensor = _make_fake_row_major_tensor(v)
+        b_tensor = _make_fake_row_major_tensor(b)
+        o_tensor = _make_fake_row_major_tensor(output)
+        h0_indices_tensor = _make_fake_row_major_tensor(h0_indices)
+        cu_seqlens_tensor = _make_fake_row_major_tensor(cu_seqlens)
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
         # Choose kernel based on batch size
         if B <= 32:
@@ -1010,10 +1027,9 @@ def gated_delta_rule_decode_pretranspose(
     else:
         compiled = cache["compiled"]
 
-    # Run kernel directly with PyTorch tensors (no from_dlpack needed)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    # Run kernel directly with PyTorch tensors on the current torch stream.
     cache["compiled"](
-        h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens, stream
+        h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens
     )
 
     updated_state = h0_source.reshape(B, HV, V, K).contiguous()
