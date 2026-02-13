@@ -1,5 +1,6 @@
 # FlashInfer Competition
 solution.json
+logs/
 
 # CUDA build artifacts
 *.o
@@ -221,3 +222,6 @@ __marimo__/
 
 # Mini dataset
 mini_datasets
+
+# Logs
+logs
