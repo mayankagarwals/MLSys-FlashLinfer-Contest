@@ -1,6 +1,7 @@
 # FlashInfer Competition Starter
 
 Minimal local workflow for iterating on kernels with `flashinfer-bench`.
+Agent-specific workflow details are indexed in `AGENTS.md` and stored as skills in `.agents/skills/`.
 
 ## Quick Commands
 
@@ -15,6 +16,13 @@ bash_scripts/run_local.sh full
 # Run + dump current run trace to markdown
 bash_scripts/run_local.sh mini-dump-trace-md
 bash_scripts/run_local.sh full-dump-trace-md
+
+# NCU profile (all selected workloads / one profiled forward pass each)
+bash_scripts/run_ncu.sh mini
+bash_scripts/run_ncu.sh full
+
+# GDN experiment loop (mini preflight + full benchmark + LOGS.md append + revert)
+bash_scripts/run_gdn_experiment.sh "<hypothesis>" "<change_summary>" [decision]
 ```
 
 `<op_dir>` values:
@@ -107,9 +115,62 @@ FIB_DATASET_PATH=<dataset_path> uv run python scripts/run_local.py
 
 `run_local.py` calls `scripts/pack_solution.py` automatically.
 
-## 6) Common Status Meanings
+## 6) NCU Single-Pass Profiling
+
+Use this for a simple Nsight Compute run without benchmark loops:
+
+```bash
+bash_scripts/run_ncu.sh mini [mini_dataset_name]
+bash_scripts/run_ncu.sh full
+```
+
+Default behavior:
+- Profiles all workloads for the current `config.toml` definition.
+- Runs one profiled forward pass per workload.
+- Uses native API: `flashinfer_bench.agents.ncu.flashinfer_bench_run_ncu`.
+- Applies NVTX include expression `flashinfer_bench_ncu_profile]` for push/pop range matching.
+- Uses `--target-processes all`.
+- Uses kernel filter `regex:kernel_cutlass` by default.
+- Writes artifacts to `ncu_logs/<definition>_<timestamp>/workloads/<index>_<uuid>/`.
+  - Includes `ncu_report.ncu-rep` per workload.
+
+Note:
+- `ncu` here is one-pass profiling. `run_local.sh` latency is an average over many iterations with cache-clearing in the benchmark loop, so values will not match exactly.
+
+Useful overrides:
+
+```bash
+FIB_NCU_OUTPUT_DIR=/your/path
+FIB_NCU_KERNEL_NAME='regex:kernel_cutlass'
+FIB_NCU_SET=basic
+FIB_NCU_PAGE=details
+FIB_NCU_DEVICE=cuda:0
+FIB_NCU_TARGET_PROCESSES=all
+FIB_NCU_WORKLOAD_SCOPE=first
+FIB_NCU_MAX_WORKLOADS=5
+FIB_NCU_TIMEOUT=300
+FIB_NCU_SECTIONS='LaunchStats,Occupancy'
+FIB_NCU_NVTX_INCLUDE='flashinfer_bench_ncu_profile]'
+```
+
+## 7) Common Status Meanings
 
 - `COMPILE_ERROR`: build/signature/entrypoint mismatch.
 - `RUNTIME_ERROR`: callable raised at runtime.
 - `INCORRECT_NUMERICAL`: output mismatch.
 - `PASSED`: correctness check passed.
+
+## 8) Ephemeral GDN Experiment Loop
+
+For iterative tuning of `solution/python/gdn_decode_cutedsl.py`, use:
+
+```bash
+bash_scripts/run_gdn_experiment.sh "<hypothesis>" "<change_summary>" [decision]
+```
+
+It will:
+- Require a local edit in `solution/python/gdn_decode_cutedsl.py`.
+- Run mini preflight (`run_local.sh mini`).
+- Run full benchmark (`run_local.sh full-dump-trace-md`) if mini passes.
+- Append metrics to root `LOGS.md`.
+- Revert `solution/python/gdn_decode_cutedsl.py` to `HEAD`.
