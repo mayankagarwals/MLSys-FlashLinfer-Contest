@@ -153,9 +153,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
     # Get current batch
     gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
-    gDst = cute.local_tile(
-        h0_source, (1, SMALL_TILE_V, TILE_K), (batch_idx, None, 0)
-    )
+    gDst = cute.local_tile(h0_source, (1, SMALL_TILE_V, TILE_K), (batch_idx, None, 0))
 
     # V 方向分 tiles
     gSrc = cute.local_tile(
@@ -287,9 +285,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
             cute.arch.cp_async_commit_group()
 
         # Step 3: Compute using data from current stage (contiguous access pattern)
-        for row in cutlass.range_constexpr(
-            0, SMALL_TILE_V, NUM_THREADS // WARP_SIZE
-        ):
+        for row in cutlass.range_constexpr(0, SMALL_TILE_V, NUM_THREADS // WARP_SIZE):
             row_offset = warp_idx
             sum_hk = 0.0
 
@@ -677,9 +673,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     # sData: SMALL_TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
     # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
-    smem_bytes = (
-        4 * SMALL_TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
-    )
+    smem_bytes = 4 * SMALL_TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
 
     gdn_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
@@ -921,7 +915,7 @@ def gated_delta_rule_decode_pretranspose(
     # - output is not destination-passed
     # - use_qk_l2norm is always disabled
     use_qk_l2norm = False
-    output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
+    output = torch.empty((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
     # Public API uses k-last state layout [B, HV, V, K].
     if state is None:
@@ -1006,7 +1000,7 @@ def gated_delta_rule_decode_pretranspose(
         h0_source, A_log, a, dt_bias, q, k, v, b, output, h0_indices, cu_seqlens
     )
 
-    updated_state = h0_source.reshape(B, HV, V, K).contiguous()
+    updated_state = h0_source.reshape(B, HV, V, K)  # .contigous()
     return output, updated_state
 
 
