@@ -27,12 +27,13 @@ import cuda.bindings.driver as cuda
 # Global configuration for PRETRANSPOSE version ([B*HV, V, K])
 # ============================================================================
 TILE_V = 8
+SMALL_TILE_V = 4
 TILE_K = 128
 NUM_STAGES = 2
 WARP_SIZE = 32
 NUM_WARPS = 4
 NUM_THREADS = WARP_SIZE * NUM_WARPS
-NUM_BLOCKS_PER_STATE = 16
+NUM_BLOCKS_PER_STATE = 32
 WARP_REDUCE_OFFSETS = (
     WARP_SIZE // 2,
     WARP_SIZE // 4,
@@ -152,12 +153,14 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
     # Get current batch
     gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
-    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (batch_idx, None, 0))
+    gDst = cute.local_tile(
+        h0_source, (1, SMALL_TILE_V, TILE_K), (batch_idx, None, 0)
+    )
 
     # V 方向分 tiles
     gSrc = cute.local_tile(
-        gSrc_batch, (TILE_V, TILE_K), (None, 0)
-    )  # (TILE_V, TILE_K, num_v_tiles)
+        gSrc_batch, (SMALL_TILE_V, TILE_K), (None, 0)
+    )  # (SMALL_TILE_V, TILE_K, num_v_tiles)
 
     # Partition for load
     thr_copy_load = tiled_copy_load.get_slice(tidx)
@@ -284,7 +287,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
             cute.arch.cp_async_commit_group()
 
         # Step 3: Compute using data from current stage (contiguous access pattern)
-        for row in cutlass.range_constexpr(0, TILE_V, NUM_THREADS // WARP_SIZE):
+        for row in cutlass.range_constexpr(
+            0, SMALL_TILE_V, NUM_THREADS // WARP_SIZE
+        ):
             row_offset = warp_idx
             sum_hk = 0.0
 
@@ -303,7 +308,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
                     sum_hk, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
                 )
 
-            v_new = sV[v_tiles * TILE_V + row + row_offset] - sum_hk
+            v_new = sV[v_tiles * SMALL_TILE_V + row + row_offset] - sum_hk
             v_new = v_new * r_beta
 
             sum_hq = 0.0
@@ -322,7 +327,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
                     sum_hq, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
                 )
 
-            o_idx = v_tiles * TILE_V + row + row_offset
+            o_idx = v_tiles * SMALL_TILE_V + row + row_offset
             if lane_id == 0 and o_idx < V:
                 sOutput[o_idx] = cutlass.BFloat16(sum_hq)
 
@@ -331,7 +336,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     # All threads write (V=128, NUM_THREADS)
     # ===================================================================
     cute.arch.barrier()  # Ensure all writes to sOutput are complete
-    if tidx >= start_v_tiles * TILE_V and tidx < end_v_tiles * TILE_V:
+    if tidx >= start_v_tiles * SMALL_TILE_V and tidx < end_v_tiles * SMALL_TILE_V:
         o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
 
 
@@ -656,7 +661,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
 
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
-    num_v_tiles = cute.ceil_div(v_dim, TILE_V)
+    num_v_tiles = cute.ceil_div(v_dim, SMALL_TILE_V)
     v_dim * k_dim * batch_size * 4 / 1024 / 1024
 
     vec_size = (
@@ -665,13 +670,16 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
 
     # Create SMEM layout
     smem_layout_staged = cute.make_layout(
-        (TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K)
+        (SMALL_TILE_V, TILE_K, NUM_STAGES),
+        stride=(TILE_K, 1, SMALL_TILE_V * TILE_K),
     )
 
-    # sData: TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
+    # sData: SMALL_TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
     # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
-    smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
+    smem_bytes = (
+        4 * SMALL_TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
+    )
 
     gdn_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
