@@ -122,32 +122,22 @@ def gdn_decode_kernel_small_batch_pretranspose(
     # Allocate shared memory for output (size V) - use BFloat16 to match SGLang
     sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((V,)), 16)
 
-    # Allocate shared memory for v values (size K, to reduce register usage)
-    sV = smem.allocate_tensor(cutlass.Float32, cute.make_layout((V,)), 16)
-
     r_k = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
     r_q = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
-    # r_v moved to shared memory (sV)
     r_h = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
-    # BF16 register tensors for vectorized q, k, v loading
+    # BF16 register tensors for vectorized q and k loading
     r_q_bf16 = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
     )
     r_k_bf16 = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
     )
-    r_v_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
-
-    # Compute k_start for contiguous access pattern
-    k_start = lane_id * vec_size
 
     cute.arch.barrier()
 
@@ -190,14 +180,6 @@ def gdn_decode_kernel_small_batch_pretranspose(
     for i in cutlass.range_constexpr(vec_size):
         r_q[i] = cutlass.Float32(r_q_bf16[i])
         r_k[i] = cutlass.Float32(r_k_bf16[i])
-
-    # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
-    v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
-    cute.autovec_copy(v_tile, r_v_bf16)
-    for i in cutlass.range_constexpr(vec_size):
-        sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
-
-    cute.arch.barrier()  # Ensure all threads finish writing to sV
 
     # ===================================================================
     # Compute g and beta (scalar values)
@@ -304,7 +286,14 @@ def gdn_decode_kernel_small_batch_pretranspose(
                     sum_hk, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
                 )
 
-            v_new = sV[v_tiles * SMALL_TILE_V + row + row_offset] - sum_hk
+            o_idx = v_tiles * SMALL_TILE_V + row + row_offset
+
+            v_scalar = cutlass.Float32(0.0)
+            if lane_id == 0 and o_idx < V:
+                v_scalar = cutlass.Float32(v[(i_n, i_t, i_hv, o_idx)])
+            v_scalar = cute.arch.shuffle_sync(v_scalar, 0) # Broadcast to all lanes
+
+            v_new = v_scalar - sum_hk
             v_new = v_new * r_beta
 
             sum_hq = 0.0
@@ -323,7 +312,6 @@ def gdn_decode_kernel_small_batch_pretranspose(
                     sum_hq, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
                 )
 
-            o_idx = v_tiles * SMALL_TILE_V + row + row_offset
             if lane_id == 0 and o_idx < V:
                 sOutput[o_idx] = cutlass.BFloat16(sum_hq)
 
@@ -671,9 +659,8 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     )
 
     # sData: SMALL_TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
-    # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
-    smem_bytes = 4 * SMALL_TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
+    smem_bytes = 4 * SMALL_TILE_V * TILE_K * NUM_STAGES + 2 * v_dim + 32
 
     gdn_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
