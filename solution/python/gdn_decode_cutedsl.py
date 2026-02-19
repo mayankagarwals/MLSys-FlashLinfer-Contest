@@ -34,13 +34,7 @@ WARP_SIZE = 32
 NUM_WARPS = 4
 NUM_THREADS = WARP_SIZE * NUM_WARPS
 NUM_BLOCKS_PER_STATE = 32
-WARP_REDUCE_OFFSETS = (
-    WARP_SIZE // 2,
-    WARP_SIZE // 4,
-    WARP_SIZE // 8,
-    WARP_SIZE // 16,
-    WARP_SIZE // 32,
-)
+WARP_REDUCE_STEPS = 5
 
 
 _TORCH_TO_CUTLASS_DTYPE = {
@@ -122,34 +116,24 @@ def gdn_decode_kernel_small_batch_pretranspose(
     # Allocate shared memory for output (size V) - use BFloat16 to match SGLang
     sOutput = smem.allocate_tensor(cutlass.BFloat16, cute.make_layout((V,)), 16)
 
-    # Allocate shared memory for v values (size K, to reduce register usage)
-    sV = smem.allocate_tensor(cutlass.Float32, cute.make_layout((V,)), 16)
-
     r_k = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
     r_q = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
-    # r_v moved to shared memory (sV)
     r_h = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.Float32
     )
-    # BF16 register tensors for vectorized q, k, v loading
+    # BF16 register tensors for vectorized q and k loading
     r_q_bf16 = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
     )
     r_k_bf16 = cute.make_rmem_tensor(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
     )
-    r_v_bf16 = cute.make_rmem_tensor(
-        cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
-    )
 
-    # Compute k_start for contiguous access pattern
-    k_start = lane_id * vec_size
-
-    cute.arch.barrier()
+    # cute.arch.barrier() # No write at this point, redundant.
 
     # Get current batch
     gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
@@ -191,14 +175,6 @@ def gdn_decode_kernel_small_batch_pretranspose(
         r_q[i] = cutlass.Float32(r_q_bf16[i])
         r_k[i] = cutlass.Float32(r_k_bf16[i])
 
-    # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
-    v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
-    cute.autovec_copy(v_tile, r_v_bf16)
-    for i in cutlass.range_constexpr(vec_size):
-        sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
-
-    cute.arch.barrier()  # Ensure all threads finish writing to sV
-
     # ===================================================================
     # Compute g and beta (scalar values)
     # ===================================================================
@@ -211,7 +187,6 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
         if beta_x <= softplus_threshold:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
-            # Use CuTe fastmath path instead of inline PTX wrappers.
             exp_beta_x = cute.exp(beta_x, fastmath=True)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
             log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
@@ -233,7 +208,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
-    if use_qk_l2norm:
+    if cutlass.const_expr(use_qk_l2norm):
         # Compute L2 norm of q and k
         sum_q = 0.0
         sum_k = 0.0
@@ -241,12 +216,18 @@ def gdn_decode_kernel_small_batch_pretranspose(
             sum_q += r_q[i] * r_q[i]
             sum_k += r_k[i] * r_k[i]
         # Warp-level reduction using butterfly shuffle
-        for offset in WARP_REDUCE_OFFSETS:
+        for reduce_step in cutlass.range_constexpr(WARP_REDUCE_STEPS):
             sum_q += cute.arch.shuffle_sync_bfly(
-                sum_q, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
+                sum_q,
+                offset=(WARP_SIZE >> (reduce_step + 1)),
+                mask=-1,
+                mask_and_clamp=WARP_SIZE - 1,
             )
             sum_k += cute.arch.shuffle_sync_bfly(
-                sum_k, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
+                sum_k,
+                offset=(WARP_SIZE >> (reduce_step + 1)),
+                mask=-1,
+                mask_and_clamp=WARP_SIZE - 1,
             )
 
         inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
@@ -299,12 +280,22 @@ def gdn_decode_kernel_small_batch_pretranspose(
                 r_h[i] = r_h[i] * r_g
                 sum_hk += r_h[i] * r_k[i]
 
-            for offset in WARP_REDUCE_OFFSETS:
+            for reduce_step in cutlass.range_constexpr(WARP_REDUCE_STEPS):
                 sum_hk += cute.arch.shuffle_sync_bfly(
-                    sum_hk, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
+                    sum_hk,
+                    offset=(WARP_SIZE >> (reduce_step + 1)),
+                    mask=-1,
+                    mask_and_clamp=WARP_SIZE - 1,
                 )
 
-            v_new = sV[v_tiles * SMALL_TILE_V + row + row_offset] - sum_hk
+            o_idx = v_tiles * SMALL_TILE_V + row + row_offset
+
+            v_scalar = cutlass.Float32(0.0)
+            if lane_id == 0 and o_idx < V:
+                v_scalar = cutlass.Float32(v[(i_n, i_t, i_hv, o_idx)])
+            v_scalar = cute.arch.shuffle_sync(v_scalar, 0)  # Broadcast to all lanes
+
+            v_new = v_scalar - sum_hk
             v_new = v_new * r_beta
 
             sum_hq = 0.0
@@ -318,12 +309,14 @@ def gdn_decode_kernel_small_batch_pretranspose(
             )
             cute.autovec_copy(r_h, gDst_tile)
 
-            for offset in WARP_REDUCE_OFFSETS:
+            for reduce_step in cutlass.range_constexpr(WARP_REDUCE_STEPS):
                 sum_hq += cute.arch.shuffle_sync_bfly(
-                    sum_hq, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
+                    sum_hq,
+                    offset=(WARP_SIZE >> (reduce_step + 1)),
+                    mask=-1,
+                    mask_and_clamp=WARP_SIZE - 1,
                 )
 
-            o_idx = v_tiles * SMALL_TILE_V + row + row_offset
             if lane_id == 0 and o_idx < V:
                 sOutput[o_idx] = cutlass.BFloat16(sum_hq)
 
@@ -420,7 +413,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
     # Compute k_start for contiguous access pattern
     k_start = lane_id * vec_size
 
-    cute.arch.barrier()
+    cute.arch.barrier()  # No need for this barrier, weirdly increases performance
 
     # Get current batch
     gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
@@ -481,7 +474,6 @@ def gdn_decode_kernel_big_batch_pretranspose(
 
         if beta_x <= softplus_threshold:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
-            # Use CuTe fastmath path instead of inline PTX wrappers.
             exp_beta_x = cute.exp(beta_x, fastmath=True)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
             log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
@@ -503,7 +495,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
-    if use_qk_l2norm:
+    if cutlass.const_expr(use_qk_l2norm):
         # Compute L2 norm of q and k
         sum_q = 0.0
         sum_k = 0.0
@@ -511,12 +503,18 @@ def gdn_decode_kernel_big_batch_pretranspose(
             sum_q += r_q[i] * r_q[i]
             sum_k += r_k[i] * r_k[i]
         # Warp-level reduction using butterfly shuffle
-        for offset in WARP_REDUCE_OFFSETS:
+        for reduce_step in cutlass.range_constexpr(WARP_REDUCE_STEPS):
             sum_q += cute.arch.shuffle_sync_bfly(
-                sum_q, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
+                sum_q,
+                offset=(WARP_SIZE >> (reduce_step + 1)),
+                mask=-1,
+                mask_and_clamp=WARP_SIZE - 1,
             )
             sum_k += cute.arch.shuffle_sync_bfly(
-                sum_k, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
+                sum_k,
+                offset=(WARP_SIZE >> (reduce_step + 1)),
+                mask=-1,
+                mask_and_clamp=WARP_SIZE - 1,
             )
 
         inv_norm_q = cute.rsqrt(sum_q + 1e-6, fastmath=True)
@@ -568,9 +566,12 @@ def gdn_decode_kernel_big_batch_pretranspose(
                 r_h[i] = r_h[i] * r_g
                 sum_hk += r_h[i] * r_k[i]
 
-            for offset in WARP_REDUCE_OFFSETS:
+            for reduce_step in cutlass.range_constexpr(WARP_REDUCE_STEPS):
                 sum_hk += cute.arch.shuffle_sync_bfly(
-                    sum_hk, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
+                    sum_hk,
+                    offset=(WARP_SIZE >> (reduce_step + 1)),
+                    mask=-1,
+                    mask_and_clamp=WARP_SIZE - 1,
                 )
 
             v_new = sV[v_tiles * TILE_V + row + row_offset] - sum_hk
@@ -587,9 +588,12 @@ def gdn_decode_kernel_big_batch_pretranspose(
             )
             cute.autovec_copy(r_h, gDst_tile)
 
-            for offset in WARP_REDUCE_OFFSETS:
+            for reduce_step in cutlass.range_constexpr(WARP_REDUCE_STEPS):
                 sum_hq += cute.arch.shuffle_sync_bfly(
-                    sum_hq, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
+                    sum_hq,
+                    offset=(WARP_SIZE >> (reduce_step + 1)),
+                    mask=-1,
+                    mask_and_clamp=WARP_SIZE - 1,
                 )
 
             o_idx = v_tiles * TILE_V + row + row_offset
@@ -671,9 +675,8 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     )
 
     # sData: SMALL_TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
-    # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
-    smem_bytes = 4 * SMALL_TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
+    smem_bytes = 4 * SMALL_TILE_V * TILE_K * NUM_STAGES + 2 * v_dim + 32
 
     gdn_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
