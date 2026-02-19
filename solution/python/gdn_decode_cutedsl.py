@@ -413,7 +413,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
     # Compute k_start for contiguous access pattern
     k_start = lane_id * vec_size
 
-    cute.arch.barrier()
+    cute.arch.barrier()  # No need for this barrier, weirdly increases performance
 
     # Get current batch
     gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
@@ -495,7 +495,7 @@ def gdn_decode_kernel_big_batch_pretranspose(
     r_g = cute.arch.shuffle_sync(r_g, 0)
     r_beta = cute.arch.shuffle_sync(r_beta, 0)
 
-    if use_qk_l2norm:
+    if cutlass.const_expr(use_qk_l2norm):
         # Compute L2 norm of q and k
         sum_q = 0.0
         sum_k = 0.0
