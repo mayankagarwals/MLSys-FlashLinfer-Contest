@@ -161,27 +161,24 @@ def gdn_decode_kernel_small_batch_pretranspose(
     )  # (SMALL_TILE_V, TILE_K, num_v_tiles)
 
     # Partition for load
-    thr_copy_load = tiled_copy_load.get_slice(tidx)
+    thr_copy_load = tiled_copy_load.get_slice(tidx) # this thread slice of the plan (copy 1 row 4 elements . totalling across 4 warps, 32 threads to 4 rows 128 dim)
 
-    # ===================================================================
-    # Prefetch: All threads participate in cp.async load
-    # ===================================================================
     start_v_tiles = batch_inner * num_v_tiles_per_block
-    prefetch_count = cutlass.min(NUM_STAGES - 1, num_v_tiles_per_block)
-    for v_tiles in range(start_v_tiles, start_v_tiles + prefetch_count):
-        stage = (v_tiles - start_v_tiles) % NUM_STAGES
+    end_v_tiles = start_v_tiles + num_v_tiles_per_block
 
-        gSrc_tile = gSrc[(None, None, v_tiles)]
-        sData_stage = sData[(None, None, stage)]
+    # Single-tile small-kernel specialization: one direct shared-memory load, no cp.async pipeline.
+    single_v_tile = start_v_tiles
+    gSrc_tile = gSrc[(None, None, single_v_tile)]
+    sData_stage = sData[(None, None, 0)]
 
-        thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
-        thr_sData = thr_copy_load.partition_D(sData_stage)
+    thr_gSrc = thr_copy_load.partition_S(gSrc_tile)
+    thr_sData = thr_copy_load.partition_D(sData_stage)
 
-        cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-        cute.arch.cp_async_commit_group()
+    cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
+    cute.arch.barrier()
 
     # Load q, k into BF16 registers using autovec_copy (contiguous pattern)
-    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
+    q_tile = cute.local_tile(q, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id)) # pick the 4 elements of q this thread is interested in 
     k_tile = cute.local_tile(k, (1, 1, 1, vec_size), (i_n, i_t, i_h, lane_id))
     cute.autovec_copy(q_tile, r_q_bf16)
     cute.autovec_copy(k_tile, r_k_bf16)
@@ -262,70 +259,46 @@ def gdn_decode_kernel_small_batch_pretranspose(
     # ===================================================================
     # Mainloop: All threads participate
     # ===================================================================
-    end_v_tiles = start_v_tiles + num_v_tiles_per_block
-    for v_tiles in range(start_v_tiles, end_v_tiles):
-        stage = (v_tiles - start_v_tiles) % NUM_STAGES
+    single_stage = 0
+    for row in cutlass.range_constexpr(0, SMALL_TILE_V, NUM_THREADS // WARP_SIZE):
+        row_offset = warp_idx
+        sum_hk = 0.0
 
-        # Step 1: Wait for current stage to complete
-        cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
+        sData_tile = cute.local_tile(
+            sData, (1, vec_size, 1), (row + row_offset, lane_id, single_stage)
+        )
+        cute.autovec_copy(sData_tile, r_h)
 
-        # Step 2: Issue async load for next tile (after compute)
-        next_v_tiles = v_tiles + prefetch_count
-        if next_v_tiles < end_v_tiles:
-            next_stage = (next_v_tiles - start_v_tiles) % NUM_STAGES
+        for i in cutlass.range_constexpr(vec_size):
+            r_h[i] = r_h[i] * r_g
+            sum_hk += r_h[i] * r_k[i]
 
-            gSrc_next = gSrc[(None, None, next_v_tiles)]
-            sData_next = sData[(None, None, next_stage)]
-
-            thr_gSrc = thr_copy_load.partition_S(gSrc_next)
-            thr_sData = thr_copy_load.partition_D(sData_next)
-
-            cute.copy(tiled_copy_load, thr_gSrc, thr_sData)
-            cute.arch.cp_async_commit_group()
-
-        # Step 3: Compute using data from current stage (contiguous access pattern)
-        for row in cutlass.range_constexpr(0, SMALL_TILE_V, NUM_THREADS // WARP_SIZE):
-            row_offset = warp_idx
-            sum_hk = 0.0
-
-            # Load h from sData using 3D local_tile + autovec_copy (contiguous in K)
-            sData_tile = cute.local_tile(
-                sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
+        for offset in WARP_REDUCE_OFFSETS:
+            sum_hk += cute.arch.shuffle_sync_bfly(
+                sum_hk, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
             )
-            cute.autovec_copy(sData_tile, r_h)
 
-            for i in cutlass.range_constexpr(vec_size):
-                r_h[i] = r_h[i] * r_g
-                sum_hk += r_h[i] * r_k[i]
+        v_new = sV[single_v_tile * SMALL_TILE_V + row + row_offset] - sum_hk
+        v_new = v_new * r_beta
 
-            for offset in WARP_REDUCE_OFFSETS:
-                sum_hk += cute.arch.shuffle_sync_bfly(
-                    sum_hk, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
-                )
+        sum_hq = 0.0
+        for i in cutlass.range_constexpr(vec_size):
+            r_h[i] += r_k[i] * v_new
+            sum_hq += r_h[i] * r_q[i]
 
-            v_new = sV[v_tiles * SMALL_TILE_V + row + row_offset] - sum_hk
-            v_new = v_new * r_beta
+        gDst_tile = cute.local_tile(
+            gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, single_v_tile)
+        )
+        cute.autovec_copy(r_h, gDst_tile)
 
-            sum_hq = 0.0
-            for i in cutlass.range_constexpr(vec_size):
-                r_h[i] += r_k[i] * v_new
-                sum_hq += r_h[i] * r_q[i]
-
-            # Write h to gDst using 4D local_tile + autovec_copy (contiguous in K)
-            gDst_tile = cute.local_tile(
-                gDst, (1, 1, vec_size, 1), (0, row + row_offset, lane_id, v_tiles)
+        for offset in WARP_REDUCE_OFFSETS:
+            sum_hq += cute.arch.shuffle_sync_bfly(
+                sum_hq, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
             )
-            cute.autovec_copy(r_h, gDst_tile)
 
-            for offset in WARP_REDUCE_OFFSETS:
-                sum_hq += cute.arch.shuffle_sync_bfly(
-                    sum_hq, offset=offset, mask=-1, mask_and_clamp=WARP_SIZE - 1
-                )
-
-            o_idx = v_tiles * SMALL_TILE_V + row + row_offset
-            if lane_id == 0 and o_idx < V:
-                sOutput[o_idx] = cutlass.BFloat16(sum_hq)
+        o_idx = single_v_tile * SMALL_TILE_V + row + row_offset
+        if lane_id == 0 and o_idx < V:
+            sOutput[o_idx] = cutlass.BFloat16(sum_hq)
 
     # ===================================================================
     # Final writeback: Copy output from shared memory to global memory
@@ -633,7 +606,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     is_varlen: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
-    """Launch original pipelined kernel for small batch pretranspose."""
+    """Launch small-batch kernel with host-dispatched single-tile specialization."""
     # h0_source: (B*HV, V, K)
     batch_size, v_dim, k_dim = (
         h0_source.layout.shape[0],
@@ -653,12 +626,11 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         (NUM_THREADS // WARP_SIZE, WARP_SIZE),  # num_warps rows, WARP_SIZE threads/row
         stride=(WARP_SIZE, 1),
     )
-    val_layout = cute.make_layout((1, 4))  # Each thread handles 4 elements
+    val_layout = cute.make_layout((1, 4))  # Each thread handles 4 elements. 1 row 4 columns
 
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
     num_v_tiles = cute.ceil_div(v_dim, SMALL_TILE_V)
-    v_dim * k_dim * batch_size * 4 / 1024 / 1024
 
     vec_size = (
         TILE_K // WARP_SIZE
