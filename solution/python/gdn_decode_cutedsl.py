@@ -133,7 +133,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
         cute.make_layout((vec_size,), stride=(1,)), cutlass.BFloat16
     )
 
-    cute.arch.barrier()
+    # cute.arch.barrier() # No write at this point, redundant.
 
     # Get current batch
     gSrc_batch = h0_source[(batch_idx, None, None)]  # (V, K)
