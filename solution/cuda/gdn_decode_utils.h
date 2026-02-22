@@ -11,7 +11,7 @@ constexpr int kHeadSize = 128;
 
 inline void
 ValidateShapesAndTypes(const TensorView &q, const TensorView &k,
-                       const TensorView &v, const Optional<TensorView> &state,
+                       const TensorView &v, const TensorView &state,
                        const TensorView &A_log, const TensorView &a,
                        const TensorView &dt_bias, const TensorView &b,
                        const TensorView &output, const TensorView &new_state) {
@@ -35,12 +35,9 @@ ValidateShapesAndTypes(const TensorView &q, const TensorView &k,
   CHECK_DIM(4, output);
   CHECK_DIM(4, new_state);
 
-  TVM_FFI_CHECK(state.has_value(), ValueError)
-      << "state must be provided for this workload";
-  const TensorView &state_v = state.value();
-  CHECK_INPUT(state_v);
-  CHECK_DIM(4, state_v);
-  CHECK_DEVICE(q, state_v);
+  CHECK_INPUT(state);
+  CHECK_DIM(4, state);
+  CHECK_DEVICE(q, state);
 
   CHECK_DEVICE(q, k);
   CHECK_DEVICE(q, v);
@@ -64,7 +61,7 @@ ValidateShapesAndTypes(const TensorView &q, const TensorView &k,
       << "output must be bfloat16";
   TVM_FFI_CHECK(new_state.dtype() == dl_float32, TypeError)
       << "new_state must be float32";
-  TVM_FFI_CHECK(state_v.dtype() == dl_float32, TypeError)
+  TVM_FFI_CHECK(state.dtype() == dl_float32, TypeError)
       << "state must be float32";
 
   int64_t B = q.size(0);
@@ -112,8 +109,8 @@ ValidateShapesAndTypes(const TensorView &q, const TensorView &k,
                 ValueError)
       << "new_state must have shape [B, HV, V, K]";
 
-  TVM_FFI_CHECK(state_v.size(0) == B && state_v.size(1) == HV &&
-                    state_v.size(2) == V && state_v.size(3) == K,
+  TVM_FFI_CHECK(state.size(0) == B && state.size(1) == HV &&
+                    state.size(2) == V && state.size(3) == K,
                 ValueError)
       << "state must have shape [B, HV, V, K]";
 }
