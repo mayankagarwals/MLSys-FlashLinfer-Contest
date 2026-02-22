@@ -20,6 +20,7 @@ constexpr int kNumVTiles = kHeadSize / kRowsPerBlock;
 
 constexpr int64_t kQGroupSize = kNumVHeads / kNumQHeads;
 constexpr int64_t kKGroupSize = kNumVHeads / kNumKHeads;
+constexpr unsigned kFullWarpMask = 0xffffffffu;
 
 static_assert(kHeadSize == 128, "kernel_2 expects head size 128");
 static_assert(kNumThreads == 128, "kernel_2 expects 128 threads per block");
@@ -35,7 +36,7 @@ struct GdnScalars {
 };
 
 __device__ __forceinline__ float SoftplusStable(float x) {
-  float abs_x = fabsf(x);
+  const float abs_x = fabsf(x);
   return log1pf(expf(-abs_x)) + fmaxf(x, 0.0f);
 }
 
@@ -47,8 +48,8 @@ __device__ __forceinline__ GdnScalars ComputeGdnScalars(float A_log_val,
                                                         __nv_bfloat16 a_val,
                                                         float dt_bias_val,
                                                         __nv_bfloat16 b_val) {
-  float x = __bfloat162float(a_val) + dt_bias_val;
-  float softplus_x = SoftplusStable(x);
+  const float x = __bfloat162float(a_val) + dt_bias_val;
+  const float softplus_x = SoftplusStable(x);
 
   GdnScalars out;
   out.g = expf(-expf(A_log_val) * softplus_x);
@@ -59,9 +60,9 @@ __device__ __forceinline__ GdnScalars ComputeGdnScalars(float A_log_val,
 __device__ __forceinline__ float WarpAllReduceSum(float value) {
 #pragma unroll
   for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-    value += __shfl_down_sync(0xffffffffu, value, offset);
+    value += __shfl_down_sync(kFullWarpMask, value, offset);
   }
-  return __shfl_sync(0xffffffffu, value, 0);
+  return __shfl_sync(kFullWarpMask, value, 0);
 }
 
 __device__ __forceinline__ void
@@ -116,7 +117,7 @@ __global__ void GdnDecodeKernel2(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
 
   __syncthreads();
 
-  GdnScalars scalars =
+  const GdnScalars scalars =
       ComputeGdnScalars(A_log[hv_idx], a[hv_base], dt_bias[hv_idx], b[hv_base]);
   const float g = scalars.g;
   const float beta = scalars.beta;
@@ -129,7 +130,7 @@ __global__ void GdnDecodeKernel2(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   float old_v_partial = 0.0f;
 #pragma unroll
   for (int kk = lane; kk < kHeadSize; kk += kWarpSize) {
-    float old_state = g * state[state_row_base + kk];
+    const float old_state = g * state[state_row_base + kk];
     old_v_partial += s_k[kk] * old_state;
   }
 
@@ -140,8 +141,8 @@ __global__ void GdnDecodeKernel2(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   float out_partial = 0.0f;
 #pragma unroll
   for (int kk = lane; kk < kHeadSize; kk += kWarpSize) {
-    float old_state = g * state[state_row_base + kk];
-    float updated = old_state + s_k[kk] * delta;
+    const float old_state = g * state[state_row_base + kk];
+    const float updated = old_state + s_k[kk] * delta;
     new_state[state_row_base + kk] = updated;
     out_partial += s_q[kk] * updated;
   }
@@ -170,7 +171,7 @@ void LaunchGdnDecodeKernel2(const __nv_bfloat16 *q_ptr,
                             int64_t B, cudaStream_t stream) {
   TVM_FFI_CHECK(B > 0, ValueError) << "batch size must be positive";
 
-  dim3 grid(B * kNumVHeads * kNumVTiles, 1, 1);
+  const dim3 grid(B * kNumVHeads * kNumVTiles, 1, 1);
   GdnDecodeKernel2<<<grid, kNumThreads, 0, stream>>>(
       q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
       scale_f, output_ptr, new_state_ptr);
@@ -184,10 +185,10 @@ void RunGdnDecodeKernel2(TensorView q, TensorView k, TensorView v,
                                      output, new_state);
 
   const int64_t B = q.size(0);
-  float scale_f = ResolveScale(scale);
+  const float scale_f = ResolveScale(scale);
 
   ffi::CUDADeviceGuard guard(q.device().device_id);
-  cudaStream_t stream = get_cuda_stream(q.device());
+  const cudaStream_t stream = get_cuda_stream(q.device());
 
   const float *state_ptr = static_cast<const float *>(state.data_ptr());
 
@@ -205,7 +206,7 @@ void RunGdnDecodeKernel2(TensorView q, TensorView k, TensorView v,
                          dt_bias_ptr, b_ptr, scale_f, output_ptr, new_state_ptr,
                          B, stream);
 
-  cudaError_t err = cudaGetLastError();
+  const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     TVM_FFI_THROW(RuntimeError)
         << "GdnDecodeKernel2 launch failed: " << cudaGetErrorString(err);
