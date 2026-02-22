@@ -17,6 +17,11 @@ bash_scripts/run_local.sh full
 bash_scripts/run_local.sh mini-dump-trace-md
 bash_scripts/run_local.sh full-dump-trace-md
 
+# Run benchmark repeatedly and report per-workload mean/std latency
+bash_scripts/run_local_stats.sh full [runs]
+bash_scripts/run_local_stats.sh mini [mini_dataset_name] [runs]
+bash_scripts/run_local_stats.sh [runs]
+
 # NCU profile (all selected workloads / one profiled forward pass each)
 bash_scripts/run_ncu.sh mini
 bash_scripts/run_ncu.sh full
@@ -106,6 +111,19 @@ Notes:
 - `*-dump-trace-md` runs the benchmark, then writes trace entries from the current run to a timestamped markdown file in `logs/`.
   - File pattern: `logs/<definition>_<run-timestamp>.md`
   - Override output folder with: `FIB_RUN_LOG_DIR=/your/path`
+
+Repeated-run stats command:
+
+```bash
+bash_scripts/run_local_stats.sh full [runs]
+bash_scripts/run_local_stats.sh mini [mini_dataset_name] [runs]
+bash_scripts/run_local_stats.sh [runs]
+```
+
+- Default `runs` is `10`.
+- Shorthand: passing only `runs` is treated as `full` mode (e.g. `bash_scripts/run_local_stats.sh 10`).
+- The script runs `scripts/run_local.py` repeatedly and slices new trace rows after each run.
+- Aggregates per-workload `latency_ms` and prints: `n_pass`, `n_seen`, `mean_ms`, `std_ms`, `min_ms`, `max_ms`.
 
 ## 5) Manual Command (Equivalent)
 
