@@ -8,6 +8,9 @@
 namespace gdn_decode {
 
 constexpr int kHeadSize = 128;
+constexpr int64_t kNumQHeads = 4;
+constexpr int64_t kNumKHeads = 4;
+constexpr int64_t kNumVHeads = 8;
 
 inline void
 ValidateShapesAndTypes(const TensorView &q, const TensorView &k,
@@ -84,6 +87,9 @@ ValidateShapesAndTypes(const TensorView &q, const TensorView &k,
       << "sequence length mismatch among q/k/v";
   TVM_FFI_CHECK(K == Kk, ValueError) << "head size mismatch between q and k";
   TVM_FFI_CHECK(T == 1, ValueError) << "decode requires T=1";
+  TVM_FFI_CHECK(Hq == kNumQHeads, ValueError) << "num_q_heads must be 4";
+  TVM_FFI_CHECK(Hk == kNumKHeads, ValueError) << "num_k_heads must be 4";
+  TVM_FFI_CHECK(HV == kNumVHeads, ValueError) << "num_v_heads must be 8";
   TVM_FFI_CHECK(K == kHeadSize, ValueError) << "head size K must be 128";
   TVM_FFI_CHECK(V == kHeadSize, ValueError) << "value size V must be 128";
   TVM_FFI_CHECK(Hq > 0 && Hk > 0, ValueError) << "head counts must be positive";

@@ -1,6 +1,7 @@
 #include "gdn_decode_utils.h"
 #include "tvm_ffi_utils.h"
 
+#include <cstdint>
 #include <cuda_bf16.h>
 #include <math.h>
 
@@ -9,6 +10,11 @@ namespace {
 constexpr int kHeadSize = gdn_decode::kHeadSize;
 constexpr int kNumThreads = 128;
 constexpr float kSoftplusThreshold = 20.0f;
+constexpr int64_t kNumQHeads = gdn_decode::kNumQHeads;
+constexpr int64_t kNumKHeads = gdn_decode::kNumKHeads;
+constexpr int64_t kNumVHeads = gdn_decode::kNumVHeads;
+constexpr int64_t kQGroupSize = kNumVHeads / kNumQHeads;
+constexpr int64_t kKGroupSize = kNumVHeads / kNumKHeads;
 
 struct GdnScalars {
   float g;
@@ -44,28 +50,25 @@ __global__ void GdnDecodeKernel1(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
                                  const float *A_log, const __nv_bfloat16 *a,
                                  const float *dt_bias, const __nv_bfloat16 *b,
                                  float scale, __nv_bfloat16 *output,
-                                 float *new_state, int B, int Hq, int Hk,
-                                 int HV, int K, int V) {
-  int bh = static_cast<int>(blockIdx.x);
-  int batch_idx = bh / HV;
-  int hv_idx = bh % HV;
-  int tid = static_cast<int>(threadIdx.x);
+                                 float *new_state) {
+  const int64_t bh = blockIdx.x;
+  const int64_t batch_idx = bh / kNumVHeads;
+  const int64_t hv_idx = bh % kNumVHeads;
+  const int64_t tid = threadIdx.x;
 
-  int q_groups = HV / Hq;
-  int k_groups = HV / Hk;
-  int q_head = hv_idx / q_groups;
-  int k_head = hv_idx / k_groups;
+  const int64_t q_head = hv_idx / kQGroupSize;
+  const int64_t k_head = hv_idx / kKGroupSize;
 
-  int q_base = (batch_idx * Hq + q_head) * K;
-  int k_base = (batch_idx * Hk + k_head) * K;
-  int hv_base = (batch_idx * HV + hv_idx);
+  const int64_t q_base = (batch_idx * kNumQHeads + q_head) * kHeadSize;
+  const int64_t k_base = (batch_idx * kNumKHeads + k_head) * kHeadSize;
+  const int64_t hv_base = (batch_idx * kNumVHeads + hv_idx);
 
   __shared__ float s_q[kHeadSize];
   __shared__ float s_k[kHeadSize];
   __shared__ float s_g;
   __shared__ float s_beta;
 
-  if (tid < K) {
+  if (tid < kHeadSize) {
     s_q[tid] = __bfloat162float(q[q_base + tid]);
     s_k[tid] = __bfloat162float(k[k_base + tid]);
   }
@@ -78,13 +81,13 @@ __global__ void GdnDecodeKernel1(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   }
   __syncthreads();
 
-  if (tid >= V) {
+  if (tid >= kHeadSize) {
     return;
   }
 
-  int v_idx = tid;
-  int v_offset = hv_base * V + v_idx;
-  int state_row_base = v_offset * K;
+  const int64_t v_idx = tid;
+  const int64_t v_offset = hv_base * kHeadSize + v_idx;
+  const int64_t state_row_base = v_offset * kHeadSize;
 
   float v_scalar = __bfloat162float(v[v_offset]);
 
@@ -111,10 +114,10 @@ __global__ void GdnDecodeKernel1(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   output[v_offset] = __float2bfloat16_rn(scale * out_acc);
 }
 
-__host__ __forceinline__ float ResolveScale(double scale, int K) {
+__host__ __forceinline__ float ResolveScale(double scale) {
   float scale_f = static_cast<float>(scale);
   if (scale_f == 0.0f) {
-    scale_f = 1.0f / sqrtf(static_cast<float>(K));
+    scale_f = 1.0f / sqrtf(static_cast<float>(kHeadSize));
   }
   return scale_f;
 }
@@ -126,12 +129,13 @@ void LaunchGdnDecodeKernel1(const __nv_bfloat16 *q_ptr,
                             const float *dt_bias_ptr,
                             const __nv_bfloat16 *b_ptr, float scale_f,
                             __nv_bfloat16 *output_ptr, float *new_state_ptr,
-                            int B, int Hq, int Hk, int HV, int K, int V,
-                            cudaStream_t stream) {
-  int blocks = B * HV;
-  GdnDecodeKernel1<<<blocks, kNumThreads, 0, stream>>>(
+                            int64_t B, cudaStream_t stream) {
+  TVM_FFI_CHECK(B > 0, ValueError) << "batch size must be positive";
+
+  dim3 grid(B * kNumVHeads, 1, 1);
+  GdnDecodeKernel1<<<grid, kNumThreads, 0, stream>>>(
       q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
-      scale_f, output_ptr, new_state_ptr, B, Hq, Hk, HV, K, V);
+      scale_f, output_ptr, new_state_ptr);
 }
 
 void RunGdnDecodeKernel1(TensorView q, TensorView k, TensorView v,
@@ -141,14 +145,9 @@ void RunGdnDecodeKernel1(TensorView q, TensorView k, TensorView v,
   gdn_decode::ValidateShapesAndTypes(q, k, v, state, A_log, a, dt_bias, b,
                                      output, new_state);
 
-  int B = static_cast<int>(q.size(0));
-  int Hq = static_cast<int>(q.size(2));
-  int Hk = static_cast<int>(k.size(2));
-  int HV = static_cast<int>(v.size(2));
-  int K = static_cast<int>(q.size(3));
-  int V = static_cast<int>(v.size(3));
+  const int64_t B = q.size(0);
 
-  float scale_f = ResolveScale(scale, K);
+  float scale_f = ResolveScale(scale);
 
   ffi::CUDADeviceGuard guard(q.device().device_id);
   cudaStream_t stream = get_cuda_stream(q.device());
@@ -166,8 +165,8 @@ void RunGdnDecodeKernel1(TensorView q, TensorView k, TensorView v,
   float *new_state_ptr = static_cast<float *>(new_state.data_ptr());
 
   LaunchGdnDecodeKernel1(q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr,
-                         dt_bias_ptr, b_ptr, scale_f, output_ptr, new_state_ptr,
-                         B, Hq, Hk, HV, K, V, stream);
+                         dt_bias_ptr, b_ptr, scale_f, output_ptr,
+                         new_state_ptr, B, stream);
 
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
