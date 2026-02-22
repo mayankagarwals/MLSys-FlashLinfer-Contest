@@ -16,6 +16,9 @@ constexpr int64_t kNumVHeads = gdn_decode::kNumVHeads;
 constexpr int64_t kQGroupSize = kNumVHeads / kNumQHeads;
 constexpr int64_t kKGroupSize = kNumVHeads / kNumKHeads;
 
+static_assert(kNumThreads == kHeadSize,
+              "kernel launch threads must match head size");
+
 struct GdnScalars {
   float g;
   float beta;
@@ -68,10 +71,8 @@ __global__ void GdnDecodeKernel1(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   __shared__ float s_g;
   __shared__ float s_beta;
 
-  if (tid < kHeadSize) {
-    s_q[tid] = __bfloat162float(q[q_base + tid]);
-    s_k[tid] = __bfloat162float(k[k_base + tid]);
-  }
+  s_q[tid] = __bfloat162float(q[q_base + tid]);
+  s_k[tid] = __bfloat162float(k[k_base + tid]);
 
   if (tid == 0) {
     GdnScalars scalars = ComputeGdnScalars(A_log[hv_idx], a[hv_base],
@@ -80,10 +81,6 @@ __global__ void GdnDecodeKernel1(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
     s_beta = scalars.beta;
   }
   __syncthreads();
-
-  if (tid >= kHeadSize) {
-    return;
-  }
 
   const int64_t v_idx = tid;
   const int64_t v_offset = hv_base * kHeadSize + v_idx;
