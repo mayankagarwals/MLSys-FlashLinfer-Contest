@@ -1,9 +1,9 @@
 [solution]
-name = "gdn-decode-cuda-naive"
+name = "gdn-decode-cuda-reduction"
 definition = "gdn_decode_qk4_v8_d128_k_last"
 author = "team-name"
 
 [build]
 language = "cuda"
-entry_point = "gdn_decode_kernel_1.cu::gdn_decode"
+entry_point = "gdn_decode_kernel_2.cu::gdn_decode"
 destination_passing_style = true
