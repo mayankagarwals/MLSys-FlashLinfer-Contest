@@ -135,10 +135,9 @@ void LaunchGdnDecodeKernel1(const __nv_bfloat16 *q_ptr,
 }
 
 void RunGdnDecodeKernel1(TensorView q, TensorView k, TensorView v,
-                         Optional<TensorView> state, TensorView A_log,
-                         TensorView a, TensorView dt_bias, TensorView b,
-                         double scale, TensorView output,
-                         TensorView new_state) {
+                         TensorView state, TensorView A_log, TensorView a,
+                         TensorView dt_bias, TensorView b, double scale,
+                         TensorView output, TensorView new_state) {
   gdn_decode::ValidateShapesAndTypes(q, k, v, state, A_log, a, dt_bias, b,
                                      output, new_state);
 
@@ -154,8 +153,7 @@ void RunGdnDecodeKernel1(TensorView q, TensorView k, TensorView v,
   ffi::CUDADeviceGuard guard(q.device().device_id);
   cudaStream_t stream = get_cuda_stream(q.device());
 
-  const TensorView &state_v = state.value();
-  const float *state_ptr = static_cast<const float *>(state_v.data_ptr());
+  const float *state_ptr = static_cast<const float *>(state.data_ptr());
 
   const __nv_bfloat16 *q_ptr = static_cast<const __nv_bfloat16 *>(q.data_ptr());
   const __nv_bfloat16 *k_ptr = static_cast<const __nv_bfloat16 *>(k.data_ptr());
