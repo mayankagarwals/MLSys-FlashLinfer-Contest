@@ -991,7 +991,7 @@ def gated_delta_rule_decode_pretranspose(
             use_qk_l2norm=use_qk_l2norm,
             is_varlen=False,
             stream=stream,
-            options="--enable-tvm-ffi",
+            options="--enable-tvm-ffi --generate-line-info --keep-ptx --keep-cubin --dump-dir /tmp/mlsys_ncu_profile_run/cute_dump_ptx",
         )
         cache["compiled"] = compiled
     else:
