@@ -61,28 +61,10 @@ __device__ __forceinline__ GdnScalars ComputeGdnScalars(float A_log_val,
 
 __device__ __forceinline__ float WarpAllReduceSum(float value) {
 #pragma unroll
-  for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-    value += __shfl_down_sync(kFullWarpMask, value, offset);
+  for (int mask = kWarpSize / 2; mask > 0; mask >>= 1) {
+    value += __shfl_xor_sync(kFullWarpMask, value, mask);
   }
-  return __shfl_sync(kFullWarpMask, value, 0);
-}
-
-__device__ __forceinline__ void
-StoreBf16Predicated(__nv_bfloat16 *ptr, __nv_bfloat16 value, int predicate) {
-  union {
-    __nv_bfloat16 bf16;
-    unsigned short u16;
-  } bits;
-  bits.bf16 = value;
-
-  asm volatile("{\n\t"
-               ".reg .pred p;\n\t"
-               "setp.ne.s32 p, %2, 0;\n\t"
-               "@p st.global.u16 [%0], %1;\n\t"
-               "}\n"
-               :
-               : "l"(ptr), "h"(bits.u16), "r"(predicate)
-               : "memory");
+  return value;
 }
 
 __global__ void GdnDecodeKernel3(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
@@ -163,9 +145,9 @@ __global__ void GdnDecodeKernel3(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   out_partial = fmaf(q_vec.w, updated_vec.w, out_partial);
 
   const float out_acc = WarpAllReduceSum(out_partial);
-  const int lane_is_leader = static_cast<int>(lane == 0);
-  StoreBf16Predicated(output + v_offset, __float2bfloat16_rn(scale * out_acc),
-                      lane_is_leader);
+  if (lane == 0) {
+    output[v_offset] = __float2bfloat16_rn(scale * out_acc);
+  }
 }
 
 __host__ __forceinline__ float ResolveScale(double scale) {
