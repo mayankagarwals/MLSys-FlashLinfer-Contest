@@ -85,7 +85,7 @@ def print_results(results: dict):
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
 
             if result.get("latency_ms") is not None:
-                print(f" | {result['latency_ms']:.3f} ms", end="")
+                print(f" | {result['latency_ms'] * 1e3:.3f} us", end="")
 
             if result.get("speedup_factor") is not None:
                 print(f" | {result['speedup_factor']:.2f}x speedup", end="")
