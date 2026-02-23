@@ -22,6 +22,7 @@ constexpr int kElemsPerLane = kHeadSize / kWarpSize;
 constexpr int64_t kQGroupSize = kNumVHeads / kNumQHeads;
 constexpr int64_t kKGroupSize = kNumVHeads / kNumKHeads;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
+constexpr float kLog2e = 1.44269504088896340736f;
 
 static_assert(kHeadSize == 128, "kernel_3 expects head size 128");
 static_assert(kNumThreads == 128, "kernel_3 expects 128 threads per block");
@@ -37,13 +38,23 @@ struct GdnScalars {
   float beta;
 };
 
+__device__ __forceinline__ float FastExp2(float x) {
+  float y;
+  asm volatile("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+
+__device__ __forceinline__ float FastExp(float x) {
+  return FastExp2(x * kLog2e);
+}
+
 __device__ __forceinline__ float SoftplusStable(float x) {
   const float abs_x = fabsf(x);
-  return log1pf(expf(-abs_x)) + fmaxf(x, 0.0f);
+  return log1pf(FastExp(-abs_x)) + fmaxf(x, 0.0f);
 }
 
 __device__ __forceinline__ float Sigmoid(float x) {
-  return 1.0f / (1.0f + expf(-x));
+  return 1.0f / (1.0f + FastExp(-x));
 }
 
 __device__ __forceinline__ GdnScalars ComputeGdnScalars(float A_log_val,
@@ -54,7 +65,7 @@ __device__ __forceinline__ GdnScalars ComputeGdnScalars(float A_log_val,
   const float softplus_x = SoftplusStable(x);
 
   GdnScalars out;
-  out.g = expf(-expf(A_log_val) * softplus_x);
+  out.g = FastExp(-FastExp(A_log_val) * softplus_x);
   out.beta = Sigmoid(__bfloat162float(b_val));
   return out;
 }
