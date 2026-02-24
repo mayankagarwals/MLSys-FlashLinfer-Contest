@@ -67,7 +67,7 @@ __device__ __forceinline__ float WarpAllReduceSum(float value) {
   return value;
 }
 
-__global__ void GdnDecodeKernel3(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
+__global__ void GdnDecodeKernel4(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
                                  const __nv_bfloat16 *v, const float *state,
                                  const float *A_log, const __nv_bfloat16 *a,
                                  const float *dt_bias, const __nv_bfloat16 *b,
@@ -161,7 +161,7 @@ __host__ __forceinline__ float ResolveScale(double scale) {
   return scale_f;
 }
 
-void LaunchGdnDecodeKernel3(const __nv_bfloat16 *q_ptr,
+void LaunchGdnDecodeKernel4(const __nv_bfloat16 *q_ptr,
                             const __nv_bfloat16 *k_ptr,
                             const __nv_bfloat16 *v_ptr, const float *state_ptr,
                             const float *A_log_ptr, const __nv_bfloat16 *a_ptr,
@@ -172,12 +172,12 @@ void LaunchGdnDecodeKernel3(const __nv_bfloat16 *q_ptr,
   TVM_FFI_CHECK(B > 0, ValueError) << "batch size must be positive";
 
   const dim3 grid(B * kNumVHeads * kNumVTiles, 1, 1);
-  GdnDecodeKernel3<<<grid, kNumThreads, 0, stream>>>(
+  GdnDecodeKernel4<<<grid, kNumThreads, 0, stream>>>(
       q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
       scale_f, output_ptr, new_state_ptr);
 }
 
-void RunGdnDecodeKernel3(TensorView q, TensorView k, TensorView v,
+void RunGdnDecodeKernel4(TensorView q, TensorView k, TensorView v,
                          TensorView state, TensorView A_log, TensorView a,
                          TensorView dt_bias, TensorView b, double scale,
                          TensorView output, TensorView new_state) {
@@ -202,17 +202,17 @@ void RunGdnDecodeKernel3(TensorView q, TensorView k, TensorView v,
   __nv_bfloat16 *output_ptr = static_cast<__nv_bfloat16 *>(output.data_ptr());
   float *new_state_ptr = static_cast<float *>(new_state.data_ptr());
 
-  LaunchGdnDecodeKernel3(q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr,
+  LaunchGdnDecodeKernel4(q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr,
                          dt_bias_ptr, b_ptr, scale_f, output_ptr, new_state_ptr,
                          B, stream);
 
   const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     TVM_FFI_THROW(RuntimeError)
-        << "GdnDecodeKernel3 launch failed: " << cudaGetErrorString(err);
+        << "GdnDecodeKernel4 launch failed: " << cudaGetErrorString(err);
   }
 }
 
 } // namespace
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_decode_v3, RunGdnDecodeKernel3);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_decode_v4, RunGdnDecodeKernel4);
