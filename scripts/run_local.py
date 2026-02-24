@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 
+import pandas as pd
+
 # Add project root to path for imports
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -65,8 +67,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 "solution": trace.solution,
             }
             if trace.evaluation.performance:
-                entry["latency_ms"] = trace.evaluation.performance.latency_ms
-                entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
+                entry["latency_us"] = trace.evaluation.performance.latency_ms * 1e3
+                entry["reference_latency_us"] = trace.evaluation.performance.reference_latency_ms * 1e3
                 entry["speedup_factor"] = trace.evaluation.performance.speedup_factor
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
@@ -84,8 +86,8 @@ def print_results(results: dict):
             status = result.get("status")
             print(f"  Workload {workload_uuid[:8]}...: {status}", end="")
 
-            if result.get("latency_ms") is not None:
-                print(f" | {result['latency_ms'] * 1e3:.3f} us", end="")
+            if result.get("latency_us") is not None:
+                print(f" | {result['latency_us']:.3f} us", end="")
 
             if result.get("speedup_factor") is not None:
                 print(f" | {result['speedup_factor']:.2f}x speedup", end="")
@@ -115,6 +117,13 @@ def main():
         return
 
     print_results(results)
+
+    # export to tsv for convenient copy-paste to excel.
+    # this will overwrite existing tsv file.
+    for k, v in results.items():
+        path = Path("results") / f"{k}.tsv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(v).T.to_csv(path, sep="\t")
 
 
 if __name__ == "__main__":

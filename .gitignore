@@ -227,3 +227,5 @@ mini_datasets
 logs
 ncu_logs
 LOGS.md
+
+results/*.tsv
