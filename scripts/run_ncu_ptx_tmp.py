@@ -3,10 +3,6 @@
 '''
 Usage: 
 
-RUN_ROOT=/tmp/mlsys_ncu_profile_run/ptx_run_$(date +%Y%m%d_%H%M%S)
-export FIB_CACHE_PATH="$RUN_ROOT/fib_cache"
-export FIB_NCU_KEEP_DIR="$RUN_ROOT/cuda_keep"
-
 /usr/local/cuda-13.1/bin/ncu \
   --set full \
   --import-source on \
