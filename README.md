@@ -46,13 +46,7 @@ bash_scripts/run_gdn_experiment.sh "<hypothesis>" "<change_summary>" [decision]
 
 ```bash
 uv venv
-uv pip install flashinfer-bench
-```
-
-If `flashinfer_bench.agents` is missing:
-
-```bash
-uv pip install git+https://github.com/flashinfer-ai/flashinfer-bench.git
+uv pip install -r requirements.txt
 ```
 
 ## 2) Dataset Path
