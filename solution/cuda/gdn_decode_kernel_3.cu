@@ -212,4 +212,4 @@ void RunGdnDecodeKernel3(TensorView q, TensorView k, TensorView v,
 
 } // namespace
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_decode, RunGdnDecodeKernel3);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_decode_v3, RunGdnDecodeKernel3);
