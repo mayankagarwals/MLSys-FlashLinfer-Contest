@@ -93,34 +93,37 @@ __global__ void GdnDecodeKernel3(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   const int64_t k_base = (batch_idx * kNumKHeads + k_head) * kHeadSize;
   const int64_t hv_base = (batch_idx * kNumVHeads + hv_idx);
 
+  const int64_t v_offset = hv_base * kHeadSize + v_idx;
+  const int64_t state_row_base = v_offset * kHeadSize;
+  const float v_scalar = __bfloat162float(v[v_offset]);
+
+  const int vec_idx = lane;
+
+  const float4 state_vec =
+      reinterpret_cast<const float4 *>(state + state_row_base)[vec_idx];
+
   __shared__ alignas(16) float s_q[kHeadSize];
   __shared__ alignas(16) float s_k[kHeadSize];
 
   s_q[tid] = __bfloat162float(q[q_base + tid]);
   s_k[tid] = __bfloat162float(k[k_base + tid]);
 
-  __syncthreads();
 
   const GdnScalars scalars =
       ComputeGdnScalars(A_log[hv_idx], a[hv_base], dt_bias[hv_idx], b[hv_base]);
   const float g = scalars.g;
   const float beta = scalars.beta;
 
-  const int64_t v_offset = hv_base * kHeadSize + v_idx;
-  const int64_t state_row_base = v_offset * kHeadSize;
-
-  const float v_scalar = __bfloat162float(v[v_offset]);
-
-  const int vec_idx = lane;
-  const float4 k_vec = reinterpret_cast<const float4 *>(s_k)[vec_idx];
-  const float4 state_vec =
-      reinterpret_cast<const float4 *>(state + state_row_base)[vec_idx];
 
   float4 old_state_vec;
   old_state_vec.x = g * state_vec.x;
   old_state_vec.y = g * state_vec.y;
   old_state_vec.z = g * state_vec.z;
   old_state_vec.w = g * state_vec.w;
+
+  __syncthreads();
+
+  const float4 k_vec = reinterpret_cast<const float4 *>(s_k)[vec_idx];
 
   float old_v_partial = k_vec.x * old_state_vec.x;
   old_v_partial = fmaf(k_vec.y, old_state_vec.y, old_v_partial);
