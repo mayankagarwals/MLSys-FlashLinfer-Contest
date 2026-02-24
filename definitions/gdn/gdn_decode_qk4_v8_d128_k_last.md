@@ -71,6 +71,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     
     Delta rule update:
     state_new = g * state_old + k^T @ (beta * v + (1-beta) * k @ state_old) - k^T @ (k @ state_old)
+              = g * state_old + k^T @ (beta * (v - k @ state_old))
     output = scale * q @ state_new
     """
     B, T, num_q_heads, K = q.shape
