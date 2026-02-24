@@ -46,16 +46,16 @@ __device__ __forceinline__ float Sigmoid(float x) {
   return 1.0f / (1.0f + expf(-x));
 }
 
-__device__ __forceinline__ GdnScalars ComputeGdnScalars(float A_log_val,
+__device__ __forceinline__ GdnScalars ComputeGdnScalars(float negated_exp_A_log,
                                                         __nv_bfloat16 a_val,
                                                         float dt_bias_val,
-                                                        __nv_bfloat16 b_val) {
+                                                        float beta ) {
   const float x = __bfloat162float(a_val) + dt_bias_val;
   const float softplus_x = SoftplusStable(x);
 
   GdnScalars out;
-  out.g = expf(-expf(A_log_val) * softplus_x);
-  out.beta = Sigmoid(__bfloat162float(b_val));
+  out.g = expf(negated_exp_A_log * softplus_x);
+  out.beta = beta;
   return out;
 }
 
@@ -73,12 +73,15 @@ __global__ void GdnDecodeKernel4(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
                                  const float *dt_bias, const __nv_bfloat16 *b,
                                  float scale, __nv_bfloat16 *output,
                                  float *new_state) {
+
+
   const int64_t block_linear = static_cast<int64_t>(blockIdx.x);
   const int64_t tile_idx = block_linear % kNumVTiles;
   const int64_t bh = block_linear / kNumVTiles;
 
   const int64_t batch_idx = bh / kNumVHeads;
   const int64_t hv_idx = bh % kNumVHeads;
+  const float negated_exp_A_log = -expf(A_log[hv_idx]);
 
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
@@ -92,10 +95,11 @@ __global__ void GdnDecodeKernel4(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   const int64_t q_base = (batch_idx * kNumQHeads + q_head) * kHeadSize;
   const int64_t k_base = (batch_idx * kNumKHeads + k_head) * kHeadSize;
   const int64_t hv_base = (batch_idx * kNumVHeads + hv_idx);
+  const float beta_val = Sigmoid(__bfloat162float(b[hv_base]));
 
   const int64_t v_offset = hv_base * kHeadSize + v_idx;
   const int64_t state_row_base = v_offset * kHeadSize;
-  const float v_scalar = __bfloat162float(v[v_offset]);
+  const float v_scalar = v[v_offset];
 
   const int vec_idx = lane;
 
@@ -105,15 +109,18 @@ __global__ void GdnDecodeKernel4(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   __shared__ alignas(16) float s_q[kHeadSize];
   __shared__ alignas(16) float s_k[kHeadSize];
 
-  s_q[tid] = __bfloat162float(q[q_base + tid]);
-  s_k[tid] = __bfloat162float(k[k_base + tid]);
+  s_q[tid] = q[q_base + tid];
+  s_k[tid] = k[k_base + tid];
 
 
   const GdnScalars scalars =
-      ComputeGdnScalars(A_log[hv_idx], a[hv_base], dt_bias[hv_idx], b[hv_base]);
-  const float g = scalars.g;
-  const float beta = scalars.beta;
+      ComputeGdnScalars(negated_exp_A_log, a[hv_base], dt_bias[hv_idx], beta_val);
+  const float s_g = scalars.g;
+  const float s_beta = scalars.beta;
 
+  __syncthreads();
+  const float g = s_g;
+  const float beta = s_beta;
 
   float4 old_state_vec;
   old_state_vec.x = g * state_vec.x;
@@ -121,7 +128,7 @@ __global__ void GdnDecodeKernel4(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   old_state_vec.z = g * state_vec.z;
   old_state_vec.w = g * state_vec.w;
 
-  __syncthreads();
+
 
   const float4 k_vec = reinterpret_cast<const float4 *>(s_k)[vec_idx];
 
@@ -131,7 +138,7 @@ __global__ void GdnDecodeKernel4(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
   old_v_partial = fmaf(k_vec.w, old_state_vec.w, old_v_partial);
 
   const float old_v = WarpAllReduceSum(old_v_partial);
-  const float new_v = beta * v_scalar + (1.0f - beta) * old_v;
+  const float new_v = beta * __bfloat162float(v_scalar) + (1.0f - beta) * old_v;
   const float delta = new_v - old_v;
 
   float4 updated_vec;
