@@ -1,9 +1,7 @@
 # modified from https://github.com/flashinfer-ai/flashinfer-bench/blob/c1fd980f/flashinfer_bench/agents/_solution_runner.py
-# NOTE: please pack the current solution first using (make sure config.toml is updated)
-#  python scripts/pack_solution.py
 #
 # run with ncu
-#  ncu --set full --import-source on --nvtx --nvtx-include flashinfer_bench_ncu_profile/ -o profile -f python scripts/run_ncu.py --definition gdn_decode_qk4_v8_d128_k_last
+#  ncu --set full --import-source on --nvtx --nvtx-include flashinfer_bench_ncu_profile/ -o profile -f python scripts/run_ncu.py
 #
 # you can select a particular workload by passing --uuid
 
@@ -17,20 +15,26 @@ from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
 from flashinfer_bench.compile import BuilderRegistry
 from flashinfer_bench.data import Definition, Solution, Workload
 from huggingface_hub import hf_hub_download
+from pack_solution import pack_solution
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run solution for profiling")
-    parser.add_argument("--definition", required=True)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--uuid")
-    parser.add_argument("--solution", default="solution.json")
     args = parser.parse_args()
 
-    if args.definition.startswith("dsa_"):
+    # pack and load solution
+    solution_path = pack_solution()
+    solution = Solution.model_validate_json(solution_path.read_text())
+
+    # get definition from solution
+    def_name = solution.definition
+
+    if def_name.startswith("dsa_"):
         parent = "dsa_paged"
-    elif args.definition.startswith("gdn_"):
+    elif def_name.startswith("gdn_"):
         parent = "gdn"
-    elif args.definition.startswith("moe_"):
+    elif def_name.startswith("moe_"):
         parent = "moe"
     else:
         raise ValueError("Unsupported definition")
@@ -38,12 +42,12 @@ def main():
     REPO_NAME = "flashinfer-ai/mlsys26-contest"
 
     # load definition
-    filename = f"definitions/{parent}/{args.definition}.json"
+    filename = f"definitions/{parent}/{def_name}.json"
     path = hf_hub_download(REPO_NAME, filename, repo_type="dataset")
     definition = Definition.model_validate_json(open(path).read())
 
     # load workloads
-    filename = f"workloads/{parent}/{args.definition}.jsonl"
+    filename = f"workloads/{parent}/{def_name}.jsonl"
     path = hf_hub_download(REPO_NAME, filename, repo_type="dataset")
     workloads = [
         Workload.model_validate(json.loads(line)["workload"]) for line in open(path)
@@ -55,9 +59,6 @@ def main():
         workload = workloads[0]
     else:
         workload = next(w for w in workloads if w.uuid == args.uuid)
-
-    # load solution
-    solution = Solution.model_validate_json(open(args.solution).read())
 
     # root path for safetensors path
     trace_set_path = Path(
