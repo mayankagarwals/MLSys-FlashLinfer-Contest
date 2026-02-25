@@ -18,25 +18,18 @@ def softplus(x):
 
 
 @triton.jit
-def sigmoid(x):
-    return 1.0 / (1.0 + tl.math.exp(-x))
-
-
-@triton.jit
 def kernel(
-    q,  # [B, T, H, K]
-    k,  # [B, T, H, K]
-    v,  # [B, T, HV, V]
+    q,  # [B, 1, H, K]
+    k,  # [B, 1, H, K]
+    v,  # [B, 1, HV, V]
     A_log,  # [HV]
-    a,  # [B, T, HV]
+    a,  # [B, 1, HV]
     dt_bias,  # [HV]
-    b,  # [B, T, HV]
-    o,  # [B, T, HV, V]
+    b,  # [B, 1, HV]
+    o,  # [B, 1, HV, V]
     h0,  # [B, HV, V, K]
     ht,  # [B, HV, V, K]
     scale,
-    T,
-    B: tl.constexpr,
     H: tl.constexpr,
     HV: tl.constexpr,
     K: tl.constexpr,
@@ -49,7 +42,7 @@ def kernel(
     i_h = i_hv // (HV // H)
     i_nh = i_n * HV + i_hv
 
-    bos = i_n * T
+    bos = i_n
     o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
 
@@ -67,33 +60,24 @@ def kernel(
     p_h0 = h0 + i_nh * K * V + o_v[:, None] * K + o_k[None, :]  # [BV, BK]
     b_h = tl.load(p_h0).to(tl.float32)
 
-    for _ in range(0, T):
-        b_q = tl.load(p_q).to(tl.float32)  # [BK]
-        b_k = tl.load(p_k).to(tl.float32)  # [BK]
-        b_v = tl.load(p_v).to(tl.float32)  # [BV]
+    b_q = tl.load(p_q).to(tl.float32)  # [BK]
+    b_k = tl.load(p_k).to(tl.float32)  # [BK]
+    b_v = tl.load(p_v).to(tl.float32)  # [BV]
 
-        b_q = b_q * scale
-        b_beta = sigmoid(tl.load(p_b).to(tl.float32))
+    b_q = b_q * scale
+    b_beta = tl.sigmoid(tl.load(p_b).to(tl.float32))
 
-        # apply gating
-        b_x = tl.load(p_a).to(tl.float32) + b_dt_bias
-        b_g = tl.math.exp(b_A_neg * softplus(b_x))
-        b_h *= b_g
+    # apply gating
+    b_x = tl.load(p_a).to(tl.float32) + b_dt_bias
+    b_g = tl.math.exp(b_A_neg * softplus(b_x))
+    b_h *= b_g
 
-        b_v = b_beta * (b_v - tl.sum(b_h * b_k[None, :], 1))
-        b_h += b_k[None, :] * b_v[:, None]
+    b_v = b_beta * (b_v - tl.sum(b_h * b_k[None, :], 1))
+    b_h += b_k[None, :] * b_v[:, None]
 
-        # [BV]
-        b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o)
-
-        p_q += H * K
-        p_k += H * K
-        p_v += HV * V
-
-        p_a += HV
-        p_b += HV
-        p_o += HV * V
+    # [BV]
+    b_o = tl.sum(b_h * b_q[None, :], 1)
+    tl.store(p_o, b_o)
 
     p_ht = ht + i_nh * K * V + o_v[:, None] * K + o_k[None, :]
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty))
@@ -122,15 +106,12 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
         h0=state,
         ht=final_state,
         scale=scale,
-        T=T,
-        B=B,
         H=H,
         HV=HV,
         K=K,
         V=V,
         BV=BV,
-        num_warps=1,
-        num_stages=3,
+        num_warps=1,  # improve occupancy?
     )
     return o, final_state
 
