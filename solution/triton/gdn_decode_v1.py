@@ -4,26 +4,36 @@
 #
 # [build]
 # language = "triton"
-# entry_point = "gdn_fla.py::decode"
+# entry_point = "gdn_decode_v1.py::run"
 # destination_passing_style = false
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-import triton.language.extra.libdevice as tldevice
 
 
 @triton.jit
-def fused_recurrent_gated_delta_rule_fwd_kernel(
-    q,
-    k,
-    v,
-    g,
-    beta,
-    o,
-    h0,
-    ht,
+def softplus(x):
+    return tl.math.log(1 + tl.math.exp(x))
+
+
+@triton.jit
+def sigmoid(x):
+    return 1.0 / (1.0 + tl.math.exp(-x))
+
+
+@triton.jit
+def kernel(
+    q,  # [B, T, H, K]
+    k,  # [B, T, H, K]
+    v,  # [B, T, HV, V]
+    A_log,  # [HV]
+    a,  # [B, T, HV]
+    dt_bias,  # [HV]
+    b,  # [B, T, HV]
+    o,  # [B, T, HV, V]
+    h0,  # [B, HV, V, K]
+    ht,  # [B, HV, V, K]
     scale,
     T,
     B: tl.constexpr,
@@ -31,28 +41,27 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     HV: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    BK: tl.constexpr,
     BV: tl.constexpr,
-    IS_BETA_HEADWISE: tl.constexpr,
 ):
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
-    i_n, i_hv = i_nh // HV, i_nh % HV
+    i_v = tl.program_id(0)
+    i_hv = tl.program_id(1)
+    i_n = tl.program_id(2)
     i_h = i_hv // (HV // H)
+    i_nh = i_n * HV + i_hv
 
-    bos, eos = i_n * T, i_n * T + T
-    o_k = tl.arange(0, BK)
+    bos = i_n * T
+    o_k = tl.arange(0, K)
     o_v = i_v * BV + tl.arange(0, BV)
 
     p_q = q + (bos * H + i_h) * K + o_k
     p_k = k + (bos * H + i_h) * K + o_k
     p_v = v + (bos * HV + i_hv) * V + o_v
 
-    p_g = g + bos * HV + i_hv
-    if IS_BETA_HEADWISE:
-        p_beta = beta + bos * HV + i_hv
-    else:
-        p_beta = beta + (bos * HV + i_hv) * V + o_v
+    b_A_neg = -tl.math.exp(tl.load(A_log + i_hv).to(tl.float32))
+    b_dt_bias = tl.load(dt_bias + i_hv).to(tl.float32)
 
+    p_a = a + bos * HV + i_hv
+    p_b = b + bos * HV + i_hv
     p_o = o + (bos * HV + i_hv) * V + o_v
 
     p_h0 = h0 + i_nh * K * V + o_v[:, None] * K + o_k[None, :]  # [BV, BK]
@@ -64,63 +73,53 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
         b_v = tl.load(p_v).to(tl.float32)  # [BV]
 
         b_q = b_q * scale
-        if IS_BETA_HEADWISE:
-            b_beta = tl.load(p_beta).to(tl.float32)
-        else:
-            # b_beta = tl.load(p_beta, mask=mask_v, other=0).to(tl.float32)
-            b_beta = tl.load(p_beta).to(tl.float32)
+        b_beta = sigmoid(tl.load(p_b).to(tl.float32))
 
-        # [BK, BV]
-        b_g = tl.load(p_g).to(tl.float32)
-        b_h *= tldevice.fast_expf(b_g)
+        # apply gating
+        b_x = tl.load(p_a).to(tl.float32) + b_dt_bias
+        b_g = tl.math.exp(b_A_neg * softplus(b_x))
+        b_h *= b_g
 
         b_v = b_beta * (b_v - tl.sum(b_h * b_k[None, :], 1))
         b_h += b_k[None, :] * b_v[:, None]
 
         # [BV]
         b_o = tl.sum(b_h * b_q[None, :], 1)
-        tl.store(p_o, b_o.to(p_o.dtype.element_ty))
+        tl.store(p_o, b_o)
 
         p_q += H * K
         p_k += H * K
         p_v += HV * V
 
-        p_g += HV
-        p_beta += HV * (1 if IS_BETA_HEADWISE else V)
+        p_a += HV
+        p_b += HV
         p_o += HV * V
 
     p_ht = ht + i_nh * K * V + o_v[:, None] * K + o_k[None, :]
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty))
 
 
-def fused_recurrent_gated_delta_rule_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor | None = None,
-    beta: torch.Tensor | None = None,
-    scale: float = None,
-    initial_state: torch.Tensor = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     B, T, H, K, V = *k.shape, v.shape[-1]
     HV = v.shape[2]
-    N = B
-    BK = triton.next_power_of_2(K)
-    BV = min(8, triton.next_power_of_2(V))
-    NV = triton.cdiv(V, BV)
 
     o = torch.empty_like(v)
-    final_state = q.new_empty(N, HV, V, K, dtype=torch.float32)
+    final_state = q.new_empty(B, HV, V, K, dtype=torch.float32)
 
-    grid = (NV, N * HV)
-    fused_recurrent_gated_delta_rule_fwd_kernel[grid](
+    BV = 4
+    NV = triton.cdiv(V, BV)
+
+    grid = (NV, HV, B)
+    kernel[grid](
         q=q,
         k=k,
         v=v,
-        g=g,
-        beta=beta,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
         o=o,
-        h0=initial_state,
+        h0=state,
         ht=final_state,
         scale=scale,
         T=T,
@@ -129,28 +128,11 @@ def fused_recurrent_gated_delta_rule_fwd(
         HV=HV,
         K=K,
         V=V,
-        BK=BK,
         BV=BV,
-        IS_BETA_HEADWISE=beta.ndim != v.ndim,
         num_warps=1,
         num_stages=3,
     )
     return o, final_state
-
-
-def decode(q, k, v, state, A_log, a, dt_bias, b, scale):
-    x = a.float() + dt_bias.float()  # [B, 1, HV]
-    g = -torch.exp(A_log.float()) * F.softplus(x)  # [B, 1, HV]
-    beta = torch.sigmoid(b.float())  # [B, 1, HV]
-    return fused_recurrent_gated_delta_rule_fwd(
-        q,
-        k,
-        v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        initial_state=state,
-    )
 
 
 if __name__ == "__main__":
@@ -165,4 +147,4 @@ if __name__ == "__main__":
     b = torch.randn(B, T, HV, dtype=torch.bfloat16, device="cuda")
     scale = K**-0.5
 
-    decode(q, k, v, state, A_log, a, dt_bias, b, scale)
+    run(q, k, v, state, A_log, a, dt_bias, b, scale)
