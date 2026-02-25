@@ -2,7 +2,7 @@
 Pack solution source files into solution.json.
 
 Reads configuration from config.toml and packs the appropriate source files
-(Python, Triton, or CUDA) into a Solution JSON file for submission.
+(Python, Triton, CUDA, or TileLang) into a Solution JSON file for submission.
 """
 
 import sys
@@ -79,6 +79,8 @@ def pack_solution(output_path: Path = None) -> Path:
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "tilelang":
+        source_dir = PROJECT_ROOT / "solution" / "tilelang"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
