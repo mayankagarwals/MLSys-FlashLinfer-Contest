@@ -17,7 +17,7 @@ try:
 except ImportError:
     import tomli as tomllib
 
-from flashinfer_bench import BuildSpec
+from flashinfer_bench import BuildSpec, Solution, SourceFile
 from flashinfer_bench.agents import pack_solution_from_files
 
 
@@ -29,6 +29,37 @@ def load_config() -> dict:
 
     with open(config_path, "rb") as f:
         return tomllib.load(f)
+
+
+def patch_cuda_solution(solution: Solution):
+    # submit it as a Python submission so that we can control compile flags
+    assert solution.spec.language == "cuda"
+    solution.spec.language = "python"
+
+    entrypoint_file, entrypoint_symbol = solution.spec.entry_point.split("::")
+    main_content = rf"""
+import tvm_ffi
+from pathlib import Path
+
+CURRENT_DIR = Path(__file__).parent
+
+lib_path = tvm_ffi.cpp.build(
+    name="my_package",
+    cuda_files=[str(CURRENT_DIR / "{entrypoint_file}")],
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "-lineinfo",
+    ]
+)
+mod = tvm_ffi.load_module(lib_path)
+run = mod.{entrypoint_symbol}
+"""
+
+    # swap the entrypoint
+    solution.sources.append(SourceFile(path="main.py",content=main_content))
+    solution.spec.entry_point = "main.py::run"
 
 
 def pack_solution(output_path: Path = None) -> Path:
@@ -72,6 +103,10 @@ def pack_solution(output_path: Path = None) -> Path:
         definition=solution_config["definition"],
         author=solution_config["author"],
     )
+
+    # patch CUDA submission (modify in-place)
+    if spec.language == "cuda":
+        patch_cuda_solution(solution)
 
     # Write to output file
     if output_path is None:
