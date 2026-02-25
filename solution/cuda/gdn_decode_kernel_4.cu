@@ -62,12 +62,18 @@ __device__ __forceinline__ float WarpAllReduceSum(float value) {
   return value;
 }
 
-__global__ void GdnDecodeKernel4(const __nv_bfloat16 *q, const __nv_bfloat16 *k,
-                                 const __nv_bfloat16 *v, const float *state,
-                                 const float *A_log, const __nv_bfloat16 *a,
-                                 const float *dt_bias, const __nv_bfloat16 *b,
-                                 float scale, __nv_bfloat16 *output,
-                                 float *new_state) {
+__global__ void GdnDecodeKernel4(
+  const __nv_bfloat16* __restrict__ q,
+  const __nv_bfloat16* __restrict__ k,
+  const __nv_bfloat16* __restrict__ v,
+  const float*         __restrict__ state,
+  const float*         __restrict__ A_log,
+  const __nv_bfloat16* __restrict__ a,
+  const float*         __restrict__ dt_bias,
+  const __nv_bfloat16* __restrict__ b,
+  float scale,
+  __nv_bfloat16*       __restrict__ output,
+  float*               __restrict__ new_state) {
 
 
   const int64_t block_linear = static_cast<int64_t>(blockIdx.x);
@@ -155,14 +161,20 @@ __host__ __forceinline__ float ResolveScale(double scale) {
   return scale_f;
 }
 
-void LaunchGdnDecodeKernel4(const __nv_bfloat16 *q_ptr,
-                            const __nv_bfloat16 *k_ptr,
-                            const __nv_bfloat16 *v_ptr, const float *state_ptr,
-                            const float *A_log_ptr, const __nv_bfloat16 *a_ptr,
-                            const float *dt_bias_ptr,
-                            const __nv_bfloat16 *b_ptr, float scale_f,
-                            __nv_bfloat16 *output_ptr, float *new_state_ptr,
-                            int64_t B, cudaStream_t stream) {
+void LaunchGdnDecodeKernel4(
+  const __nv_bfloat16* __restrict__ q_ptr,
+  const __nv_bfloat16* __restrict__ k_ptr,
+  const __nv_bfloat16* __restrict__ v_ptr,
+  const float*         __restrict__ state_ptr,
+  const float*         __restrict__ A_log_ptr,
+  const __nv_bfloat16* __restrict__ a_ptr,
+  const float*         __restrict__ dt_bias_ptr,
+  const __nv_bfloat16* __restrict__ b_ptr,
+  float scale_f,
+  __nv_bfloat16*       __restrict__ output_ptr,
+  float*               __restrict__ new_state_ptr,
+  int64_t B,
+  cudaStream_t stream) {
   TVM_FFI_CHECK(B > 0, ValueError) << "batch size must be positive";
 
   const dim3 grid(B * kNumVHeads * kNumVTiles, 1, 1);
