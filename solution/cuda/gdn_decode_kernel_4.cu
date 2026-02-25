@@ -32,22 +32,18 @@ static_assert(kHeadSize % kRowsPerBlock == 0,
               "head size must be divisible by rows per block");
 static_assert(kElemsPerLane == 4, "kernel_3 expects four elements per lane");
 
-
-
 __device__ __forceinline__ float SoftplusStable(float x) {
   const float abs_x = fabsf(x);
   return log1pf(expf(-abs_x)) + fmaxf(x, 0.0f);
 }
-
-
 
 __device__ __forceinline__ float Sigmoid(float x) {
   return 1.0f / (1.0f + expf(-x));
 }
 
 __device__ __forceinline__ float ComputeGdnScalars(float negated_exp_A_log,
-                                                        __nv_bfloat16 a_val,
-                                                        float dt_bias_val) {
+                                                   __nv_bfloat16 a_val,
+                                                   float dt_bias_val) {
   const float x = __bfloat162float(a_val) + dt_bias_val;
   const float softplus_x = SoftplusStable(x);
 
@@ -63,18 +59,12 @@ __device__ __forceinline__ float WarpAllReduceSum(float value) {
 }
 
 __global__ void GdnDecodeKernel4(
-  const __nv_bfloat16* __restrict__ q,
-  const __nv_bfloat16* __restrict__ k,
-  const __nv_bfloat16* __restrict__ v,
-  const float*         __restrict__ state,
-  const float*         __restrict__ A_log,
-  const __nv_bfloat16* __restrict__ a,
-  const float*         __restrict__ dt_bias,
-  const __nv_bfloat16* __restrict__ b,
-  float scale,
-  __nv_bfloat16*       __restrict__ output,
-  float*               __restrict__ new_state) {
-
+    const __nv_bfloat16 *__restrict__ q, const __nv_bfloat16 *__restrict__ k,
+    const __nv_bfloat16 *__restrict__ v, const float *__restrict__ state,
+    const float *__restrict__ A_log, const __nv_bfloat16 *__restrict__ a,
+    const float *__restrict__ dt_bias, const __nv_bfloat16 *__restrict__ b,
+    float scale, __nv_bfloat16 *__restrict__ output,
+    float *__restrict__ new_state) {
 
   const int64_t block_linear = static_cast<int64_t>(blockIdx.x);
   const int64_t tile_idx = block_linear % kNumVTiles;
@@ -113,14 +103,14 @@ __global__ void GdnDecodeKernel4(
   s_q[tid] = q[q_base + tid];
   s_k[tid] = k[k_base + tid];
 
-  const float g = ComputeGdnScalars(negated_exp_A_log, a[hv_base], dt_bias[hv_idx]);
+  const float g =
+      ComputeGdnScalars(negated_exp_A_log, a[hv_base], dt_bias[hv_idx]);
 
   float4 old_state_vec;
   old_state_vec.x = g * state_vec.x;
   old_state_vec.y = g * state_vec.y;
   old_state_vec.z = g * state_vec.z;
   old_state_vec.w = g * state_vec.w;
-
 
   __syncthreads();
 
@@ -161,20 +151,18 @@ __host__ __forceinline__ float ResolveScale(double scale) {
   return scale_f;
 }
 
-void LaunchGdnDecodeKernel4(
-  const __nv_bfloat16* __restrict__ q_ptr,
-  const __nv_bfloat16* __restrict__ k_ptr,
-  const __nv_bfloat16* __restrict__ v_ptr,
-  const float*         __restrict__ state_ptr,
-  const float*         __restrict__ A_log_ptr,
-  const __nv_bfloat16* __restrict__ a_ptr,
-  const float*         __restrict__ dt_bias_ptr,
-  const __nv_bfloat16* __restrict__ b_ptr,
-  float scale_f,
-  __nv_bfloat16*       __restrict__ output_ptr,
-  float*               __restrict__ new_state_ptr,
-  int64_t B,
-  cudaStream_t stream) {
+void LaunchGdnDecodeKernel4(const __nv_bfloat16 *__restrict__ q_ptr,
+                            const __nv_bfloat16 *__restrict__ k_ptr,
+                            const __nv_bfloat16 *__restrict__ v_ptr,
+                            const float *__restrict__ state_ptr,
+                            const float *__restrict__ A_log_ptr,
+                            const __nv_bfloat16 *__restrict__ a_ptr,
+                            const float *__restrict__ dt_bias_ptr,
+                            const __nv_bfloat16 *__restrict__ b_ptr,
+                            float scale_f,
+                            __nv_bfloat16 *__restrict__ output_ptr,
+                            float *__restrict__ new_state_ptr, int64_t B,
+                            cudaStream_t stream) {
   TVM_FFI_CHECK(B > 0, ValueError) << "batch size must be positive";
 
   const dim3 grid(B * kNumVHeads * kNumVTiles, 1, 1);
