@@ -4,9 +4,13 @@ definition = "gdn_decode_qk4_v8_d128_k_last"
 author = "team-name"
 
 [build]
-language = "cuda"
-entry_point = "gdn_decode_kernel_4.cu::gdn_decode_v4"
+language = "triton"
+entry_point = "gdn_decode_reference_thomas.py::kernel_fla_recurrent"
 destination_passing_style = true
+
+#language = "cuda"
+#entry_point = "gdn_decode_kernel_4.cu::gdn_decode_v4"
+#destination_passing_style = true
 
 #language = "triton"
 #entry_point = "gdn_decode_v1.py::run"
