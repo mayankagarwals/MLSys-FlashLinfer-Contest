@@ -1,2 +1,3 @@
 git+https://github.com/flashinfer-ai/flashinfer-bench.git
 pandas
+tilelang
