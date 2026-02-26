@@ -8,10 +8,18 @@ language = "cuda"
 entry_point = "gdn_decode_kernel_4.cu::gdn_decode_v4"
 destination_passing_style = true
 
+#language = "triton"
+#entry_point = "gdn_decode_v1.py::run"
+#destination_passing_style = false
+
 #language = "python"
-#entry_point = "gdn_decode_cutedsl.py::gated_delta_rule_decode"
+#entry_point = "gdn_decode_broadcast.py::run"
 #destination_passing_style = false
 
 #language = "tilelang"
 #entry_point = "gdn_decode.py::run"
+#destination_passing_style = false
+
+#language = "python"
+#entry_point = "gdn_decode_cutedsl.py::gated_delta_rule_decode"
 #destination_passing_style = false
