@@ -90,18 +90,13 @@ __global__ void GdnDecodeKernel4(
 
   const int64_t v_offset = hv_base * kHeadSize + v_idx;
   const int64_t state_row_base = v_offset * kHeadSize;
-  const float v_scalar = v[v_offset];
+  const float v_scalar = __bfloat162float(v[v_offset]);
 
   const int vec_idx = lane;
 
   const float4 state_vec =
       reinterpret_cast<const float4 *>(state + state_row_base)[vec_idx];
 
-  __shared__ alignas(16) float s_q[kHeadSize];
-  __shared__ alignas(16) float s_k[kHeadSize];
-
-  s_q[tid] = q[q_base + tid];
-  s_k[tid] = k[k_base + tid];
 
   const float g =
       ComputeGdnScalars(negated_exp_A_log, a[hv_base], dt_bias[hv_idx]);
@@ -112,17 +107,22 @@ __global__ void GdnDecodeKernel4(
   old_state_vec.z = g * state_vec.z;
   old_state_vec.w = g * state_vec.w;
 
-  __syncthreads();
+  const int elem = lane * kElemsPerLane;  // kElemsPerLane == 4
 
-  const float4 k_vec = reinterpret_cast<const float4 *>(s_k)[vec_idx];
-
+  // Load K (bf16 -> f32)
+  float4 k_vec;
+  k_vec.x = __bfloat162float(k[k_base + elem + 0]);
+  k_vec.y = __bfloat162float(k[k_base + elem + 1]);
+  k_vec.z = __bfloat162float(k[k_base + elem + 2]);
+  k_vec.w = __bfloat162float(k[k_base + elem + 3]);
+  
   float old_v_partial = k_vec.x * old_state_vec.x;
   old_v_partial = fmaf(k_vec.y, old_state_vec.y, old_v_partial);
   old_v_partial = fmaf(k_vec.z, old_state_vec.z, old_v_partial);
   old_v_partial = fmaf(k_vec.w, old_state_vec.w, old_v_partial);
 
   const float old_v = WarpAllReduceSum(old_v_partial);
-  const float delta = beta * (__bfloat162float(v_scalar) - old_v);
+  const float delta = beta * (v_scalar - old_v);
 
   float4 updated_vec;
   updated_vec.x = fmaf(k_vec.x, delta, old_state_vec.x);
@@ -131,7 +131,15 @@ __global__ void GdnDecodeKernel4(
   updated_vec.w = fmaf(k_vec.w, delta, old_state_vec.w);
   reinterpret_cast<float4 *>(new_state + state_row_base)[vec_idx] = updated_vec;
 
-  const float4 q_vec = reinterpret_cast<const float4 *>(s_q)[vec_idx];
+
+  // Load Q (bf16 -> f32)
+  float4 q_vec;
+  q_vec.x = __bfloat162float(q[q_base + elem + 0]);
+  q_vec.y = __bfloat162float(q[q_base + elem + 1]);
+  q_vec.z = __bfloat162float(q[q_base + elem + 2]);
+  q_vec.w = __bfloat162float(q[q_base + elem + 3]);
+
+    
   float out_partial = q_vec.x * updated_vec.x;
   out_partial = fmaf(q_vec.y, updated_vec.y, out_partial);
   out_partial = fmaf(q_vec.z, updated_vec.z, out_partial);
