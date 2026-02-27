@@ -1,10 +1,3 @@
-# modified from https://github.com/flashinfer-ai/flashinfer-bench/blob/c1fd980f/flashinfer_bench/agents/_solution_runner.py
-#
-# run with ncu
-#  ncu --set full --import-source on --nvtx --nvtx-include flashinfer_bench_ncu_profile/ -o profile -f python scripts/run_ncu.py
-#
-# you can select a particular workload by passing --uuid
-
 import json
 import statistics
 from pathlib import Path
