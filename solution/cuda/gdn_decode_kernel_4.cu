@@ -23,14 +23,14 @@ constexpr int64_t kQGroupSize = kNumVHeads / kNumQHeads;
 constexpr int64_t kKGroupSize = kNumVHeads / kNumKHeads;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
 
-static_assert(kHeadSize == 128, "kernel_3 expects head size 128");
-static_assert(kNumThreads == 128, "kernel_3 expects 128 threads per block");
+static_assert(kHeadSize == 128, "kernel_4 expects head size 128");
+static_assert(kNumThreads == 128, "kernel_4 expects 128 threads per block");
 static_assert(kHeadSize % kWarpSize == 0,
               "head size must be divisible by warp size");
-static_assert(kRowsPerBlock == 4, "kernel_3 expects four rows per block");
+static_assert(kRowsPerBlock == 4, "kernel_4 expects four rows per block");
 static_assert(kHeadSize % kRowsPerBlock == 0,
               "head size must be divisible by rows per block");
-static_assert(kElemsPerLane == 4, "kernel_3 expects four elements per lane");
+static_assert(kElemsPerLane == 4, "kernel_4 expects four elements per lane");
 
 __device__ __forceinline__ float SoftplusStable(float x) {
   const float abs_x = fabsf(x);
