@@ -125,7 +125,7 @@ __global__ void GdnDecodeKernel5(
   old_v_partial = fmaf(k_vec.w, old_state_vec.w, old_v_partial);
 
   const float old_v = WarpAllReduceSum(old_v_partial);
-  const float delta = beta * (__bfloat162float(v_scalar) - old_v);
+  const float delta = beta * (v_scalar - old_v);
 
   float4 updated_vec;
   updated_vec.x = fmaf(k_vec.x, delta, old_state_vec.x);
