@@ -94,8 +94,9 @@ __global__ void GdnDecodeKernel6(
   const int64_t state_row_base = v_offset * kHeadSize;
   const float v_scalar = v[v_offset];
 
-  const float4 state_vec =
-      reinterpret_cast<const float4 *>(state + state_row_base)[lane];
+  // Streaming load: bypass L1+L2 cache for read-once state data
+  const float4 state_vec = __ldcs(
+      reinterpret_cast<const float4 *>(state + state_row_base + lane * kElemsPerLane));
 
   const int kk_base = lane * kElemsPerLane;
   float4 q_vec;
