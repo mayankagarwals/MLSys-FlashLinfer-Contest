@@ -5,7 +5,7 @@ author = "team-name"
 
 [build]
 language = "cuda"
-entry_point = "gdn_decode_kernel_5.cu::gdn_decode_v5"
+entry_point = "gdn_decode_kernel_6.cu::gdn_decode_v6"
 destination_passing_style = true
 
 #language = "cuda"
