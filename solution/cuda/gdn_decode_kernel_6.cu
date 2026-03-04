@@ -7,9 +7,8 @@
 
 namespace {
 
-// v6: Same as v5 with __stcs streaming store for new_state.
-// Bypasses L2 cache on state writes (~1MB write-once data),
-// freeing L2 capacity for concurrent state reads by other blocks.
+// v6: Same as v5 with relaxed store + L1::no_allocate for new_state.
+// Bypasses L1 cache.
 
 constexpr int kHeadSize = gdn_decode::kHeadSize;
 constexpr int64_t kNumQHeads = gdn_decode::kNumQHeads;
@@ -134,10 +133,11 @@ __global__ void GdnDecodeKernel6(
   updated_vec.z = fmaf(k_vec.z, delta, old_state_vec.z);
   updated_vec.w = fmaf(k_vec.w, delta, old_state_vec.w);
 
-  // Streaming store: bypass L2 cache for write-once state data
-  __stcs(reinterpret_cast<float4 *>(new_state + state_row_base +
-                                     lane * kElemsPerLane),
-         updated_vec);
+  // Relaxed store: bypass L1 cache
+  float *addr = new_state + state_row_base + lane * kElemsPerLane;
+  asm volatile("st.relaxed.cta.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};"
+      :: "l"(addr),
+      "f"(updated_vec.x), "f"(updated_vec.y), "f"(updated_vec.z), "f"(updated_vec.w));
 
   float out_partial = q_vec.x * updated_vec.x;
   out_partial = fmaf(q_vec.y, updated_vec.y, out_partial);
