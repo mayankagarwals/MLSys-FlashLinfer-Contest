@@ -1,12 +1,20 @@
 [solution]
-name = "gdn-decode-cuda-reduction"
-definition = "gdn_decode_qk4_v8_d128_k_last"
+name = "gdn-prefill-baseline"
+definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "team-name"
 
+#name = "gdn-decode-cuda-reduction"
+#definition = "gdn_decode_qk4_v8_d128_k_last"
+#author = "team-name"
+
 [build]
-language = "cuda"
-entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"
-destination_passing_style = true
+language = "python"
+entry_point = "gdn_prefill_reference.py::run"
+destination_passing_style = false
+
+#language = "cuda"
+#entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"
+#destination_passing_style = true
 
 #language = "cuda"
 #entry_point = "gdn_decode_kernel_4.cu::gdn_decode_v4"
