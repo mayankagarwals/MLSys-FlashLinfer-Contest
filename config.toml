@@ -9,7 +9,7 @@ author = "team-name"
 
 [build]
 language = "python"
-entry_point = "gdn_prefill_reference.py::run"
+entry_point = "gdn_prefill_recurrent_vllm.py::run"
 destination_passing_style = false
 
 #language = "cuda"
