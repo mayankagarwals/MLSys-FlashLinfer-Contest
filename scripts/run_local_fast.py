@@ -50,7 +50,9 @@ def main():
     ).parent
 
     # Build the solution
+    device = "cuda"
     registry = BuilderRegistry.get_instance()
+    runnable_ref = registry.build_reference(definition)
     runnable = registry.build(definition, solution)
 
     rows = []
@@ -63,20 +65,24 @@ def main():
         if any(inp.type == "safetensors" for inp in workload.inputs.values()):
             safe_tensors = load_safetensors(definition, workload, trace_set_path)
 
-        # Generate inputs and allocate outputs
-        device = "cuda"
+        # correctness check
+        # this also runs JIT
         inputs = gen_inputs(definition, workload, device, safe_tensors)
         outputs = allocate_outputs(definition, inputs, device)
+        outputs_ref = allocate_outputs(definition, inputs, device)
 
+        runnable.call_destination_passing(*inputs, *outputs)
+        runnable_ref.call_destination_passing(*inputs, *outputs_ref)
+        try:
+            torch.testing.assert_close(outputs, outputs_ref)
+        except Exception as e:
+            print(e)
+
+        # benchmark
         if solution.spec.destination_passing_style:
             args = tuple(inputs) + tuple(outputs)
         else:
             args = tuple(inputs)
-
-        # Warmup run to trigger JIT compilation
-        with torch.no_grad():
-            runnable(*args)
-        torch.cuda.synchronize()
 
         timings = bench_gpu_time_with_cupti(
             runnable, dry_run_iters=3, repeat_iters=100, input_args=args
