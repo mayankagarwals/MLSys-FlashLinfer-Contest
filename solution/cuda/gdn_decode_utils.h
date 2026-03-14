@@ -121,4 +121,12 @@ ValidateShapesAndTypes(const TensorView &q, const TensorView &k,
       << "state must have shape [B, HV, V, K]";
 }
 
+__host__ __forceinline__ float ResolveScale(double scale) {
+    float scale_f = static_cast<float>(scale);
+    if (scale_f == 0.0f) {
+      scale_f = 1.0f / sqrtf(static_cast<float>(kHeadSize));
+    }
+    return scale_f;
+  }
+
 } // namespace gdn_decode

@@ -8,9 +8,13 @@ author = "team-name"
 #author = "team-name"
 
 [build]
-language = "python"
-entry_point = "gdn_prefill_recurrent_vllm.py::run"
-destination_passing_style = false
+language = "cuda"
+entry_point = "gdn_prefill_kernel_1.cu::gdn_prefill_1"
+destination_passing_style = true
+
+#language = "python"
+#entry_point = "gdn_prefill_recurrent_vllm.py::run"
+#destination_passing_style = false
 
 #language = "cuda"
 #entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"
