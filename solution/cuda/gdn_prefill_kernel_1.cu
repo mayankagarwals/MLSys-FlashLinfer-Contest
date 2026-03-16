@@ -28,11 +28,11 @@ __device__ __forceinline__ float Sigmoid(float x) {
   return 1.0f / (1.0f + expf(-x));
 }
 
-__device__ __forceinline__ float DotRow(const float *a, const float *b) {
-  float acc = 0.0f;
+__device__ __forceinline__ double DotRowF64(const float *a, const float *b) {
+  double acc = 0.0;
 #pragma unroll 8
   for (int d = 0; d < kHeadSize; ++d) {
-    acc = fmaf(a[d], b[d], acc);
+    acc += static_cast<double>(a[d]) * static_cast<double>(b[d]);
   }
   return acc;
 }
@@ -185,10 +185,10 @@ __global__ void GdnPrefillKernel1(
 
   const int64_t state_row_base =
       ((((seq_idx * kNumVHeads) + hv_idx) * kHeadSize) + row) * kHeadSize;
+  float row_buf[kHeadSize];
   for (int d = 0; d < kHeadSize; ++d) {
-    new_state[state_row_base + d] = state[state_row_base + d];
+    row_buf[d] = state[state_row_base + d];
   }
-  __syncthreads();
 
   const float exp_A = expf(A_log[hv_idx]);
 
@@ -218,12 +218,13 @@ __global__ void GdnPrefillKernel1(
     __syncthreads();
 
     if (threadIdx.x == 0) {
-      float acc = 0.0f;
+      double acc = 0.0;
       for (int i = 0; i < tile_n; ++i) {
-        acc += s_logg[i];
-        s_log_cu[i] = acc;
-        s_cu_gate[i] = expf(acc);
-        s_inv_cu_gate[i] = 1.0f / s_cu_gate[i];
+        acc += static_cast<double>(s_logg[i]);
+        const double cu = exp(acc);
+        s_log_cu[i] = static_cast<float>(acc);
+        s_cu_gate[i] = static_cast<float>(cu);
+        s_inv_cu_gate[i] = static_cast<float>(1.0 / cu);
       }
     }
     __syncthreads();
@@ -231,15 +232,15 @@ __global__ void GdnPrefillKernel1(
     for (int idx = threadIdx.x; idx < tile_n * tile_n; idx += kNumThreads) {
       const int i = idx / tile_n;
       const int j = idx % tile_n;
-      float qk_acc = 0.0f;
-      float kk_acc = 0.0f;
+      double qk_acc = 0.0;
+      double kk_acc = 0.0;
 #pragma unroll 8
       for (int d = 0; d < kHeadSize; ++d) {
-        qk_acc = fmaf(s_q[i][d], s_k[j][d], qk_acc);
-        kk_acc = fmaf(s_k[i][d], s_k[j][d], kk_acc);
+        qk_acc += static_cast<double>(s_q[i][d]) * static_cast<double>(s_k[j][d]);
+        kk_acc += static_cast<double>(s_k[i][d]) * static_cast<double>(s_k[j][d]);
       }
-      s_qk[i][j] = qk_acc;
-      s_kkt[i][j] = kk_acc;
+      s_qk[i][j] = static_cast<float>(qk_acc);
+      s_kkt[i][j] = static_cast<float>(kk_acc);
       s_gamma[i][j] = expf(s_log_cu[i] - s_log_cu[j]);
     }
     __syncthreads();
@@ -261,12 +262,13 @@ __global__ void GdnPrefillKernel1(
     if (threadIdx.x == 0) {
       for (int col = 0; col < tile_n; ++col) {
         for (int i = 0; i < tile_n; ++i) {
-          const float rhs = (i == col) ? s_beta[col] : 0.0f;
-          float sum = 0.0f;
+          const double rhs = (i == col) ? static_cast<double>(s_beta[col]) : 0.0;
+          double sum = 0.0;
           for (int j = 0; j < i; ++j) {
-            sum = fmaf(s_L[i][j], s_T[j][col], sum);
+            sum += static_cast<double>(s_L[i][j]) *
+                   static_cast<double>(s_T[j][col]);
           }
-          s_T[i][col] = rhs - sum;
+          s_T[i][col] = static_cast<float>(rhs - sum);
         }
       }
     }
@@ -275,48 +277,57 @@ __global__ void GdnPrefillKernel1(
     for (int idx = threadIdx.x; idx < tile_n * kHeadSize; idx += kNumThreads) {
       const int i = idx / kHeadSize;
       const int d = idx % kHeadSize;
-      float w = 0.0f;
-      float u = 0.0f;
+      double w = 0.0;
+      double u = 0.0;
       for (int j = 0; j < tile_n; ++j) {
-        w = fmaf(s_T[i][j] * s_cu_gate[j], s_k[j][d], w);
-        u = fmaf(s_T[i][j], s_v[j][d], u);
+        w += static_cast<double>(s_T[i][j]) * static_cast<double>(s_cu_gate[j]) *
+             static_cast<double>(s_k[j][d]);
+        u += static_cast<double>(s_T[i][j]) * static_cast<double>(s_v[j][d]);
       }
-      s_W[i][d] = w;
-      s_U[i][d] = u;
+      s_W[i][d] = static_cast<float>(w);
+      s_U[i][d] = static_cast<float>(u);
     }
     __syncthreads();
 
-    float v_err[kBlockT];
+    double v_err[kBlockT];
 #pragma unroll
     for (int i = 0; i < kBlockT; ++i) {
-      v_err[i] = 0.0f;
-    }
-
-    const float *row_state = new_state + state_row_base;
-    for (int i = 0; i < tile_n; ++i) {
-      v_err[i] = s_U[i][row] - DotRow(s_W[i], row_state);
+      v_err[i] = 0.0;
     }
 
     for (int i = 0; i < tile_n; ++i) {
-      float corr = 0.0f;
+      v_err[i] = static_cast<double>(s_U[i][row]) - DotRowF64(s_W[i], row_buf);
+    }
+
+    for (int i = 0; i < tile_n; ++i) {
+      double corr = 0.0;
       for (int j = 0; j <= i; ++j) {
-        corr = fmaf(s_qk[i][j] * s_inv_cu_gate[j], v_err[j], corr);
+        corr += static_cast<double>(s_qk[i][j]) *
+                static_cast<double>(s_inv_cu_gate[j]) * v_err[j];
       }
-      const float qstate = DotRow(s_q[i], row_state);
-      const float out_val = s_cu_gate[i] * (qstate + corr);
+      const double qstate = DotRowF64(s_q[i], row_buf);
+      const double out_val =
+          static_cast<double>(s_cu_gate[i]) * (qstate + corr);
       output[((t0 + i) * kNumVHeads + hv_idx) * kHeadSize + row] =
-          __float2bfloat16_rn(scale * out_val);
+          __float2bfloat16_rn(static_cast<float>(static_cast<double>(scale) *
+                                                 out_val));
     }
 
-    const float tile_scale = s_cu_gate[tile_n - 1];
+    const double tile_scale = static_cast<double>(s_cu_gate[tile_n - 1]);
     for (int d = 0; d < kHeadSize; ++d) {
-      float upd_d = 0.0f;
+      double upd_d = 0.0;
       for (int j = 0; j < tile_n; ++j) {
-        upd_d = fmaf(v_err[j] * s_inv_cu_gate[j], s_k[j][d], upd_d);
+        upd_d += v_err[j] * static_cast<double>(s_inv_cu_gate[j]) *
+                 static_cast<double>(s_k[j][d]);
       }
-      new_state[state_row_base + d] = tile_scale * (row_state[d] + upd_d);
+      row_buf[d] =
+          static_cast<float>(tile_scale * (static_cast<double>(row_buf[d]) + upd_d));
     }
     __syncthreads();
+  }
+
+  for (int d = 0; d < kHeadSize; ++d) {
+    new_state[state_row_base + d] = row_buf[d];
   }
 }
 
