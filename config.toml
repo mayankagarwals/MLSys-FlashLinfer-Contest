@@ -1,7 +1,7 @@
 [solution]
 name = "gdn-decode-cuda-reduction"
 definition = "gdn_decode_qk4_v8_d128_k_last"
-author = "team-name"
+author = "CUDA_ERROR_UNKNOWN"
 
 [build]
 language = "cuda"
