@@ -3,6 +3,10 @@ name = "gdn-decode-cuda-reduction"
 definition = "gdn_decode_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
+name = "gdn-prefill-baseline"
+definition = "gdn_prefill_qk4_v8_d128_k_last"
+author = "team-name"
+
 [build]
 language = "python"
 entry_point = "gdn_prefill_recurrent_vllm.py::run"
