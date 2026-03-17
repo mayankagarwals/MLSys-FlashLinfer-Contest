@@ -34,7 +34,7 @@ def load_config() -> dict:
 def patch_cuda_solution(solution: Solution):
     # submit it as a Python submission so that we can control compile flags
     assert solution.spec.language == "cuda"
-    solution.spec.language = "python"
+    solution.spec.language = solution.spec.language.PYTHON
 
     entrypoint_file, entrypoint_symbol = solution.spec.entry_point.split("::")
     main_content = rf"""
@@ -58,7 +58,7 @@ run = mod.{entrypoint_symbol}
 """
 
     # swap the entrypoint
-    solution.sources.append(SourceFile(path="main.py",content=main_content))
+    solution.sources.append(SourceFile(path="main.py", content=main_content))
     solution.spec.entry_point = "main.py::run"
 
 
@@ -129,12 +129,15 @@ def main():
     """Entry point for pack_solution script."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Pack solution files into solution.json")
+    parser = argparse.ArgumentParser(
+        description="Pack solution files into solution.json"
+    )
     parser.add_argument(
-        "-o", "--output",
+        "-o",
+        "--output",
         type=Path,
         default=None,
-        help="Output path for solution.json (default: ./solution.json)"
+        help="Output path for solution.json (default: ./solution.json)",
     )
     args = parser.parse_args()
 
