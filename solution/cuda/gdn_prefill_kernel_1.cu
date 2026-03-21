@@ -38,8 +38,6 @@ __device__ __forceinline__ double DotRowF64(const float *a, const float *b) {
   return acc;
 }
 
-constexpr int kSolveBlock = 4;
-
 inline void ValidatePrefillShapesAndTypes(const TensorView &q,
                                           const TensorView &k,
                                           const TensorView &v,
@@ -180,10 +178,10 @@ __global__ void GdnPrefillKernel1(
   __shared__ float s_qk[kBlockT][kBlockT];
   __shared__ float s_kkt[kBlockT][kBlockT];
   __shared__ float s_gamma[kBlockT][kBlockT];
-  __shared__ float s_L[kBlockT][kBlockT];
-  __shared__ float s_T[kBlockT][kBlockT];
-  __shared__ float s_W[kBlockT][kHeadSize];
-  __shared__ float s_U[kBlockT][kHeadSize];
+  __shared__ float s_ikk[kBlockT][kBlockT];
+  __shared__ float s_inv_ikk[kBlockT][kBlockT];
+  __shared__ float s_rhs[kBlockT][kHeadSize];
+  __shared__ float s_new_v[kBlockT][kHeadSize];
 
   const int64_t state_row_base =
       ((((seq_idx * kNumVHeads) + hv_idx) * kHeadSize) + row) * kHeadSize;
@@ -256,104 +254,27 @@ __global__ void GdnPrefillKernel1(
       if (i == j) {
         val += 1.0f;
       }
-      s_L[i][j] = val;
+      s_ikk[i][j] = val;
     }
     __syncthreads();
 
     if (threadIdx.x == 0) {
-      const int num_blocks = (tile_n + kSolveBlock - 1) / kSolveBlock;
-      for (int bc = 0; bc < num_blocks; ++bc) {
-        const int col0 = bc * kSolveBlock;
-        const int col_n =
-            ((tile_n - col0) < kSolveBlock) ? (tile_n - col0) : kSolveBlock;
-
-        for (int br = 0; br < num_blocks; ++br) {
-          const int row0 = br * kSolveBlock;
-          const int row_n =
-              ((tile_n - row0) < kSolveBlock) ? (tile_n - row0) : kSolveBlock;
-          double rhs[kSolveBlock][kSolveBlock];
-
-#pragma unroll
-          for (int i = 0; i < kSolveBlock; ++i) {
-#pragma unroll
-            for (int j = 0; j < kSolveBlock; ++j) {
-              rhs[i][j] = 0.0;
-            }
+      // Match the Blackwell kernel's blockwise decomposition:
+      // build inv(I + strict_lower(beta * Gamma * K K^T)) first, then apply it to
+      // beta * (V - gamma * K S_old).
+      for (int row_i = 0; row_i < tile_n; ++row_i) {
+        for (int col_j = 0; col_j < tile_n; ++col_j) {
+          if (col_j > row_i) {
+            s_inv_ikk[row_i][col_j] = 0.0f;
+            continue;
           }
-
-          if (br == bc) {
-#pragma unroll
-            for (int i = 0; i < kSolveBlock; ++i) {
-              if (i < row_n) {
-                rhs[i][i] = static_cast<double>(s_beta[col0 + i]);
-              }
-            }
+          double rhs = (row_i == col_j) ? 1.0 : 0.0;
+          for (int kk = 0; kk < row_i; ++kk) {
+            rhs -= static_cast<double>(s_ikk[row_i][kk]) *
+                   static_cast<double>(s_inv_ikk[kk][col_j]);
           }
-
-          for (int bk = 0; bk < br; ++bk) {
-            const int k0 = bk * kSolveBlock;
-            const int k_n =
-                ((tile_n - k0) < kSolveBlock) ? (tile_n - k0) : kSolveBlock;
-
-#pragma unroll
-            for (int i = 0; i < kSolveBlock; ++i) {
-              if (i >= row_n) {
-                continue;
-              }
-#pragma unroll
-              for (int j = 0; j < kSolveBlock; ++j) {
-                if (j >= col_n) {
-                  continue;
-                }
-                double sum = 0.0;
-#pragma unroll
-                for (int kk = 0; kk < kSolveBlock; ++kk) {
-                  if (kk >= k_n) {
-                    continue;
-                  }
-                  sum += static_cast<double>(s_L[row0 + i][k0 + kk]) *
-                         static_cast<double>(s_T[k0 + kk][col0 + j]);
-                }
-                rhs[i][j] -= sum;
-              }
-            }
-          }
-
-#pragma unroll
-          for (int col = 0; col < kSolveBlock; ++col) {
-            if (col >= col_n) {
-              continue;
-            }
-#pragma unroll
-            for (int i = 0; i < kSolveBlock; ++i) {
-              if (i >= row_n) {
-                continue;
-              }
-              double sum = 0.0;
-#pragma unroll
-              for (int j = 0; j < kSolveBlock; ++j) {
-                if (j >= i || j >= row_n) {
-                  continue;
-                }
-                sum += static_cast<double>(s_L[row0 + i][row0 + j]) * rhs[j][col];
-              }
-              rhs[i][col] -= sum;
-            }
-          }
-
-#pragma unroll
-          for (int i = 0; i < kSolveBlock; ++i) {
-            if (i >= row_n) {
-              continue;
-            }
-#pragma unroll
-            for (int j = 0; j < kSolveBlock; ++j) {
-              if (j >= col_n) {
-                continue;
-              }
-              s_T[row0 + i][col0 + j] = static_cast<float>(rhs[i][j]);
-            }
-          }
+          rhs /= static_cast<double>(s_ikk[row_i][row_i]);
+          s_inv_ikk[row_i][col_j] = static_cast<float>(rhs);
         }
       }
     }
@@ -362,36 +283,43 @@ __global__ void GdnPrefillKernel1(
     for (int idx = threadIdx.x; idx < tile_n * kHeadSize; idx += kNumThreads) {
       const int i = idx / kHeadSize;
       const int d = idx % kHeadSize;
-      double w = 0.0;
-      double u = 0.0;
-      for (int j = 0; j < tile_n; ++j) {
-        w += static_cast<double>(s_T[i][j]) * static_cast<double>(s_cu_gate[j]) *
-             static_cast<double>(s_k[j][d]);
-        u += static_cast<double>(s_T[i][j]) * static_cast<double>(s_v[j][d]);
-      }
-      s_W[i][d] = static_cast<float>(w);
-      s_U[i][d] = static_cast<float>(u);
+      s_rhs[i][d] = static_cast<float>(DotRowF64(s_k[i], row_buf));
     }
     __syncthreads();
 
-    double v_err[kBlockT];
-#pragma unroll
-    for (int i = 0; i < kBlockT; ++i) {
-      v_err[i] = 0.0;
+    for (int idx = threadIdx.x; idx < tile_n * kHeadSize; idx += kNumThreads) {
+      const int i = idx / kHeadSize;
+      const int d = idx % kHeadSize;
+      const double rhs =
+          static_cast<double>(s_beta[i]) *
+          (static_cast<double>(s_v[i][d]) -
+           static_cast<double>(s_cu_gate[i]) * static_cast<double>(s_rhs[i][d]));
+      s_rhs[i][d] = static_cast<float>(rhs);
     }
+    __syncthreads();
 
-    for (int i = 0; i < tile_n; ++i) {
-      v_err[i] = static_cast<double>(s_U[i][row]) - DotRowF64(s_W[i], row_buf);
-    }
-
-    for (int i = 0; i < tile_n; ++i) {
-      double corr = 0.0;
-      for (int j = 0; j <= i; ++j) {
-        corr += static_cast<double>(s_qk[i][j]) *
-                static_cast<double>(s_gamma[i][j]) * v_err[j];
+    for (int idx = threadIdx.x; idx < tile_n * kHeadSize; idx += kNumThreads) {
+      const int i = idx / kHeadSize;
+      const int d = idx % kHeadSize;
+      double new_v = 0.0;
+      for (int j = 0; j < tile_n; ++j) {
+        new_v += static_cast<double>(s_inv_ikk[i][j]) *
+                 static_cast<double>(s_rhs[j][d]);
       }
-      const double qstate = DotRowF64(s_q[i], row_buf);
-      const double out_val = static_cast<double>(s_cu_gate[i]) * qstate + corr;
+      s_new_v[i][d] = static_cast<float>(new_v);
+    }
+    __syncthreads();
+
+    for (int i = 0; i < tile_n; ++i) {
+      double o_intra = 0.0;
+      for (int j = 0; j <= i; ++j) {
+        o_intra += static_cast<double>(s_qk[i][j]) *
+                   static_cast<double>(s_gamma[i][j]) *
+                   static_cast<double>(s_new_v[j][row]);
+      }
+      const double o_inter =
+          static_cast<double>(s_cu_gate[i]) * DotRowF64(s_q[i], row_buf);
+      const double out_val = o_inter + o_intra;
       output[((t0 + i) * kNumVHeads + hv_idx) * kHeadSize + row] =
           __float2bfloat16_rn(static_cast<float>(static_cast<double>(scale) *
                                                  out_val));
@@ -401,7 +329,8 @@ __global__ void GdnPrefillKernel1(
       double next_val =
           static_cast<double>(s_cu_gate[tile_n - 1]) * static_cast<double>(row_buf[d]);
       for (int j = 0; j < tile_n; ++j) {
-        next_val += static_cast<double>(s_gamma[tile_n - 1][j]) * v_err[j] *
+        next_val += static_cast<double>(s_gamma[tile_n - 1][j]) *
+                    static_cast<double>(s_new_v[j][row]) *
                     static_cast<double>(s_k[j][d]);
       }
       row_buf[d] = static_cast<float>(next_val);
