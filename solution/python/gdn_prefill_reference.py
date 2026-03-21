@@ -9,7 +9,7 @@ def matmul(a: torch.Tensor, b: torch.Tensor):
 
 
 @torch.no_grad()
-def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
+def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, k_scale=1.0):
     """
     Gated Delta Net prefill reference implementation (k-last layout).
 
@@ -44,7 +44,9 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     beta = torch.sigmoid(b.float())  # [total_seq_len, HV]
 
     q_exp = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)
-    k_exp = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)
+    k_exp = k.repeat_interleave(num_v_heads // num_k_heads, dim=1).float()
+    if k_scale != 1.0:
+        k_exp = k_exp * float(k_scale)
 
     output = torch.zeros(
         (total_seq_len, num_sab_heads, head_size), dtype=torch.bfloat16, device=device

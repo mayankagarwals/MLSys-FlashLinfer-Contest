@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import statistics
 import sys
@@ -20,6 +21,7 @@ from scripts.pack_solution import pack_solution
 from solution.python import gdn_prefill_reference
 
 DEFAULT_FULL_DATASET_PATH = "/home/simon/flashinfer-competition/mlsys26-contest"
+DEFAULT_REFERENCE_K_SCALE = 1.0 / math.sqrt(128.0)
 
 
 def infer_parent(def_name: str) -> str:
@@ -112,6 +114,9 @@ def main():
     parser.add_argument("--uuid", type=str, required=True)
     parser.add_argument("--dry-run-iters", type=int, default=10)
     parser.add_argument("--repeat-iters", type=int, default=100)
+    parser.add_argument(
+        "--reference-k-scale", type=float, default=DEFAULT_REFERENCE_K_SCALE
+    )
     args = parser.parse_args()
 
     solution_path = pack_solution()
@@ -140,7 +145,9 @@ def main():
 
     ref_inputs = [clone_arg(x) for x in inputs]
     with torch.no_grad():
-        expected_output, expected_new_state = gdn_prefill_reference.run(*ref_inputs)
+        expected_output, expected_new_state = gdn_prefill_reference.run(
+            *ref_inputs, k_scale=args.reference_k_scale
+        )
         runnable(*call_args)
     torch.cuda.synchronize()
 
@@ -153,6 +160,7 @@ def main():
     print(f"Dataset path: {dataset_path}")
     print(f"Definition: {solution.definition}")
     print(f"Workload: {workload.uuid}")
+    print(f"Reference k_scale: {args.reference_k_scale}")
     print("Reference comparison:")
     for name in definition.outputs.keys():
         actual = actual_by_name[name]
@@ -165,7 +173,7 @@ def main():
 
     with torch.no_grad():
         runnable(*bench_call_args)
-        gdn_prefill_reference.run(*ref_bench_args)
+        gdn_prefill_reference.run(*ref_bench_args, k_scale=args.reference_k_scale)
     torch.cuda.synchronize()
 
     solution_latency_us = bench_latency_us(
@@ -173,7 +181,7 @@ def main():
     )
     reference_latency_us = bench_latency_us(
         gdn_prefill_reference.run,
-        ref_bench_args,
+        ref_bench_args + (args.reference_k_scale,),
         args.dry_run_iters,
         args.repeat_iters,
     )

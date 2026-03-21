@@ -9,6 +9,7 @@ namespace {
 constexpr int kHeadSize = 128;
 constexpr int kBlockT = 16;
 constexpr int kNumThreads = 128;
+constexpr float kKeyScale = 0.08838834764831845f;
 constexpr int64_t kNumQHeads = 4;
 constexpr int64_t kNumKHeads = 4;
 constexpr int64_t kNumVHeads = 8;
@@ -202,7 +203,7 @@ __global__ void GdnPrefillKernel1(
       const int d = idx % kHeadSize;
       s_q[t][d] = __bfloat162float(
           q[((t0 + t) * kNumQHeads + q_head) * kHeadSize + d]);
-      s_k[t][d] = __bfloat162float(
+      s_k[t][d] = kKeyScale * __bfloat162float(
           k[((t0 + t) * kNumKHeads + k_head) * kHeadSize + d]);
       s_v[t][d] = __bfloat162float(
           v[((t0 + t) * kNumVHeads + hv_idx) * kHeadSize + d]);
