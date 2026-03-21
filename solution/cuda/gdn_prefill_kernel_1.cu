@@ -176,7 +176,6 @@ __global__ void GdnPrefillKernel1(
   __shared__ float s_beta[kBlockT];
   __shared__ float s_log_cu[kBlockT];
   __shared__ float s_cu_gate[kBlockT];
-  __shared__ float s_inv_cu_gate[kBlockT];
   __shared__ float s_qk[kBlockT][kBlockT];
   __shared__ float s_kkt[kBlockT][kBlockT];
   __shared__ float s_gamma[kBlockT][kBlockT];
@@ -226,7 +225,6 @@ __global__ void GdnPrefillKernel1(
         const double cu = exp(acc);
         s_log_cu[i] = static_cast<float>(acc);
         s_cu_gate[i] = static_cast<float>(cu);
-        s_inv_cu_gate[i] = static_cast<float>(1.0 / cu);
       }
     }
     __syncthreads();
@@ -389,25 +387,23 @@ __global__ void GdnPrefillKernel1(
       double corr = 0.0;
       for (int j = 0; j <= i; ++j) {
         corr += static_cast<double>(s_qk[i][j]) *
-                static_cast<double>(s_inv_cu_gate[j]) * v_err[j];
+                static_cast<double>(s_gamma[i][j]) * v_err[j];
       }
       const double qstate = DotRowF64(s_q[i], row_buf);
-      const double out_val =
-          static_cast<double>(s_cu_gate[i]) * (qstate + corr);
+      const double out_val = static_cast<double>(s_cu_gate[i]) * qstate + corr;
       output[((t0 + i) * kNumVHeads + hv_idx) * kHeadSize + row] =
           __float2bfloat16_rn(static_cast<float>(static_cast<double>(scale) *
                                                  out_val));
     }
 
-    const double tile_scale = static_cast<double>(s_cu_gate[tile_n - 1]);
     for (int d = 0; d < kHeadSize; ++d) {
-      double upd_d = 0.0;
+      double next_val =
+          static_cast<double>(s_cu_gate[tile_n - 1]) * static_cast<double>(row_buf[d]);
       for (int j = 0; j < tile_n; ++j) {
-        upd_d += v_err[j] * static_cast<double>(s_inv_cu_gate[j]) *
-                 static_cast<double>(s_k[j][d]);
+        next_val += static_cast<double>(s_gamma[tile_n - 1][j]) * v_err[j] *
+                    static_cast<double>(s_k[j][d]);
       }
-      row_buf[d] =
-          static_cast<float>(tile_scale * (static_cast<double>(row_buf[d]) + upd_d));
+      row_buf[d] = static_cast<float>(next_val);
     }
     __syncthreads();
   }

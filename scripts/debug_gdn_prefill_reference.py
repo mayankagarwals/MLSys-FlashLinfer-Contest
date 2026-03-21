@@ -75,10 +75,18 @@ def tensor_summary(name: str, actual: torch.Tensor, expected: torch.Tensor) -> s
     actual_f = actual.float()
     expected_f = expected.float()
     diff = (actual_f - expected_f).abs()
-    max_abs = diff.max()
-    max_idx = tuple(int(i) for i in (diff == max_abs).nonzero()[0].tolist())
-    expected_at_max = expected_f[max_idx].item()
-    actual_at_max = actual_f[max_idx].item()
+    if diff.numel() == 0:
+        return f"{name}: shape={tuple(actual.shape)} dtype={actual.dtype} empty tensor"
+    diff_flat = diff.reshape(-1)
+    actual_flat = actual_f.reshape(-1)
+    expected_flat = expected_f.reshape(-1)
+    flat_idx = int(diff_flat.argmax().item())
+    max_abs = diff_flat[flat_idx]
+    max_idx = tuple(
+        int(i) for i in torch.unravel_index(torch.tensor(flat_idx), diff.shape)
+    )
+    expected_at_max = expected_flat[flat_idx].item()
+    actual_at_max = actual_flat[flat_idx].item()
     rel = diff / expected_f.abs().clamp_min(1e-12)
     max_rel = rel.max().item()
     return (
