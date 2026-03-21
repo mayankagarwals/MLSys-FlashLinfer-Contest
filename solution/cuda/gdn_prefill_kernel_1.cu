@@ -37,6 +37,8 @@ __device__ __forceinline__ double DotRowF64(const float *a, const float *b) {
   return acc;
 }
 
+constexpr int kSolveBlock = 4;
+
 inline void ValidatePrefillShapesAndTypes(const TensorView &q,
                                           const TensorView &k,
                                           const TensorView &v,
@@ -260,15 +262,99 @@ __global__ void GdnPrefillKernel1(
     __syncthreads();
 
     if (threadIdx.x == 0) {
-      for (int col = 0; col < tile_n; ++col) {
-        for (int i = 0; i < tile_n; ++i) {
-          const double rhs = (i == col) ? static_cast<double>(s_beta[col]) : 0.0;
-          double sum = 0.0;
-          for (int j = 0; j < i; ++j) {
-            sum += static_cast<double>(s_L[i][j]) *
-                   static_cast<double>(s_T[j][col]);
+      const int num_blocks = (tile_n + kSolveBlock - 1) / kSolveBlock;
+      for (int bc = 0; bc < num_blocks; ++bc) {
+        const int col0 = bc * kSolveBlock;
+        const int col_n =
+            ((tile_n - col0) < kSolveBlock) ? (tile_n - col0) : kSolveBlock;
+
+        for (int br = 0; br < num_blocks; ++br) {
+          const int row0 = br * kSolveBlock;
+          const int row_n =
+              ((tile_n - row0) < kSolveBlock) ? (tile_n - row0) : kSolveBlock;
+          double rhs[kSolveBlock][kSolveBlock];
+
+#pragma unroll
+          for (int i = 0; i < kSolveBlock; ++i) {
+#pragma unroll
+            for (int j = 0; j < kSolveBlock; ++j) {
+              rhs[i][j] = 0.0;
+            }
           }
-          s_T[i][col] = static_cast<float>(rhs - sum);
+
+          if (br == bc) {
+#pragma unroll
+            for (int i = 0; i < kSolveBlock; ++i) {
+              if (i < row_n) {
+                rhs[i][i] = static_cast<double>(s_beta[col0 + i]);
+              }
+            }
+          }
+
+          for (int bk = 0; bk < br; ++bk) {
+            const int k0 = bk * kSolveBlock;
+            const int k_n =
+                ((tile_n - k0) < kSolveBlock) ? (tile_n - k0) : kSolveBlock;
+
+#pragma unroll
+            for (int i = 0; i < kSolveBlock; ++i) {
+              if (i >= row_n) {
+                continue;
+              }
+#pragma unroll
+              for (int j = 0; j < kSolveBlock; ++j) {
+                if (j >= col_n) {
+                  continue;
+                }
+                double sum = 0.0;
+#pragma unroll
+                for (int kk = 0; kk < kSolveBlock; ++kk) {
+                  if (kk >= k_n) {
+                    continue;
+                  }
+                  sum += static_cast<double>(s_L[row0 + i][k0 + kk]) *
+                         static_cast<double>(s_T[k0 + kk][col0 + j]);
+                }
+                rhs[i][j] -= sum;
+              }
+            }
+          }
+
+#pragma unroll
+          for (int col = 0; col < kSolveBlock; ++col) {
+            if (col >= col_n) {
+              continue;
+            }
+#pragma unroll
+            for (int i = 0; i < kSolveBlock; ++i) {
+              if (i >= row_n) {
+                continue;
+              }
+              double sum = 0.0;
+#pragma unroll
+              for (int j = 0; j < kSolveBlock; ++j) {
+                if (j >= i || j >= row_n) {
+                  continue;
+                }
+                sum += static_cast<double>(s_L[row0 + i][row0 + j]) * rhs[j][col];
+              }
+              rhs[i][col] -= sum;
+            }
+          }
+
+#pragma unroll
+          for (int i = 0; i < kSolveBlock; ++i) {
+            if (i >= row_n) {
+              continue;
+            }
+#pragma unroll
+            for (int j = 0; j < kSolveBlock; ++j) {
+              if (j >= col_n) {
+                continue;
+              }
+              s_T[row0 + i][col0 + j] = static_cast<float>(rhs[i][j]);
+            }
+          }
         }
       }
     }
