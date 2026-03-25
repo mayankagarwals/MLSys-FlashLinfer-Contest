@@ -24,12 +24,19 @@ Interpretation:
 
 ## Experiment Summary
 
-| Experiment | Hypothesis | Mini result | Outcome |
-| --- | --- | --- | --- |
-| Tile-2 CTA reuse | Process 2 `tile_idx` values per CTA and reuse `q`, `k`, `g`, `beta` | `3.699 us -> 3.789 us` | Failed |
-| Warp-broadcast scalar path | Have one lane compute/load scalar gating terms and broadcast within warp | `3.709 us -> 4.150 us` | Failed |
-| Precompute `g/beta` helper kernel | Remove scalar gating from decode entirely | `3.706 us -> 9.369 us` | Failed badly |
-| CTA-shared `q/k` cache | Stage `q` and `k` once per CTA in shared memory | `3.702 us -> 3.779 us` | Failed |
+Branch reference:
+- Baseline: `codex/gdn-v7-baseline-20260325`
+- Tile-2 CTA reuse: `codex/gdn-v7-tile2-20260325`
+- Warp-broadcast scalar path: `codex/gdn-v7-warp-bcast-20260325`
+- Precompute `g/beta`: `codex/gdn-v7-precompute-20260325-182043`
+- CTA-shared `q/k` cache: `codex/gdn-v7-shared-qk-20260325-185829`
+
+| Experiment | Branch | Hypothesis | Mini result | Outcome |
+| --- | --- | --- | --- | --- |
+| Tile-2 CTA reuse | `codex/gdn-v7-tile2-20260325` | Process 2 `tile_idx` values per CTA and reuse `q`, `k`, `g`, `beta` | `3.699 us -> 3.789 us` | Failed |
+| Warp-broadcast scalar path | `codex/gdn-v7-warp-bcast-20260325` | Have one lane compute/load scalar gating terms and broadcast within warp | `3.709 us -> 4.150 us` | Failed |
+| Precompute `g/beta` helper kernel | `codex/gdn-v7-precompute-20260325-182043` | Remove scalar gating from decode entirely | `3.706 us -> 9.369 us` | Failed badly |
+| CTA-shared `q/k` cache | `codex/gdn-v7-shared-qk-20260325-185829` | Stage `q` and `k` once per CTA in shared memory | `3.702 us -> 3.779 us` | Failed |
 
 ## 1. Tile-2 CTA Reuse
 
