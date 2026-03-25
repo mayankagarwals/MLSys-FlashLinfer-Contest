@@ -78,10 +78,19 @@ LoadBf16x4GlobalNc(const __nv_bfloat16 *__restrict__ ptr) {
 
 __device__ __forceinline__ void
 StoreF32x4RelaxedNoAllocate(float *addr, const float4 &value) {
-  asm volatile(
-      "st.relaxed.cta.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};"
+  asm (
+      "st.global.L1::no_allocate.v4.f32 [%0], {%1, %2, %3, %4};"     
       :
       : "l"(addr), "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w));
+}
+
+__device__ __forceinline__ float4
+LoadF32x4GlobalNcStreaming(const float *__restrict__ ptr) {
+  float4 out;
+  asm ("ld.global.cs.nc.v4.f32 {%0, %1, %2, %3}, [%4];"
+               : "=f"(out.x), "=f"(out.y), "=f"(out.z), "=f"(out.w)
+               : "l"(ptr));
+  return out;
 }
 
 __global__ void GdnDecodeKernel7(
@@ -119,7 +128,7 @@ __global__ void GdnDecodeKernel7(
   const float v_scalar = v[v_offset];
 
   const float4 state_vec =
-      reinterpret_cast<const float4 *>(state + state_row_base)[lane];
+  LoadF32x4GlobalNcStreaming(state + state_row_base + lane * kElemsPerLane);
 
   const int kk_base = lane * kElemsPerLane;
   const float4 q_vec = LoadBf16x4GlobalNc(q + q_base + kk_base);
