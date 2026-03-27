@@ -1,15 +1,13 @@
 import json
-import statistics
 from pathlib import Path
 
 import pandas as pd
-import torch
-from flashinfer.testing import bench_gpu_time_with_cupti
+from flashinfer_bench.bench.evaluators import DefaultEvaluator
 from flashinfer_bench.bench.evaluators.utils import allocate_outputs
-from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
+from flashinfer_bench.bench.utils import BenchmarkConfig, gen_inputs, load_safetensors
 from flashinfer_bench.compile import BuilderRegistry
 from flashinfer_bench.data import Definition, Solution, Workload
-from huggingface_hub import hf_hub_download
+from huggingface_hub import snapshot_download
 from pack_solution import pack_solution
 
 
@@ -31,23 +29,18 @@ def main():
         raise ValueError("Unsupported definition")
 
     REPO_NAME = "flashinfer-ai/mlsys26-contest"
+    repo_path = Path(snapshot_download(REPO_NAME, repo_type="dataset"))
 
     # load definition
     filename = f"definitions/{parent}/{def_name}.json"
-    path = hf_hub_download(REPO_NAME, filename, repo_type="dataset")
-    definition = Definition.model_validate_json(open(path).read())
+    definition = Definition.model_validate_json(open(repo_path / filename).read())
 
     # load workloads
     filename = f"workloads/{parent}/{def_name}.jsonl"
-    path = hf_hub_download(REPO_NAME, filename, repo_type="dataset")
     workloads = [
-        Workload.model_validate(json.loads(line)["workload"]) for line in open(path)
+        Workload.model_validate(json.loads(line)["workload"])
+        for line in open(repo_path / filename)
     ]
-
-    # root path for safetensors path
-    trace_set_path = Path(
-        hf_hub_download(REPO_NAME, "README.md", repo_type="dataset")
-    ).parent
 
     # Build the solution
     device = "cuda"
@@ -63,33 +56,29 @@ def main():
         # Load safetensors if needed
         safe_tensors = None
         if any(inp.type == "safetensors" for inp in workload.inputs.values()):
-            safe_tensors = load_safetensors(definition, workload, trace_set_path)
+            safe_tensors = load_safetensors(definition, workload, repo_path)
 
-        # correctness check
-        # this also runs JIT
         inputs = gen_inputs(definition, workload, device, safe_tensors)
-        outputs = allocate_outputs(definition, inputs, device)
         outputs_ref = allocate_outputs(definition, inputs, device)
-
-        runnable.call_destination_passing(*inputs, *outputs)
         runnable_ref.call_destination_passing(*inputs, *outputs_ref)
-        try:
-            torch.testing.assert_close(outputs, outputs_ref)
-        except Exception as e:
-            print(e)
 
-        # benchmark
-        if solution.spec.destination_passing_style:
-            args = tuple(inputs) + tuple(outputs)
-        else:
-            args = tuple(inputs)
-
-        timings = bench_gpu_time_with_cupti(
-            runnable, dry_run_iters=3, repeat_iters=100, input_args=args
+        evaluation = DefaultEvaluator.evaluate(
+            definition,
+            runnable,
+            inputs=[inputs],
+            ref_outputs=[outputs_ref],
+            ref_mean_latency_ms=1.0,  # arbitrary number
+            cfg=BenchmarkConfig(),
+            log_path="/tmp/flashinfer",
+            device=device,
         )
-        latency_us = statistics.median(timings) * 1e3
-
-        rows.append(dict(uuid=workload.uuid, latency_us=latency_us))
+        rows.append(
+            dict(
+                uuid=workload.uuid,
+                **workload.axes,
+                latency_us=evaluation.performance.latency_ms * 1e3,
+            )
+        )
 
     # Cleanup
     runnable.cleanup()

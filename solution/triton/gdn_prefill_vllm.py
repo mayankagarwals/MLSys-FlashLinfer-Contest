@@ -27,6 +27,7 @@ def run(
     scale: float,
 ):
     # compute g and beta
+    # TODO: fuse this with one of the kernels inside chunk_gated_delta_rule_fwd()
     x = a.float() + dt_bias.float()
     g = -torch.exp(A_log.float()) * F.softplus(x)  # this is actually log(g)
     beta = b.float().sigmoid()
