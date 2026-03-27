@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 
@@ -11,9 +12,22 @@ from huggingface_hub import snapshot_download
 from pack_solution import pack_solution
 
 
-def main():
-    # pack and load solution
-    solution_path = pack_solution()
+def main(args: argparse.Namespace):
+    REPO_NAME = "flashinfer-ai/mlsys26-contest"
+    repo_path = Path(snapshot_download(REPO_NAME, repo_type="dataset"))
+
+    if args.run_baseline:
+        # load hard-coded baseline path
+        solution_path = dict(
+            gdn_decode=repo_path
+            / "solutions/baseline/gdn/gdn_decode_qk4_v8_d128_k_last/flashinfer_wrapper_9b7f1e.json",
+            gdn_prefill=repo_path
+            / "solutions/baseline/gdn/gdn_prefill_qk4_v8_d128_k_last/flashinfer_wrapper_123ca6.json",
+        )[args.run_baseline]
+    else:
+        # pack our solution
+        solution_path = pack_solution()
+
     solution = Solution.model_validate_json(solution_path.read_text())
 
     # get definition from solution
@@ -27,9 +41,6 @@ def main():
         parent = "moe"
     else:
         raise ValueError("Unsupported definition")
-
-    REPO_NAME = "flashinfer-ai/mlsys26-contest"
-    repo_path = Path(snapshot_download(REPO_NAME, repo_type="dataset"))
 
     # load definition
     filename = f"definitions/{parent}/{def_name}.json"
@@ -69,16 +80,16 @@ def main():
             ref_outputs=[outputs_ref],
             ref_mean_latency_ms=1.0,  # arbitrary number
             cfg=BenchmarkConfig(),
-            log_path="/tmp/flashinfer",
+            log_path="/tmp/flashinfer-bench",
             device=device,
         )
-        rows.append(
-            dict(
-                uuid=workload.uuid,
-                **workload.axes,
-                latency_us=evaluation.performance.latency_ms * 1e3,
-            )
-        )
+        sample = dict(uuid=workload.uuid, **workload.axes)
+        if evaluation.performance is not None:
+            sample.update(latency_us=evaluation.performance.latency_ms * 1e3)
+        if evaluation.correctness is not None:
+            sample.update(max_abs_error=evaluation.correctness.max_absolute_error)
+            sample.update(max_rel_error=evaluation.correctness.max_relative_error)
+        rows.append(sample)
 
     # Cleanup
     runnable.cleanup()
@@ -90,4 +101,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_baseline", choices=["gdn_decode", "gdn_prefill"])
+    args = parser.parse_args()
+
+    main(args)
