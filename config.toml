@@ -1,7 +1,7 @@
 [solution]
 
 
-name = "gdn-prefill-baseline"
+name = "gdn-prefill-cuda-recurrent"
 definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
@@ -11,9 +11,9 @@ author = "CUDA_ERROR_UNKNOWN"
 #author = "CUDA_ERROR_UNKNOWN"
 
 [build]
-language = "python"
-entry_point = "gdn_prefill_recurrent_vllm.py::run"
-destination_passing_style = false
+language = "cuda"
+entry_point = "gdn_prefill_kernel_recurrent.cu::gdn_prefill_recurrent_v1"
+destination_passing_style = true
 
 #language = "cuda"
 #entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"

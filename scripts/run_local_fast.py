@@ -1,3 +1,16 @@
+"""
+Fast single-process benchmark using flashinfer-bench evaluator.
+
+Reads config.toml for the solution to benchmark, runs all workloads in a single
+process (no subprocess isolation), and reports latency + correctness.
+
+Usage:
+  cd scripts/
+  uv run python run_local_fast.py                          # download dataset from HuggingFace
+  uv run python run_local_fast.py --local /path/to/dataset  # use local dataset
+  uv run python run_local_fast.py --run_baseline gdn_prefill  # run FlashInfer baseline
+"""
+
 import argparse
 import json
 from pathlib import Path
@@ -8,13 +21,19 @@ from flashinfer_bench.bench.evaluators.utils import allocate_outputs
 from flashinfer_bench.bench.utils import BenchmarkConfig, gen_inputs, load_safetensors
 from flashinfer_bench.compile import BuilderRegistry
 from flashinfer_bench.data import Definition, Solution, Workload
-from huggingface_hub import snapshot_download
 from pack_solution import pack_solution
 
 
 def main(args: argparse.Namespace):
-    REPO_NAME = "flashinfer-ai/mlsys26-contest"
-    repo_path = Path(snapshot_download(REPO_NAME, repo_type="dataset"))
+    # Resolve dataset path: local flag > HuggingFace download
+    if args.local:
+        repo_path = Path(args.local)
+        if not repo_path.exists():
+            raise FileNotFoundError(f"Local dataset not found: {repo_path}")
+    else:
+        from huggingface_hub import snapshot_download
+        REPO_NAME = "flashinfer-ai/mlsys26-contest"
+        repo_path = Path(snapshot_download(REPO_NAME, repo_type="dataset"))
 
     if args.run_baseline:
         # load hard-coded baseline path
@@ -101,8 +120,11 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--run_baseline", choices=["gdn_decode", "gdn_prefill"])
+    parser = argparse.ArgumentParser(description="Fast single-process benchmark")
+    parser.add_argument("--run_baseline", choices=["gdn_decode", "gdn_prefill"],
+                        help="Run FlashInfer baseline instead of config.toml solution")
+    parser.add_argument("--local", type=str, default=None,
+                        help="Path to local dataset (skip HuggingFace download)")
     args = parser.parse_args()
 
     main(args)
