@@ -1,21 +1,33 @@
+import argparse
 import json
-import statistics
 from pathlib import Path
 
 import pandas as pd
-import torch
-from flashinfer.testing import bench_gpu_time_with_cupti
+from flashinfer_bench.bench.evaluators import DefaultEvaluator
 from flashinfer_bench.bench.evaluators.utils import allocate_outputs
-from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
+from flashinfer_bench.bench.utils import BenchmarkConfig, gen_inputs, load_safetensors
 from flashinfer_bench.compile import BuilderRegistry
 from flashinfer_bench.data import Definition, Solution, Workload
-from huggingface_hub import hf_hub_download
+from huggingface_hub import snapshot_download
 from pack_solution import pack_solution
 
 
-def main():
-    # pack and load solution
-    solution_path = pack_solution()
+def main(args: argparse.Namespace):
+    REPO_NAME = "flashinfer-ai/mlsys26-contest"
+    repo_path = Path(snapshot_download(REPO_NAME, repo_type="dataset"))
+
+    if args.run_baseline:
+        # load hard-coded baseline path
+        solution_path = dict(
+            gdn_decode=repo_path
+            / "solutions/baseline/gdn/gdn_decode_qk4_v8_d128_k_last/flashinfer_wrapper_9b7f1e.json",
+            gdn_prefill=repo_path
+            / "solutions/baseline/gdn/gdn_prefill_qk4_v8_d128_k_last/flashinfer_wrapper_123ca6.json",
+        )[args.run_baseline]
+    else:
+        # pack our solution
+        solution_path = pack_solution()
+
     solution = Solution.model_validate_json(solution_path.read_text())
 
     # get definition from solution
@@ -30,27 +42,21 @@ def main():
     else:
         raise ValueError("Unsupported definition")
 
-    REPO_NAME = "flashinfer-ai/mlsys26-contest"
-
     # load definition
     filename = f"definitions/{parent}/{def_name}.json"
-    path = hf_hub_download(REPO_NAME, filename, repo_type="dataset")
-    definition = Definition.model_validate_json(open(path).read())
+    definition = Definition.model_validate_json(open(repo_path / filename).read())
 
     # load workloads
     filename = f"workloads/{parent}/{def_name}.jsonl"
-    path = hf_hub_download(REPO_NAME, filename, repo_type="dataset")
     workloads = [
-        Workload.model_validate(json.loads(line)["workload"]) for line in open(path)
+        Workload.model_validate(json.loads(line)["workload"])
+        for line in open(repo_path / filename)
     ]
 
-    # root path for safetensors path
-    trace_set_path = Path(
-        hf_hub_download(REPO_NAME, "README.md", repo_type="dataset")
-    ).parent
-
     # Build the solution
+    device = "cuda"
     registry = BuilderRegistry.get_instance()
+    runnable_ref = registry.build_reference(definition)
     runnable = registry.build(definition, solution)
 
     rows = []
@@ -61,29 +67,29 @@ def main():
         # Load safetensors if needed
         safe_tensors = None
         if any(inp.type == "safetensors" for inp in workload.inputs.values()):
-            safe_tensors = load_safetensors(definition, workload, trace_set_path)
+            safe_tensors = load_safetensors(definition, workload, repo_path)
 
-        # Generate inputs and allocate outputs
-        device = "cuda"
         inputs = gen_inputs(definition, workload, device, safe_tensors)
-        outputs = allocate_outputs(definition, inputs, device)
+        outputs_ref = allocate_outputs(definition, inputs, device)
+        runnable_ref.call_destination_passing(*inputs, *outputs_ref)
 
-        if solution.spec.destination_passing_style:
-            args = tuple(inputs) + tuple(outputs)
-        else:
-            args = tuple(inputs)
-
-        # Warmup run to trigger JIT compilation
-        with torch.no_grad():
-            runnable(*args)
-        torch.cuda.synchronize()
-
-        timings = bench_gpu_time_with_cupti(
-            runnable, dry_run_iters=3, repeat_iters=100, input_args=args
+        evaluation = DefaultEvaluator.evaluate(
+            definition,
+            runnable,
+            inputs=[inputs],
+            ref_outputs=[outputs_ref],
+            ref_mean_latency_ms=1.0,  # arbitrary number
+            cfg=BenchmarkConfig(),
+            log_path="/tmp/flashinfer-bench",
+            device=device,
         )
-        latency_us = statistics.median(timings) * 1e3
-
-        rows.append(dict(uuid=workload.uuid, latency_us=latency_us))
+        sample = dict(uuid=workload.uuid, **workload.axes)
+        if evaluation.performance is not None:
+            sample.update(latency_us=evaluation.performance.latency_ms * 1e3)
+        if evaluation.correctness is not None:
+            sample.update(max_abs_error=evaluation.correctness.max_absolute_error)
+            sample.update(max_rel_error=evaluation.correctness.max_relative_error)
+        rows.append(sample)
 
     # Cleanup
     runnable.cleanup()
@@ -95,4 +101,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run_baseline", choices=["gdn_decode", "gdn_prefill"])
+    args = parser.parse_args()
+
+    main(args)
