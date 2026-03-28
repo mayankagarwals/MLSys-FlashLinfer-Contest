@@ -1,4 +1,48 @@
-#include "gdn_decode_utils.h"
+/*
+ * GDN Prefill — Recurrent CUDA Kernel (v1)
+ *
+ * Token-by-token recurrent processing, identical math to gdn_decode_kernel_7
+ * but adapted for the prefill layout with variable-length sequences.
+ *
+ * Key differences from decode kernel (gdn_decode_kernel_7.cu):
+ *
+ * 1. Tensor layout
+ *    Decode: q/k [B, 1, Hq/Hk, K], v [B, 1, Hv, V], a/b [B, 1, Hv]  (4D/3D, T=1)
+ *    Prefill: q/k [T, Hq/Hk, K], v [T, Hv, V], a/b [T, Hv]  (3D/2D, packed)
+ *    Prefill adds cu_seqlens [N+1] to mark sequence boundaries.
+ *
+ * 2. Grid indexing
+ *    Decode: block_linear → (batch_idx, hv_idx, tile_idx), batch_idx is constant.
+ *    Prefill: block_linear → (seq_idx, hv_idx, tile_idx), seq_idx is constant.
+ *
+ * 3. Token loop
+ *    Decode: no loop — processes exactly one token per block.
+ *    Prefill: loops over all tokens in [cu_seqlens[seq_idx], cu_seqlens[seq_idx+1]).
+ *
+ * 4. Address computation
+ *    Decode: hv_base = batch_idx * kNumVHeads + hv_idx (constant per block).
+ *            q_base/k_base use batch_idx (constant).
+ *    Prefill: hv_base = t * kNumVHeads + hv_idx (changes each iteration).
+ *             q_base/k_base use token index t (changes each iteration).
+ *
+ * 5. State management
+ *    Decode: state_vec is `const float4` (immutable, one token). Writes updated_vec
+ *            to new_state immediately after the state update.
+ *    Prefill: state_vec is `float4` (mutable). Updated in-place each iteration and
+ *             carried across the loop in registers. Written to new_state only ONCE
+ *             after the loop ends — avoids (seq_len - 1) unnecessary global writes.
+ *
+ * 6. Optional initial state
+ *    Decode: state is always required (non-null).
+ *    Prefill: state can be nullptr (first-ever sequence) → zero-initialize.
+ *
+ * 7. State tensor indexing
+ *    Decode: state_row_base from v_offset = (batch_idx * Hv + hv_idx) * V + v_idx.
+ *    Prefill: state_row_base from (seq_idx * Hv + hv_idx) * V + v_idx.
+ *             Same formula but indexed by sequence, not by token.
+ */
+
+#include "gdn_prefill_utils.h"
 #include "tvm_ffi_utils.h"
 
 #include <cstdint>
@@ -7,10 +51,10 @@
 
 namespace {
 
-constexpr int kHeadSize = gdn_decode::kHeadSize;
-constexpr int64_t kNumQHeads = gdn_decode::kNumQHeads;
-constexpr int64_t kNumKHeads = gdn_decode::kNumKHeads;
-constexpr int64_t kNumVHeads = gdn_decode::kNumVHeads;
+constexpr int kHeadSize = gdn_prefill::kHeadSize;
+constexpr int64_t kNumQHeads = gdn_prefill::kNumQHeads;
+constexpr int64_t kNumKHeads = gdn_prefill::kNumKHeads;
+constexpr int64_t kNumVHeads = gdn_prefill::kNumVHeads;
 
 constexpr int kWarpSize = 32;
 constexpr int kWarpsPerBlock = 4;
@@ -82,28 +126,24 @@ StoreF32x4RelaxedNoAllocate(float *addr, const float4 &value) {
 }
 
 __global__ void GdnPrefillRecurrentKernel(
-    const __nv_bfloat16 *__restrict__ q,
-    const __nv_bfloat16 *__restrict__ k,
-    const __nv_bfloat16 *__restrict__ v,
-    const float *__restrict__ state,
-    const float *__restrict__ A_log,
-    const __nv_bfloat16 *__restrict__ a,
-    const float *__restrict__ dt_bias,
-    const __nv_bfloat16 *__restrict__ b,
-    // DIFF: extra params for variable-length sequences (decode has neither)
-    const int64_t *__restrict__ cu_seqlens,
-    float scale,
-    __nv_bfloat16 *__restrict__ output,
-    float *__restrict__ new_state,
-    // DIFF: decode doesn't need this — grid is B * Hv * tiles
+    const __nv_bfloat16 *__restrict__ q,          // [T, Hq=4, K=128]   bf16
+    const __nv_bfloat16 *__restrict__ k,          // [T, Hk=4, K=128]   bf16
+    const __nv_bfloat16 *__restrict__ v,          // [T, Hv=8, V=128]   bf16
+    const float *__restrict__ state,              // [N, Hv, V, K]      fp32 or nullptr
+    const float *__restrict__ A_log,              // [Hv=8]             fp32
+    const __nv_bfloat16 *__restrict__ a,          // [T, Hv=8]          bf16
+    const float *__restrict__ dt_bias,            // [Hv=8]             fp32
+    const __nv_bfloat16 *__restrict__ b,          // [T, Hv=8]          bf16
+    const int64_t *__restrict__ cu_seqlens,       // [N+1]              int64
+    float scale,                                  // scalar             fp32
+    __nv_bfloat16 *__restrict__ output,           // [T, Hv=8, V=128]   bf16
+    float *__restrict__ new_state,                // [N, Hv, V, K]      fp32
     int64_t num_seqs) {
 
   const int64_t block_linear = static_cast<int64_t>(blockIdx.x);
   const int64_t tile_idx = block_linear % kNumVTiles;
   const int64_t bh = block_linear / kNumVTiles;
 
-  // DIFF: decode has batch_idx here. Same math, just renamed because we're
-  // iterating over variable-length sequences instead of fixed batch elements.
   const int64_t seq_idx = bh / kNumVHeads;
   const int64_t hv_idx = bh % kNumVHeads;
   const float negated_exp_A_log = -expf(A_log[hv_idx]);
@@ -117,19 +157,10 @@ __global__ void GdnPrefillRecurrentKernel(
   const int64_t q_head = hv_idx / kQGroupSize;
   const int64_t k_head = hv_idx / kKGroupSize;
 
-  // DIFF: decode computes state_row_base from v_offset = hv_base * kHeadSize + v_idx,
-  // then state_row_base = v_offset * kHeadSize. Same formula, but here we use
-  // seq_idx (constant for the whole block) instead of batch_idx, because the
-  // state tensor is [N, Hv, V, K] indexed by sequence, not by token.
   const int64_t state_row_base =
       ((seq_idx * kNumVHeads + hv_idx) * kHeadSize + v_idx) * kHeadSize;
 
-  // DIFF: decode declares `const float4 state_vec` (immutable, one token).
-  // Prefill declares `float4 state_vec` (mutable) because it's updated each
-  // iteration and carried across the loop in registers.
   float4 state_vec;
-  // DIFF: decode always has state (required). Prefill allows nullptr for the
-  // first-ever sequence with no prior state — zero-initialize in that case.
   if (state != nullptr) {
     state_vec =
         reinterpret_cast<const float4 *>(state + state_row_base)[lane];
@@ -137,38 +168,24 @@ __global__ void GdnPrefillRecurrentKernel(
     state_vec = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
   }
 
-  // DIFF: decode has no loop and no cu_seqlens. It processes exactly one token
-  // per block. Prefill uses cu_seqlens to find the token range for this
-  // sequence, then loops over all of them.
   const int64_t seq_start = cu_seqlens[seq_idx];
   const int64_t seq_end = cu_seqlens[seq_idx + 1];
   const int kk_base = lane * kElemsPerLane;
 
-  // DIFF: the entire for-loop is new. Decode's per-token body runs once;
-  // prefill wraps the same body in this loop.
   for (int64_t t = seq_start; t < seq_end; t++) {
-    // DIFF: decode computes hv_base = batch_idx * kNumVHeads + hv_idx (constant).
-    // Prefill: t replaces batch_idx since layout is [T, H, ...] not [B, H, ...].
-    // hv_base changes each iteration because t changes.
     const int64_t hv_base = t * kNumVHeads + hv_idx;
 
-    // DIFF: decode uses batch_idx in q_base/k_base (constant).
-    // Prefill uses t (changes per iteration). Same formula otherwise.
     const int64_t q_base = (t * kNumQHeads + q_head) * kHeadSize;
     const int64_t k_base = (t * kNumKHeads + k_head) * kHeadSize;
     const float4 q_vec = LoadBf16x4GlobalNc(q + q_base + kk_base);
     const float4 k_vec = LoadBf16x4GlobalNc(k + k_base + kk_base);
 
-    // DIFF: decode computes v_offset once before the body (constant).
-    // Prefill recomputes it each iteration because hv_base changes with t.
     const int64_t v_offset = hv_base * kHeadSize + v_idx;
     const float v_scalar = __bfloat162float(v[v_offset]);
     const float beta = Sigmoid(__bfloat162float(b[hv_base]));
 
     const float g =
         ComputeGdnScalars(negated_exp_A_log, a[hv_base], dt_bias[hv_idx]);
-
-    // --- Everything below is identical to decode ---
 
     float4 old_state_vec;
     old_state_vec.x = g * state_vec.x;
@@ -184,16 +201,11 @@ __global__ void GdnPrefillRecurrentKernel(
     const float old_v = WarpAllReduceSum(old_v_partial);
     const float delta = beta * (v_scalar - old_v);
 
-    // DIFF: decode writes into a separate `updated_vec`, then stores it to
-    // new_state immediately. Prefill writes back into `state_vec` so the
-    // updated state carries forward to the next iteration in registers.
     state_vec.x = fmaf(k_vec.x, delta, old_state_vec.x);
     state_vec.y = fmaf(k_vec.y, delta, old_state_vec.y);
     state_vec.z = fmaf(k_vec.z, delta, old_state_vec.z);
     state_vec.w = fmaf(k_vec.w, delta, old_state_vec.w);
 
-    // DIFF: decode computes output from `updated_vec`.
-    // Prefill uses `state_vec` (same data, just a different variable name).
     float out_partial = q_vec.x * state_vec.x;
     out_partial = fmaf(q_vec.y, state_vec.y, out_partial);
     out_partial = fmaf(q_vec.z, state_vec.z, out_partial);
@@ -205,9 +217,6 @@ __global__ void GdnPrefillRecurrentKernel(
     }
   }
 
-  // DIFF: decode writes new_state right after the state update (mid-kernel).
-  // Prefill writes only ONCE here after the loop ends — only the final state
-  // matters. This avoids (seq_len - 1) unnecessary global memory writes.
   float *addr = new_state + state_row_base + lane * kElemsPerLane;
   StoreF32x4RelaxedNoAllocate(addr, state_vec);
 }
@@ -226,67 +235,16 @@ void RunGdnPrefillRecurrentV1(
     TensorView dt_bias, TensorView b, TensorView cu_seqlens, double scale,
     TensorView output, TensorView new_state) {
 
-  CHECK_INPUT(q);
-  CHECK_INPUT(k);
-  CHECK_INPUT(v);
-  CHECK_INPUT(A_log);
-  CHECK_INPUT(a);
-  CHECK_INPUT(dt_bias);
-  CHECK_INPUT(b);
-  CHECK_INPUT(cu_seqlens);
-  CHECK_INPUT(output);
-  CHECK_INPUT(new_state);
+  gdn_prefill::ValidateShapesAndTypes(q, k, v, A_log, a, dt_bias, b,
+                                      cu_seqlens, output, new_state);
 
-  CHECK_DIM(3, q);
-  CHECK_DIM(3, k);
-  CHECK_DIM(3, v);
-  CHECK_DIM(1, A_log);
-  CHECK_DIM(2, a);
-  CHECK_DIM(1, dt_bias);
-  CHECK_DIM(2, b);
-  CHECK_DIM(1, cu_seqlens);
-  CHECK_DIM(3, output);
-  CHECK_DIM(4, new_state);
-
-  const int64_t T = q.size(0);
   const int64_t num_seqs = cu_seqlens.size(0) - 1;
-
-  TVM_FFI_CHECK(num_seqs > 0, ValueError) << "must have at least one sequence";
-  TVM_FFI_CHECK(q.size(1) == kNumQHeads && q.size(2) == kHeadSize, ValueError)
-      << "q shape mismatch";
-  TVM_FFI_CHECK(k.size(0) == T && k.size(1) == kNumKHeads &&
-                    k.size(2) == kHeadSize,
-                ValueError)
-      << "k shape mismatch";
-  TVM_FFI_CHECK(v.size(0) == T && v.size(1) == kNumVHeads &&
-                    v.size(2) == kHeadSize,
-                ValueError)
-      << "v shape mismatch";
-  TVM_FFI_CHECK(a.size(0) == T && a.size(1) == kNumVHeads, ValueError)
-      << "a shape mismatch";
-  TVM_FFI_CHECK(b.size(0) == T && b.size(1) == kNumVHeads, ValueError)
-      << "b shape mismatch";
-
-  TVM_FFI_CHECK(q.dtype() == dl_bfloat16, TypeError) << "q must be bfloat16";
-  TVM_FFI_CHECK(k.dtype() == dl_bfloat16, TypeError) << "k must be bfloat16";
-  TVM_FFI_CHECK(v.dtype() == dl_bfloat16, TypeError) << "v must be bfloat16";
-  TVM_FFI_CHECK(a.dtype() == dl_bfloat16, TypeError) << "a must be bfloat16";
-  TVM_FFI_CHECK(b.dtype() == dl_bfloat16, TypeError) << "b must be bfloat16";
-  TVM_FFI_CHECK(A_log.dtype() == dl_float32, TypeError);
-  TVM_FFI_CHECK(dt_bias.dtype() == dl_float32, TypeError);
-  TVM_FFI_CHECK(output.dtype() == dl_bfloat16, TypeError);
-  TVM_FFI_CHECK(new_state.dtype() == dl_float32, TypeError);
 
   const float *state_ptr = nullptr;
   if (state_opt.has_value()) {
     TensorView state = state_opt.value();
-    CHECK_INPUT(state);
-    CHECK_DIM(4, state);
-    TVM_FFI_CHECK(state.dtype() == dl_float32, TypeError);
-    TVM_FFI_CHECK(state.size(0) == num_seqs && state.size(1) == kNumVHeads &&
-                      state.size(2) == kHeadSize && state.size(3) == kHeadSize,
-                  ValueError)
-        << "state shape mismatch";
+    gdn_prefill::ValidateState(state, num_seqs);
+    CHECK_DEVICE(q, state);
     state_ptr = static_cast<const float *>(state.data_ptr());
   }
 
