@@ -17,15 +17,15 @@ triton.set_allocator(alloc_fn)
     configs=[triton.Config(dict(), num_warps=num_warps) for num_warps in [2, 4, 8]],
     key=["H", "K", "BT"],
 )
-@triton.jit()
+@triton.jit
 def chunk_scaled_dot_kkt_fwd_kernel(
-    k_ptr,  # [total_seqlen, Hg, K]
+    k_ptr,  # [T, Hg, K_dim]
     A_log_ptr,  # [H]
     a_ptr,  # [T, H]
     dt_bias_ptr,  # [H]
-    b_ptr,  # [total_seqlen, H]
-    g_cu_ptr,  # [total_seqlen, H]
-    beta_ptr,  # [total_seqlen, H]
+    b_ptr,  # [T, H]
+    g_cu_ptr,  # [T, H]
+    beta_ptr,  # [T, H]
     A_ptr,
     cu_seqlens_ptr,
     chunk_indices_ptr,
@@ -44,11 +44,14 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     seqlen = eos - bos
 
-    # don't need masking for loads, since we will apply masking for store
-    offs_t = bos + chunk_id * BT + tl.arange(0, BT)
-    offs_k = tl.arange(0, K_dim)
-    k_ptrs = k_ptr + (offs_t[:, None] * Hg * K_dim + k_head_id * K_dim + offs_k)
-    k = tl.load(k_ptrs)  # [BT, K]
+    # this creates tensormap on device -> might not be good
+    k_desc = tl.make_tensor_descriptor(
+        k_ptr + (bos * Hg * K_dim + k_head_id * K_dim),
+        [seqlen, K_dim],
+        [Hg * K_dim, 1],
+        [BT, K_dim],
+    )
+    k = k_desc.load([chunk_id * BT, 0])
     A = tl.dot(k, k.T)  # [BT, BT]
 
     # each K head corresponds to (H // Hg) V heads
@@ -75,6 +78,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         A_ = A * beta[:, None]
         A_ = A_ * tl.exp(g_cu[:, None] - g_cu[None, :])
 
+        # TODO: use TMA
         offs_t = chunk_id * BT + tl.arange(0, BT)
         mask_t = offs_t < seqlen
         mask_A = (offs_t[:, None] > offs_t[None, :]) & (mask_t[:, None] & mask_t)
@@ -88,6 +92,18 @@ def chunk_scaled_dot_kkt_fwd_kernel(
             (1, 0),
         )
         tl.store(A_ptrs, A_, boundary_check=(0, 1))
+
+
+# concat along the first dim
+@triton.jit
+def _concat_2d_dim0(A, B):
+    return tl.join(A, B).permute(2, 0, 1).reshape(A.shape[0] * 2, A.shape[1])
+
+
+# concat along the last dim
+@triton.jit
+def _concat_2d_dim1(A, B):
+    return tl.join(A, B).permute(0, 2, 1).reshape(A.shape[0], A.shape[1] * 2)
 
 
 @triton.autotune(
@@ -125,7 +141,7 @@ def merge_16x16_to_64x64_inverse_kernel(
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
     eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
-    T = eos - bos
+    seqlen = eos - bos
 
     # compute inverse
     o_i = tl.arange(0, 16)
@@ -133,10 +149,10 @@ def merge_16x16_to_64x64_inverse_kernel(
     m_I = o_i[:, None] == o_i[None, :]
 
     desc = tl.make_tensor_descriptor(
-        A_ptr + (bos * H + head_id) * BT, [T, BT], [H * BT, 1], [16, 16]
+        A_ptr + (bos * H + head_id) * BT, [seqlen, BT], [H * BT, 1], [16, 16]
     )
     desc_o = tl.make_tensor_descriptor(
-        Ai_ptr + (bos * H + head_id) * BT, [T, BT], [H * BT, 1], [16, 16]
+        Ai_ptr + (bos * H + head_id) * BT, [seqlen, BT], [H * BT, 1], [16, 16]
     )
     Ai_11 = desc.load([chunk_id * BT + 0, 0]).to(tl.float32)
     Ai_22 = desc.load([chunk_id * BT + 16, 16]).to(tl.float32)
@@ -149,23 +165,23 @@ def merge_16x16_to_64x64_inverse_kernel(
     Ai_33 = -tl.where(m_A, Ai_33, 0)
     Ai_44 = -tl.where(m_A, Ai_44, 0)
 
-    for i in range(2, min(16, T - chunk_id * BT)):
+    for i in range(2, min(16, seqlen - chunk_id * BT)):
         a_11 = -tl.load(A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i)
         a_11 += tl.sum(a_11[:, None] * Ai_11, 0)
         Ai_11 = tl.where((o_i == i)[:, None], a_11, Ai_11)
-    for i in range(16 + 2, min(32, T - chunk_id * BT)):
+    for i in range(16 + 2, min(32, seqlen - chunk_id * BT)):
         a_22 = -tl.load(
             A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 16
         )
         a_22 += tl.sum(a_22[:, None] * Ai_22, 0)
         Ai_22 = tl.where((o_i == i - 16)[:, None], a_22, Ai_22)
-    for i in range(32 + 2, min(48, T - chunk_id * BT)):
+    for i in range(32 + 2, min(48, seqlen - chunk_id * BT)):
         a_33 = -tl.load(
             A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 32
         )
         a_33 += tl.sum(a_33[:, None] * Ai_33, 0)
         Ai_33 = tl.where((o_i == i - 32)[:, None], a_33, Ai_33)
-    for i in range(48 + 2, min(64, T - chunk_id * BT)):
+    for i in range(48 + 2, min(64, seqlen - chunk_id * BT)):
         a_44 = -tl.load(
             A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 48
         )
@@ -219,6 +235,15 @@ def merge_16x16_to_64x64_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
+    # this sometimes produces NaN for some reasons...
+    # zeros_16x16 = tl.zeros((16, 16), dtype=tl.float32)
+    # zeros_16x32 = tl.zeros((16, 32), dtype=tl.float32)
+    # Ai_1 = _concat_2d_dim1(_concat_2d_dim1(Ai_11, zeros_16x16), zeros_16x32)
+    # Ai_2 = _concat_2d_dim1(_concat_2d_dim1(Ai_21, Ai_22), zeros_16x32)
+    # Ai_3 = _concat_2d_dim1(_concat_2d_dim1(Ai_31, Ai_32), _concat_2d_dim1(Ai_33, zeros_16x16))
+    # Ai_4 = _concat_2d_dim1(_concat_2d_dim1(Ai_41, Ai_42), _concat_2d_dim1(Ai_43, Ai_44))
+    # Ai = _concat_2d_dim0(_concat_2d_dim0(Ai_1, Ai_2), _concat_2d_dim0(Ai_3, Ai_4))
+
     desc_o.store([chunk_id * BT + 0, 0], Ai_11)
     desc_o.store([chunk_id * BT + 16, 16], Ai_22)
     desc_o.store([chunk_id * BT + 32, 32], Ai_33)
@@ -238,18 +263,22 @@ def merge_16x16_to_64x64_inverse_kernel(
     # NOTE: we remove some masking, which might not be valid. sometimes we got NaN -> investigate.
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
     v_ptrs = v_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
-    v = tl.load(v_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, V_dim]
+    v = tl.load(v_ptrs, mask=offs_t < bos + seqlen, other=0.0)  # [BT, V_dim]
 
     k_head_id = head_id // (H // Hg)
     k_ptrs = k_ptr + (offs_t * Hg * K_dim + k_head_id * K_dim + tl.arange(0, K_dim))
-    k = tl.load(k_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, K_dim]
+    k = tl.load(k_ptrs, mask=offs_t < bos + seqlen, other=0.0)  # [BT, K_dim]
 
     Ai_ptrs = Ai_ptr + (offs_t * H * BT + head_id * BT + tl.arange(0, BT))
-    Ai = tl.load(Ai_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, BT]
+    Ai = tl.load(Ai_ptrs, mask=offs_t < bos + seqlen, other=0.0)  # [BT, BT]
 
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)
-    beta = tl.load(beta_ptr + (offs_t * H + head_id))  # [BT]
-    g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id))  # [BT]
+    beta = tl.load(
+        beta_ptr + (offs_t * H + head_id), mask=offs_t < bos + seqlen, other=0.0
+    )  # [BT]
+    g_cu = tl.load(
+        g_cu_ptr + (offs_t * H + head_id), mask=offs_t < bos + seqlen, other=0.0
+    )  # [BT]
 
     # U = (Ai * beta) @ V
     Ab = Ai * beta
@@ -257,7 +286,7 @@ def merge_16x16_to_64x64_inverse_kernel(
 
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
     u_ptrs = u_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
-    tl.store(u_ptrs, u, mask=offs_t < bos + T)
+    tl.store(u_ptrs, u, mask=offs_t < bos + seqlen)
 
     # W = (Ai * beta * g_cu) @ K
     Abg = Ab * tl.exp(g_cu)
@@ -265,7 +294,7 @@ def merge_16x16_to_64x64_inverse_kernel(
 
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
     w_ptrs = w_ptr + (offs_t * H * K_dim + head_id * K_dim + tl.arange(0, K_dim))
-    tl.store(w_ptrs, w, mask=offs_t < bos + T)
+    tl.store(w_ptrs, w, mask=offs_t < bos + seqlen)
 
 
 @triton.autotune(
