@@ -100,117 +100,126 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 )
 @triton.jit
 def merge_16x16_to_64x64_inverse_kernel(
-    A,
-    Ai,
-    cu_seqlens,
-    chunk_indices,
+    A_ptr,
+    Ai_ptr,
+    beta_ptr,
+    cu_seqlens_ptr,
+    chunk_indices_ptr,
     H: tl.constexpr,
     BT: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    i_h = tl.program_id(1)
+    global_chunk_id = tl.program_id(0)
+    head_id = tl.program_id(1)
 
-    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
 
-    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     T = eos - bos
 
     o_i = tl.arange(0, 16)
     m_A = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
-    A += (bos * H + i_h) * BT
-    Ai += (bos * H + i_h) * BT
+    A_ptr += (bos * H + head_id) * BT
+    Ai_ptr += (bos * H + head_id) * BT
 
-    desc = tl.make_tensor_descriptor(A, [T, BT], [H * BT, 1], [16, 16])
-    desc_o = tl.make_tensor_descriptor(Ai, [T, BT], [H * BT, 1], [16, 16])
-    b_Ai_11 = desc.load([i_t * BT + 0, 0]).to(tl.float32)
-    b_Ai_22 = desc.load([i_t * BT + 16, 16]).to(tl.float32)
-    b_Ai_33 = desc.load([i_t * BT + 32, 32]).to(tl.float32)
-    b_Ai_44 = desc.load([i_t * BT + 48, 48]).to(tl.float32)
+    desc = tl.make_tensor_descriptor(A_ptr, [T, BT], [H * BT, 1], [16, 16])
+    desc_o = tl.make_tensor_descriptor(Ai_ptr, [T, BT], [H * BT, 1], [16, 16])
+    Ai_11 = desc.load([chunk_id * BT + 0, 0]).to(tl.float32)
+    Ai_22 = desc.load([chunk_id * BT + 16, 16]).to(tl.float32)
+    Ai_33 = desc.load([chunk_id * BT + 32, 32]).to(tl.float32)
+    Ai_44 = desc.load([chunk_id * BT + 48, 48]).to(tl.float32)
 
     # [16, 16]
-    b_Ai_11 = -tl.where(m_A, b_Ai_11, 0)
-    b_Ai_22 = -tl.where(m_A, b_Ai_22, 0)
-    b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
-    b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
+    Ai_11 = -tl.where(m_A, Ai_11, 0)
+    Ai_22 = -tl.where(m_A, Ai_22, 0)
+    Ai_33 = -tl.where(m_A, Ai_33, 0)
+    Ai_44 = -tl.where(m_A, Ai_44, 0)
 
-    for i in range(2, min(16, T - i_t * BT)):
-        b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
-        b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
-        b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
-    for i in range(16 + 2, min(32, T - i_t * BT)):
-        b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
-        b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
-        b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
-    for i in range(32 + 2, min(48, T - i_t * BT)):
-        b_a_33 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 32)
-        b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
-        b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
-    for i in range(48 + 2, min(64, T - i_t * BT)):
-        b_a_44 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 48)
-        b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
-        b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)
-    b_Ai_11 += m_I
-    b_Ai_22 += m_I
-    b_Ai_33 += m_I
-    b_Ai_44 += m_I
+    for i in range(2, min(16, T - chunk_id * BT)):
+        a_11 = -tl.load(A_ptr + (chunk_id * BT + i) * H * BT + o_i)
+        a_11 += tl.sum(a_11[:, None] * Ai_11, 0)
+        Ai_11 = tl.where((o_i == i)[:, None], a_11, Ai_11)
+    for i in range(16 + 2, min(32, T - chunk_id * BT)):
+        a_22 = -tl.load(A_ptr + (chunk_id * BT + i) * H * BT + o_i + 16)
+        a_22 += tl.sum(a_22[:, None] * Ai_22, 0)
+        Ai_22 = tl.where((o_i == i - 16)[:, None], a_22, Ai_22)
+    for i in range(32 + 2, min(48, T - chunk_id * BT)):
+        a_33 = -tl.load(A_ptr + (chunk_id * BT + i) * H * BT + o_i + 32)
+        a_33 += tl.sum(a_33[:, None] * Ai_33, 0)
+        Ai_33 = tl.where((o_i == i - 32)[:, None], a_33, Ai_33)
+    for i in range(48 + 2, min(64, T - chunk_id * BT)):
+        a_44 = -tl.load(A_ptr + (chunk_id * BT + i) * H * BT + o_i + 48)
+        a_44 += tl.sum(a_44[:, None] * Ai_44, 0)
+        Ai_44 = tl.where((o_i == i - 48)[:, None], a_44, Ai_44)
+    Ai_11 += m_I
+    Ai_22 += m_I
+    Ai_33 += m_I
+    Ai_44 += m_I
 
-    b_A_21 = desc.load([i_t * BT + 16, 0]).to(tl.float32)
-    b_A_31 = desc.load([i_t * BT + 32, 0]).to(tl.float32)
-    b_A_32 = desc.load([i_t * BT + 32, 16]).to(tl.float32)
-    b_A_41 = desc.load([i_t * BT + 48, 0]).to(tl.float32)
-    b_A_42 = desc.load([i_t * BT + 48, 16]).to(tl.float32)
-    b_A_43 = desc.load([i_t * BT + 48, 32]).to(tl.float32)
+    A_21 = desc.load([chunk_id * BT + 16, 0]).to(tl.float32)
+    A_31 = desc.load([chunk_id * BT + 32, 0]).to(tl.float32)
+    A_32 = desc.load([chunk_id * BT + 32, 16]).to(tl.float32)
+    A_41 = desc.load([chunk_id * BT + 48, 0]).to(tl.float32)
+    A_42 = desc.load([chunk_id * BT + 48, 16]).to(tl.float32)
+    A_43 = desc.load([chunk_id * BT + 48, 32]).to(tl.float32)
 
-    b_Ai_21 = -tl.dot(
-        tl.dot(b_Ai_22, b_A_21, input_precision=DOT_PRECISION),
-        b_Ai_11,
+    Ai_21 = -tl.dot(
+        tl.dot(Ai_22, A_21, input_precision=DOT_PRECISION),
+        Ai_11,
         input_precision=DOT_PRECISION,
     )
-    b_Ai_32 = -tl.dot(
-        tl.dot(b_Ai_33, b_A_32, input_precision=DOT_PRECISION),
-        b_Ai_22,
+    Ai_32 = -tl.dot(
+        tl.dot(Ai_33, A_32, input_precision=DOT_PRECISION),
+        Ai_22,
         input_precision=DOT_PRECISION,
     )
-    b_Ai_43 = -tl.dot(
-        tl.dot(b_Ai_44, b_A_43, input_precision=DOT_PRECISION),
-        b_Ai_33,
-        input_precision=DOT_PRECISION,
-    )
-
-    b_Ai_31 = -tl.dot(
-        b_Ai_33,
-        tl.dot(b_A_31, b_Ai_11, input_precision=DOT_PRECISION)
-        + tl.dot(b_A_32, b_Ai_21, input_precision=DOT_PRECISION),
-        input_precision=DOT_PRECISION,
-    )
-    b_Ai_42 = -tl.dot(
-        b_Ai_44,
-        tl.dot(b_A_42, b_Ai_22, input_precision=DOT_PRECISION)
-        + tl.dot(b_A_43, b_Ai_32, input_precision=DOT_PRECISION),
-        input_precision=DOT_PRECISION,
-    )
-    b_Ai_41 = -tl.dot(
-        b_Ai_44,
-        tl.dot(b_A_41, b_Ai_11, input_precision=DOT_PRECISION)
-        + tl.dot(b_A_42, b_Ai_21, input_precision=DOT_PRECISION)
-        + tl.dot(b_A_43, b_Ai_31, input_precision=DOT_PRECISION),
+    Ai_43 = -tl.dot(
+        tl.dot(Ai_44, A_43, input_precision=DOT_PRECISION),
+        Ai_33,
         input_precision=DOT_PRECISION,
     )
 
-    desc_o.store([i_t * BT + 0, 0], b_Ai_11)
-    desc_o.store([i_t * BT + 16, 16], b_Ai_22)
-    desc_o.store([i_t * BT + 32, 32], b_Ai_33)
-    desc_o.store([i_t * BT + 48, 48], b_Ai_44)
-    desc_o.store([i_t * BT + 16, 0], b_Ai_21)
-    desc_o.store([i_t * BT + 32, 0], b_Ai_31)
-    desc_o.store([i_t * BT + 32, 16], b_Ai_32)
-    desc_o.store([i_t * BT + 48, 0], b_Ai_41)
-    desc_o.store([i_t * BT + 48, 16], b_Ai_42)
-    desc_o.store([i_t * BT + 48, 32], b_Ai_43)
+    Ai_31 = -tl.dot(
+        Ai_33,
+        tl.dot(A_31, Ai_11, input_precision=DOT_PRECISION)
+        + tl.dot(A_32, Ai_21, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
+    Ai_42 = -tl.dot(
+        Ai_44,
+        tl.dot(A_42, Ai_22, input_precision=DOT_PRECISION)
+        + tl.dot(A_43, Ai_32, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
+    Ai_41 = -tl.dot(
+        Ai_44,
+        tl.dot(A_41, Ai_11, input_precision=DOT_PRECISION)
+        + tl.dot(A_42, Ai_21, input_precision=DOT_PRECISION)
+        + tl.dot(A_43, Ai_31, input_precision=DOT_PRECISION),
+        input_precision=DOT_PRECISION,
+    )
+
+    # apply beta
+    beta = tl.load(
+        beta_ptr + ((bos + chunk_id * BT + tl.arange(0, BT)) * H + head_id)
+    )  # [BT]
+    beta12, beta34 = beta.reshape(2, 32).T.split()
+    beta1, beta2 = beta12.reshape(2, 16).T.split()
+    beta3, beta4 = beta34.reshape(2, 16).T.split()
+
+    desc_o.store([chunk_id * BT + 0, 0], Ai_11 * beta1)
+    desc_o.store([chunk_id * BT + 16, 16], Ai_22 * beta2)
+    desc_o.store([chunk_id * BT + 32, 32], Ai_33 * beta3)
+    desc_o.store([chunk_id * BT + 48, 48], Ai_44 * beta4)
+    desc_o.store([chunk_id * BT + 16, 0], Ai_21 * beta1)
+    desc_o.store([chunk_id * BT + 32, 0], Ai_31 * beta1)
+    desc_o.store([chunk_id * BT + 32, 16], Ai_32 * beta2)
+    desc_o.store([chunk_id * BT + 48, 0], Ai_41 * beta1)
+    desc_o.store([chunk_id * BT + 48, 16], Ai_42 * beta2)
+    desc_o.store([chunk_id * BT + 48, 32], Ai_43 * beta3)
 
 
 @triton.autotune(
@@ -225,7 +234,6 @@ def merge_16x16_to_64x64_inverse_kernel(
 def recompute_w_u_fwd_kernel(
     k_ptr,
     v_ptr,
-    beta_ptr,
     w_ptr,
     u_ptr,
     A_ptr,
@@ -249,6 +257,7 @@ def recompute_w_u_fwd_kernel(
     T = eos - bos
 
     # issue all loads ASAP
+    # NOTE: we remove some masking, which might not be valid. sometimes we got NaN -> investigate.
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
     v_ptrs = v_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
     v = tl.load(v_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, V_dim]
@@ -258,22 +267,23 @@ def recompute_w_u_fwd_kernel(
     k = tl.load(k_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, K_dim]
 
     A_ptrs = A_ptr + (offs_t * H * BT + head_id * BT + tl.arange(0, BT))
-    A = tl.load(A_ptrs)  # [BT, BT]. no masking required here.
+    A = tl.load(A_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, BT]
 
-    beta = tl.load(beta_ptr + (offs_t * H + head_id))  # [BT, 1]
-    g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id))  # [BT, 1]
+    offs_t = bos + chunk_id * BT + tl.arange(0, BT)
+    g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id))  # [BT]
 
-    # U = A @ (beta * V)
-    vb = v * beta  # NOTE: this is bad -> can't stream gmem->smem->mma
-    u = tl.dot(A, vb.to(A.dtype))
+    # U = A @ V
+    u = tl.dot(A, v)
 
+    offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
     u_ptrs = u_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
     tl.store(u_ptrs, u, mask=offs_t < bos + T)
 
-    # W = A @ (beta * g_cu * K)
-    kb = k * beta * tl.exp(g_cu)
-    w = tl.dot(A, kb.to(A.dtype))
+    # W = (A * g_cu) @ K
+    Ag = A * tl.exp(g_cu)
+    w = tl.dot(Ag.to(k.dtype), k)
 
+    offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
     w_ptrs = w_ptr + (offs_t * H * K_dim + head_id * K_dim + tl.arange(0, K_dim))
     tl.store(w_ptrs, w, mask=offs_t < bos + T)
 
@@ -283,128 +293,129 @@ def recompute_w_u_fwd_kernel(
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
-        for BV in [32, 64]
+        for BV in [16, 32, 64, 128]
     ],
     key=["H", "K", "V", "BT"],
 )
 @triton.jit
-def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
-    k,
-    v,
-    w,
-    v_new,
-    g,
-    h,
-    h0,
-    ht,
-    cu_seqlens,
-    chunk_offsets,
+def chunk_gated_delta_rule_fwd_kernel_h(
+    k_ptr,
+    v_ptr,
+    w_ptr,
+    v_new_ptr,
+    g_cu_ptr,
+    h_ptr,
+    h0_ptr,
+    ht_ptr,
+    cu_seqlens_ptr,
+    chunk_offsets_ptr,
     H: tl.constexpr,
     Hg: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
+    K_dim: tl.constexpr,
+    V_dim: tl.constexpr,
     BT: tl.constexpr,
     BV: tl.constexpr,
 ):
     i_v = tl.program_id(0)
     i_nh = tl.program_id(1)
-    i_n = i_nh // H
-    i_h = i_nh % H
+    seq_id = i_nh // H
+    head_id = i_nh % H
 
-    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     T = eos - bos
     NT = tl.cdiv(T, BT)
-    boh = tl.load(chunk_offsets + i_n).to(tl.int32)
-
-    # [BV, BK]
-    b_h1 = tl.zeros([BV, 64], dtype=tl.float32)
-    b_h2 = tl.zeros([BV, 64], dtype=tl.float32)
+    boh = tl.load(chunk_offsets_ptr + seq_id).to(tl.int32)
 
     # calculate offset
-    h += ((boh * H + i_h) * V * K).to(tl.int64)
-    v += ((bos * H + i_h) * V).to(tl.int64)
-    k += ((bos * Hg + i_h // (H // Hg)) * K).to(tl.int64)
-    w += ((bos * H + i_h) * K).to(tl.int64)
-    v_new += ((bos * H + i_h) * V).to(tl.int64)
+    h_ptr += ((boh * H + head_id) * V_dim * K_dim).to(tl.int64)
+    v_ptr += ((bos * H + head_id) * V_dim).to(tl.int64)
+    k_ptr += ((bos * Hg + head_id // (H // Hg)) * K_dim).to(tl.int64)
+    w_ptr += ((bos * H + head_id) * K_dim).to(tl.int64)
+    v_new_ptr += ((bos * H + head_id) * V_dim).to(tl.int64)
 
-    stride_v = H * V
-    stride_h = H * V * K
-    stride_k = Hg * K
-    stride_w = H * K
+    stride_v = H * V_dim
+    stride_h = H * V_dim * K_dim
+    stride_k = Hg * K_dim
+    stride_w = H * K_dim
 
-    h0 = h0 + i_nh * V * K
-    ht = ht + i_nh * V * K
+    h0_ptr = h0_ptr + i_nh * V_dim * K_dim
+    ht_ptr = ht_ptr + i_nh * V_dim * K_dim
 
     # load initial state
-    p_h0_1 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-    b_h1 += tl.load(p_h0_1, boundary_check=(0, 1)).to(tl.float32)
-    p_h0_2 = tl.make_block_ptr(h0, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
-    b_h2 += tl.load(p_h0_2, boundary_check=(0, 1)).to(tl.float32)
+    h0_ptrs = tl.make_block_ptr(
+        h0_ptr, (V_dim, K_dim), (K_dim, 1), (i_v * BV, 0), (BV, K_dim), (1, 0)
+    )
+    h = tl.load(h0_ptrs, boundary_check=(0, 1)).to(tl.float32)  # [BV, K_dim]
 
     # main recurrence
-    for i_t in range(NT):
-        p_h1 = tl.make_block_ptr(
-            h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0)
+    for chunk_id in range(NT):
+        # save intermediate state for o computation
+        h_ptrs = tl.make_block_ptr(
+            h_ptr + chunk_id * stride_h,
+            (V_dim, K_dim),
+            (K_dim, 1),
+            (i_v * BV, 0),
+            (BV, K_dim),
+            (1, 0),
         )
-        tl.store(p_h1, b_h1.to(p_h1.dtype.element_ty), boundary_check=(0, 1))
-        p_h2 = tl.make_block_ptr(
-            h + i_t * stride_h, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0)
-        )
-        tl.store(p_h2, b_h2.to(p_h2.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(h_ptrs, h.to(h_ptrs.dtype.element_ty), boundary_check=(0, 1))
 
-        p_w = tl.make_block_ptr(
-            w, (T, K), (stride_w, 1), (i_t * BT, 0), (BT, 64), (1, 0)
+        # issue all loads first
+        w_ptrs = tl.make_block_ptr(
+            w_ptr, (T, K_dim), (stride_w, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
         )
-        b_w = tl.load(p_w, boundary_check=(0, 1))
-        b_v = tl.dot(b_w, tl.trans(b_h1).to(b_w.dtype))
-        p_w = tl.make_block_ptr(
-            w, (T, K), (stride_w, 1), (i_t * BT, 64), (BT, 64), (1, 0)
-        )
-        b_w = tl.load(p_w, boundary_check=(0, 1))
-        b_v += tl.dot(b_w, tl.trans(b_h2).to(b_w.dtype))
+        w = tl.load(w_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
 
-        p_v = tl.make_block_ptr(
-            v, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        v_ptrs = tl.make_block_ptr(
+            v_ptr,
+            (T, V_dim),
+            (stride_v, 1),
+            (chunk_id * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
         )
-        b_v = tl.load(p_v, boundary_check=(0, 1)) - b_v
+        v = tl.load(v_ptrs, boundary_check=(0, 1))
 
-        # save new value
-        p_v = tl.make_block_ptr(
-            v_new, (T, V), (stride_v, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        k_ptrs = tl.make_block_ptr(
+            k_ptr, (T, K_dim), (stride_k, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
         )
-        tl.store(p_v, b_v.to(p_v.dtype.element_ty), boundary_check=(0, 1))
+        k = tl.load(k_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
 
-        last_idx = min((i_t + 1) * BT, T) - 1
+        last_idx = min((chunk_id + 1) * BT, T) - 1
+        g_cu_last = tl.load(g_cu_ptr + bos * H + last_idx * H + head_id)
+        g_cu_ptrs = tl.make_block_ptr(
+            g_cu_ptr + bos * H + head_id, (T,), (H,), (chunk_id * BT,), (BT,), (0,)
+        )
+        g_cu = tl.load(g_cu_ptrs, boundary_check=(0,))
+
+        # computation
+        v_new = v - tl.dot(w, h.to(w.dtype).T)  # [BT, BV]
+
+        # save new value for o computation
+        v_new_ptrs = tl.make_block_ptr(
+            v_new_ptr,
+            (T, V_dim),
+            (stride_v, 1),
+            (chunk_id * BT, i_v * BV),
+            (BT, BV),
+            (1, 0),
+        )
+        tl.store(v_new_ptrs, v_new.to(v_ptrs.dtype.element_ty), boundary_check=(0, 1))
 
         # apply g
-        m_t = (i_t * BT + tl.arange(0, BT)) < T
-        b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
-        p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
-        b_v = b_v * tl.where(m_t, tl.exp(b_g_last - b_g), 0)[:, None]
-        b_g_last = tl.exp(b_g_last)
-        b_h1 *= b_g_last
-        b_h2 *= b_g_last
+        mask_t = (chunk_id * BT + tl.arange(0, BT)) < T
+        v_new = v_new * tl.where(mask_t, tl.exp(g_cu_last - g_cu), 0)[:, None]
+        h *= tl.exp(g_cu_last)
 
-        b_v = b_v.to(k.dtype.element_ty)
-
-        p_k = tl.make_block_ptr(
-            k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h1 += tl.trans(tl.dot(b_k, b_v))
-        p_k = tl.make_block_ptr(
-            k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_h2 += tl.trans(tl.dot(b_k, b_v))
+        # update state
+        h = tl.dot(v_new.to(k.dtype).T, k, acc=h)
 
     # epilogue
-    p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 0), (BV, 64), (1, 0))
-    tl.store(p_ht, b_h1.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
-    p_ht = tl.make_block_ptr(ht, (V, K), (K, 1), (i_v * BV, 64), (BV, 64), (1, 0))
-    tl.store(p_ht, b_h2.to(p_ht.dtype.element_ty), boundary_check=(0, 1))
+    ht_ptrs = tl.make_block_ptr(
+        ht_ptr, (V_dim, K_dim), (K_dim, 1), (i_v * BV, 0), (BV, K_dim), (1, 0)
+    )
+    tl.store(ht_ptrs, h.to(ht_ptrs.dtype.element_ty), boundary_check=(0, 1))
 
 
 @triton.autotune(
@@ -561,13 +572,14 @@ def run(
         BT=BT,
     )
 
-    # compute inverse of I + strictTriu(A)
+    # compute inverse(I + strictTriu(A)) * beta
     Ai = torch.zeros_like(A, dtype=k.dtype)  # BF16
     merge_16x16_to_64x64_inverse_kernel[(total_num_chunks, H)](
-        A=A,
-        Ai=Ai,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        A,
+        Ai,
+        beta,
+        cu_seqlens,
+        chunk_indices,
         H=H,
         BT=BT,
         DOT_PRECISION="ieee",
@@ -580,7 +592,6 @@ def run(
     recompute_w_u_fwd_kernel[(total_num_chunks, H)](
         k,
         v,
-        beta,
         w,
         u,
         A,
@@ -598,24 +609,26 @@ def run(
     final_state = torch.empty_like(state, dtype=torch.float32)
     v_new = torch.empty_like(u)
 
+    # reduce BV to increase no. of SMs used.
+    # helpful when N * H is small.
     def grid(meta):
         return (triton.cdiv(V_dim, meta["BV"]), N * H)
 
-    chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
-        k=k,
-        v=u,
-        w=w,
-        v_new=v_new,
-        g=g_cu,
-        h=h,
-        h0=state,
-        ht=final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_offsets=chunk_offsets,
+    chunk_gated_delta_rule_fwd_kernel_h[grid](
+        k,
+        u,
+        w,
+        v_new,
+        g_cu,
+        h,
+        state,
+        final_state,
+        cu_seqlens,
+        chunk_offsets,
         H=H,
         Hg=Hg,
-        K=K_dim,
-        V=V_dim,
+        K_dim=K_dim,
+        V_dim=V_dim,
         BT=BT,
     )
 
