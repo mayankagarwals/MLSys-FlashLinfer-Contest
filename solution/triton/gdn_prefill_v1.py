@@ -53,7 +53,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         [BT, K_dim],
     )
     A_desc = tl.make_tensor_descriptor(
-        A_ptr + (bos * H * BT),
+        A_ptr + bos * H * BT,
         [seqlen, H, BT],
         [H * BT, BT, 1],
         [BT, 1, BT],
