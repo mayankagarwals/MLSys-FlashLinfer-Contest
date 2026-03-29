@@ -17,7 +17,7 @@ triton.set_allocator(alloc_fn)
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["H", "BT"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit
 def chunk_local_cumsum_scalar_kernel(
     A_log_ptr,  # [H]
     a_ptr,  # [T, H]
@@ -25,7 +25,6 @@ def chunk_local_cumsum_scalar_kernel(
     o_ptr,
     cu_seqlens_ptr,
     chunk_indices_ptr,
-    T,
     H: tl.constexpr,
     BT: tl.constexpr,
 ):
@@ -37,7 +36,7 @@ def chunk_local_cumsum_scalar_kernel(
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
     eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
-    T = eos - bos
+    seqlen = eos - bos
 
     # NOTE: strided load. maybe each pid should handle all heads.
     offs = chunk_id * BT + tl.arange(0, BT)
@@ -52,76 +51,68 @@ def chunk_local_cumsum_scalar_kernel(
 
     offs = chunk_id * BT + tl.arange(0, BT)
     o_ptrs = o_ptr + ((bos + offs) * H + head_id)
-    tl.store(o_ptrs, o, mask=offs < T)
+    tl.store(o_ptrs, o, mask=offs < seqlen)
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": BK}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
+    configs=[triton.Config(dict(), num_warps=num_warps) for num_warps in [2, 4, 8]],
     key=["H", "K", "BT"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit()
 def chunk_scaled_dot_kkt_fwd_kernel(
-    k,
-    beta,
-    g,
-    A,
-    cu_seqlens,
-    chunk_indices,
-    T,
+    k_ptr,  # [total_seqlen, Hg, K]
+    beta_ptr,  # [total_seqlen, H]
+    g_cu_ptr,  # [total_seqlen, H]
+    A_ptr,
+    cu_seqlens_ptr,
+    chunk_indices_ptr,
     H: tl.constexpr,
     Hg: tl.constexpr,
-    K: tl.constexpr,
+    K_dim: tl.constexpr,
     BT: tl.constexpr,
-    BK: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    i_h = tl.program_id(1)
+    global_chunk_id = tl.program_id(0)
+    head_id = tl.program_id(1)
 
-    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
 
-    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-    T = eos - bos
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    seqlen = eos - bos
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
-
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
+    # issue all loads as early as possible
+    # don't need masking for loads, since we will apply masking for store
+    # load k
+    offs_t = chunk_id * BT + tl.arange(0, BT)
+    offs_k = tl.arange(0, K_dim)
+    k_ptrs = k_ptr + (
+        (bos + offs_t[:, None]) * Hg * K_dim + head_id // (H // Hg) * K_dim + offs_k
     )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
+    k = tl.load(k_ptrs)  # [BT, K]
 
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = b_k * b_beta[:, None]
-        b_A += tl.dot(b_kb.to(b_k.dtype), tl.trans(b_k))
+    # load beta and g
+    beta = tl.load(beta_ptr + ((bos + offs_t) * H + head_id))
+    g_cu = tl.load(g_cu_ptr + ((bos + offs_t) * H + head_id))
 
-    p_g = tl.make_block_ptr(g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    b_g = tl.load(p_g, boundary_check=(0,))
-    b_g_diff = b_g[:, None] - b_g[None, :]
-    b_A = b_A * tl.exp(b_g_diff)
+    # compute
+    A = tl.dot(k, k.T)  # [BT, BT]
+    A *= beta[:, None]  # apply beta
+    A *= tl.exp(g_cu[:, None] - g_cu[None, :])  # apply gamma
 
-    m_A = (o_t[:, None] > o_t[None, :]) & (m_t[:, None] & m_t)
-    b_A = tl.where(m_A, b_A, 0)
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (BT * H, 1), (i_t * BT, 0), (BT, BT), (1, 0)
+    offs_t = chunk_id * BT + tl.arange(0, BT)
+    mask_t = offs_t < seqlen
+    mask_A = (offs_t[:, None] > offs_t[None, :]) & (mask_t[:, None] & mask_t)
+    A = tl.where(mask_A, A, 0)
+    A_ptrs = tl.make_block_ptr(
+        A_ptr + (bos * H + head_id) * BT,
+        (seqlen, BT),
+        (BT * H, 1),
+        (chunk_id * BT, 0),
+        (BT, BT),
+        (1, 0),
     )
-    tl.store(p_A, b_A.to(p_A.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(A_ptrs, A, boundary_check=(0, 1))
 
 
 @triton.autotune(
@@ -132,13 +123,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     ],
     key=["H", "BT"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit
 def merge_16x16_to_64x64_inverse_kernel(
     A,
     Ai,
     cu_seqlens,
     chunk_indices,
-    T,
     H: tl.constexpr,
     BT: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
@@ -276,7 +266,7 @@ def merge_16x16_to_64x64_inverse_kernel(
     ],
     key=["H", "K", "V", "BT", "BK", "BV"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit
 def recompute_w_u_fwd_kernel(
     k,
     v,
@@ -287,7 +277,6 @@ def recompute_w_u_fwd_kernel(
     g,
     cu_seqlens,
     chunk_indices,
-    T,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -371,7 +360,7 @@ def recompute_w_u_fwd_kernel(
     ],
     key=["H", "K", "V", "BT"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     k,
     v,
@@ -383,7 +372,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     ht,
     cu_seqlens,
     chunk_offsets,
-    T,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -502,7 +490,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     ],
     key=["H", "K", "V", "BT"],
 )
-@triton.jit(do_not_specialize=["T"])
+@triton.jit
 def chunk_fwd_kernel_o(
     q,
     k,
@@ -513,7 +501,6 @@ def chunk_fwd_kernel_o(
     cu_seqlens,
     chunk_indices,
     scale,
-    T,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -604,8 +591,8 @@ def run(
     cu_seqlens: Tensor,  # (num_seqlens + 1)
     scale: float,
 ):
-    T, Hg, K = k.shape
-    N, H, V, _ = state.shape
+    T, Hg, K_dim = k.shape
+    N, H, V_dim, _ = state.shape
 
     # beta
     beta = b.float().sigmoid()
@@ -634,24 +621,24 @@ def run(
         g_cu,
         cu_seqlens,
         chunk_indices,
-        T=T,
         H=H,
         BT=BT,
     )
 
     # obtain WY representation. u is actually the new v.
+    # compute strictLower(beta * Gamma * (K @ K.T))
+    # TODO: launch Hg blocks only
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
     chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, H)](
-        k=k,
-        g=g_cu,
-        beta=beta,
-        A=A,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        T=T,
+        k,
+        beta,
+        g_cu,
+        A,
+        cu_seqlens,
+        chunk_indices,
         H=H,
         Hg=Hg,
-        K=K,
+        K_dim=K_dim,
         BT=BT,
     )
 
@@ -662,7 +649,6 @@ def run(
         Ai=Ai,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        T=T,
         H=H,
         BT=BT,
         DOT_PRECISION="ieee",
@@ -670,7 +656,7 @@ def run(
     A = Ai
 
     u = torch.empty_like(v)
-    w = k.new_empty(T, H, K)
+    w = k.new_empty(T, H, K_dim)
     recompute_w_u_fwd_kernel[(total_num_chunks, H)](
         k=k,
         v=v,
@@ -681,22 +667,21 @@ def run(
         g=g_cu,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
-        T=T,
         H=H,
         Hg=Hg,
-        K=K,
-        V=V,
+        K=K_dim,
+        V=V_dim,
         BT=BT,
         BK=64,
         BV=64,
     )
 
-    h = k.new_empty(total_num_chunks, H, V, K)
+    h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
     final_state = torch.empty_like(state, dtype=torch.float32)
     v_new = torch.empty_like(u)
 
     def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), N * H)
+        return (triton.cdiv(V_dim, meta["BV"]), N * H)
 
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
@@ -709,18 +694,17 @@ def run(
         ht=final_state,
         cu_seqlens=cu_seqlens,
         chunk_offsets=chunk_offsets,
-        T=T,
         H=H,
         Hg=Hg,
-        K=K,
-        V=V,
+        K=K_dim,
+        V=V_dim,
         BT=BT,
     )
 
     o = torch.empty_like(v)
 
     def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), total_num_chunks, H)
+        return (triton.cdiv(V_dim, meta["BV"]), total_num_chunks, H)
 
     chunk_fwd_kernel_o[grid](
         q=q,
@@ -732,11 +716,10 @@ def run(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         scale=scale,
-        T=T,
         H=H,
         Hg=Hg,
-        K=K,
-        V=V,
+        K=K_dim,
+        V=V_dim,
         BT=BT,
     )
 
