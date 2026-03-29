@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+from triton.language.extra import libdevice
 
 
 def alloc_fn(size: int, alignment: int, stream: int | None):
@@ -66,7 +67,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         dt_bias = tl.load(dt_bias_ptr + head_id).to(tl.float32)
 
         # compute g and beta
-        beta = 1.0 / (1.0 + tl.exp(-b))  # sigmoid. NOTE: is this lowered to rcp?
+        beta = libdevice.rcp_rn(1.0 + tl.exp(-b))  # sigmoid
         g = -tl.exp(A_log) * tl.log(1.0 + tl.exp(a + dt_bias))
         g_cu = tl.cumsum(g, axis=0)
 
