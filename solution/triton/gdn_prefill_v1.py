@@ -45,7 +45,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     seqlen = eos - bos
 
-    # this creates tensormap on device -> might not be good
+    # this creates tensormap on device (or does it?) -> might not be good
     k_desc = tl.make_tensor_descriptor(
         k_ptr + (bos * Hg * K_dim + k_head_id * K_dim),
         [seqlen, K_dim],
