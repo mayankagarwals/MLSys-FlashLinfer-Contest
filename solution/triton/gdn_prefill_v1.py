@@ -577,6 +577,7 @@ def run(
 
     # - compute Ai = inverse(I + strictTriu(A))
     # - obtain WY representation: U = Ai @ V and W = (Ai * g_cu) @ K
+    # TODO: use empty to avoid fill kernel
     Ai = torch.zeros_like(A, dtype=k.dtype)  # BF16
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
