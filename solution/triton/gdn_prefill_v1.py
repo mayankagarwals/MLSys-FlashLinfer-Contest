@@ -236,7 +236,9 @@ def merge_16x16_to_64x64_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    # this sometimes produces NaN for some reasons...
+    # this is faster (skip global stores + syncthreads),
+    # but it sometimes produces NaN for some reasons...
+    # TODO: fix this
     # zeros_16x16 = tl.zeros((16, 16), dtype=tl.float32)
     # zeros_16x32 = tl.zeros((16, 32), dtype=tl.float32)
     # Ai_1 = _concat_2d_dim1(_concat_2d_dim1(Ai_11, zeros_16x16), zeros_16x32)
@@ -245,7 +247,7 @@ def merge_16x16_to_64x64_inverse_kernel(
     # Ai_4 = _concat_2d_dim1(_concat_2d_dim1(Ai_41, Ai_42), _concat_2d_dim1(Ai_43, Ai_44))
     # Ai = _concat_2d_dim0(_concat_2d_dim0(Ai_1, Ai_2), _concat_2d_dim0(Ai_3, Ai_4))
 
-    # NOTE: we can move zeros store at the start of the program
+    # NOTE: we can move zeros stores to the start of program
     zero16x16 = tl.zeros((16, 16), dtype=tl.float32)
 
     desc_o.store([chunk_id * BT + 0, 0], Ai_11)
@@ -268,7 +270,9 @@ def merge_16x16_to_64x64_inverse_kernel(
     desc_o.store([chunk_id * BT + 48, 32], Ai_43)
     desc_o.store([chunk_id * BT + 48, 48], Ai_44)
 
-    # syncthreads to make stores visible within a threadblock
+    # syncthreads to make global stores visible within a threadblock
+    # (data is still in L2, might not reach gmem yet)
+    # might not work if subsequent loads use TMA for Ai? (async proxy)
     tl.debug_barrier()
 
     # compute WY representation
@@ -286,12 +290,9 @@ def merge_16x16_to_64x64_inverse_kernel(
     Ai = tl.load(Ai_ptrs, mask=offs_t < bos + seqlen, other=0.0)  # [BT, BT]
 
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)
-    beta = tl.load(
-        beta_ptr + (offs_t * H + head_id), mask=offs_t < bos + seqlen, other=0.0
-    )  # [BT]
-    g_cu = tl.load(
-        g_cu_ptr + (offs_t * H + head_id), mask=offs_t < bos + seqlen, other=0.0
-    )  # [BT]
+    mask_t = offs_t < bos + seqlen
+    beta = tl.load(beta_ptr + (offs_t * H + head_id), mask=mask_t, other=0.0)  # [BT]
+    g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id), mask=mask_t, other=0.0)  # [BT]
 
     # U = (Ai * beta) @ V
     Ab = Ai * beta
