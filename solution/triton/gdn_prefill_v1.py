@@ -244,16 +244,28 @@ def merge_16x16_to_64x64_inverse_kernel(
     # Ai_4 = _concat_2d_dim1(_concat_2d_dim1(Ai_41, Ai_42), _concat_2d_dim1(Ai_43, Ai_44))
     # Ai = _concat_2d_dim0(_concat_2d_dim0(Ai_1, Ai_2), _concat_2d_dim0(Ai_3, Ai_4))
 
+    # NOTE: we can move zeros store at the start of the program
+    zero16x16 = tl.zeros((16, 16), dtype=tl.float32)
+
     desc_o.store([chunk_id * BT + 0, 0], Ai_11)
-    desc_o.store([chunk_id * BT + 16, 16], Ai_22)
-    desc_o.store([chunk_id * BT + 32, 32], Ai_33)
-    desc_o.store([chunk_id * BT + 48, 48], Ai_44)
+    desc_o.store([chunk_id * BT + 0, 16], zero16x16)
+    desc_o.store([chunk_id * BT + 0, 32], zero16x16)
+    desc_o.store([chunk_id * BT + 0, 48], zero16x16)
+
     desc_o.store([chunk_id * BT + 16, 0], Ai_21)
+    desc_o.store([chunk_id * BT + 16, 16], Ai_22)
+    desc_o.store([chunk_id * BT + 16, 32], zero16x16)
+    desc_o.store([chunk_id * BT + 16, 48], zero16x16)
+
     desc_o.store([chunk_id * BT + 32, 0], Ai_31)
     desc_o.store([chunk_id * BT + 32, 16], Ai_32)
+    desc_o.store([chunk_id * BT + 32, 32], Ai_33)
+    desc_o.store([chunk_id * BT + 32, 48], zero16x16)
+
     desc_o.store([chunk_id * BT + 48, 0], Ai_41)
     desc_o.store([chunk_id * BT + 48, 16], Ai_42)
     desc_o.store([chunk_id * BT + 48, 32], Ai_43)
+    desc_o.store([chunk_id * BT + 48, 48], Ai_44)
 
     # syncthreads to make stores visible within a threadblock
     tl.debug_barrier()
@@ -577,8 +589,7 @@ def run(
 
     # - compute Ai = inverse(I + strictTriu(A))
     # - obtain WY representation: U = Ai @ V and W = (Ai * g_cu) @ K
-    # TODO: use empty to avoid fill kernel
-    Ai = torch.zeros_like(A, dtype=k.dtype)  # BF16
+    Ai = torch.empty_like(A, dtype=k.dtype)  # BF16
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
     merge_16x16_to_64x64_inverse_kernel[(total_num_chunks, H)](
