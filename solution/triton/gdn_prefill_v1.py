@@ -201,36 +201,16 @@ def merge_16x16_to_64x64_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    desc_o.store(
-        [i_t * BT + 0, 0], b_Ai_11.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 16, 16], b_Ai_22.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 32, 32], b_Ai_33.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 48, 48], b_Ai_44.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 16, 0], b_Ai_21.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 32, 0], b_Ai_31.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 32, 16], b_Ai_32.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 48, 0], b_Ai_41.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 48, 16], b_Ai_42.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
-    desc_o.store(
-        [i_t * BT + 48, 32], b_Ai_43.to(desc_o.dtype, fp_downcast_rounding="rtne")
-    )
+    desc_o.store([i_t * BT + 0, 0], b_Ai_11)
+    desc_o.store([i_t * BT + 16, 16], b_Ai_22)
+    desc_o.store([i_t * BT + 32, 32], b_Ai_33)
+    desc_o.store([i_t * BT + 48, 48], b_Ai_44)
+    desc_o.store([i_t * BT + 16, 0], b_Ai_21)
+    desc_o.store([i_t * BT + 32, 0], b_Ai_31)
+    desc_o.store([i_t * BT + 32, 16], b_Ai_32)
+    desc_o.store([i_t * BT + 48, 0], b_Ai_41)
+    desc_o.store([i_t * BT + 48, 16], b_Ai_42)
+    desc_o.store([i_t * BT + 48, 32], b_Ai_43)
 
 
 @triton.autotune(
@@ -239,91 +219,63 @@ def merge_16x16_to_64x64_inverse_kernel(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["H", "K", "V", "BT", "BK", "BV"],
+    key=["H", "K", "V", "BT"],
 )
 @triton.jit
 def recompute_w_u_fwd_kernel(
-    k,
-    v,
-    beta,
-    w,
-    u,
-    A,
-    g,
-    cu_seqlens,
-    chunk_indices,
+    k_ptr,
+    v_ptr,
+    beta_ptr,
+    w_ptr,
+    u_ptr,
+    A_ptr,
+    g_cu_ptr,
+    cu_seqlens_ptr,
+    chunk_indices_ptr,
     H: tl.constexpr,
     Hg: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
+    K_dim: tl.constexpr,
+    V_dim: tl.constexpr,
     BT: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    i_h = tl.program_id(1)
+    global_chunk_id = tl.program_id(0)
+    head_id = tl.program_id(1)
 
-    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
 
-    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     T = eos - bos
 
-    p_beta = tl.make_block_ptr(
-        beta + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-    )
-    p_g = tl.make_block_ptr(g + (bos * H + i_h), (T,), (H,), (i_t * BT,), (BT,), (0,))
-    p_A = tl.make_block_ptr(
-        A + (bos * H + i_h) * BT, (T, BT), (H * BT, 1), (i_t * BT, 0), (BT, BT), (1, 0)
-    )
-    b_beta = tl.load(p_beta, boundary_check=(0,))
-    b_A = tl.load(p_A, boundary_check=(0, 1))
-    b_g = tl.exp(tl.load(p_g, boundary_check=(0,)))
+    # issue all loads ASAP
+    offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
+    v_ptrs = v_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
+    v = tl.load(v_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, V_dim]
 
-    for i_v in range(tl.cdiv(V, BV)):
-        p_v = tl.make_block_ptr(
-            v + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        p_u = tl.make_block_ptr(
-            u + (bos * H + i_h) * V,
-            (T, V),
-            (H * V, 1),
-            (i_t * BT, i_v * BV),
-            (BT, BV),
-            (1, 0),
-        )
-        b_v = tl.load(p_v, boundary_check=(0, 1))
-        b_vb = (b_v * b_beta[:, None]).to(b_v.dtype)
-        b_u = tl.dot(b_A, b_vb, allow_tf32=False)
-        tl.store(p_u, b_u.to(p_u.dtype.element_ty), boundary_check=(0, 1))
+    k_head_id = head_id // (H // Hg)
+    k_ptrs = k_ptr + (offs_t * Hg * K_dim + k_head_id * K_dim + tl.arange(0, K_dim))
+    k = tl.load(k_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, K_dim]
 
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(
-            k + (bos * Hg + i_h // (H // Hg)) * K,
-            (T, K),
-            (Hg * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        p_w = tl.make_block_ptr(
-            w + (bos * H + i_h) * K,
-            (T, K),
-            (H * K, 1),
-            (i_t * BT, i_k * BK),
-            (BT, BK),
-            (1, 0),
-        )
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_kb = (b_k * b_beta[:, None] * b_g[:, None]).to(b_k.dtype)
-        b_w = tl.dot(b_A, b_kb)
-        tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
+    A_ptrs = A_ptr + (offs_t * H * BT + head_id * BT + tl.arange(0, BT))
+    A = tl.load(A_ptrs)  # [BT, BT]. no masking required here.
+
+    beta = tl.load(beta_ptr + (offs_t * H + head_id))  # [BT, 1]
+    g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id))  # [BT, 1]
+
+    # U = A @ (beta * V)
+    vb = v * beta  # NOTE: this is bad -> can't stream gmem->smem->mma
+    u = tl.dot(A, vb.to(A.dtype))
+
+    u_ptrs = u_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
+    tl.store(u_ptrs, u, mask=offs_t < bos + T)
+
+    # W = A @ (beta * g_cu * K)
+    kb = k * beta * tl.exp(g_cu)
+    w = tl.dot(A, kb.to(A.dtype))
+
+    w_ptrs = w_ptr + (offs_t * H * K_dim + head_id * K_dim + tl.arange(0, K_dim))
+    tl.store(w_ptrs, w, mask=offs_t < bos + T)
 
 
 @triton.autotune(
@@ -610,7 +562,7 @@ def run(
     )
 
     # compute inverse of I + strictTriu(A)
-    Ai = torch.zeros_like(A, dtype=k.dtype)
+    Ai = torch.zeros_like(A, dtype=k.dtype)  # BF16
     merge_16x16_to_64x64_inverse_kernel[(total_num_chunks, H)](
         A=A,
         Ai=Ai,
@@ -626,22 +578,20 @@ def run(
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
     recompute_w_u_fwd_kernel[(total_num_chunks, H)](
-        k=k,
-        v=v,
-        beta=beta,
-        w=w,
-        u=u,
-        A=A,
-        g=g_cu,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        k,
+        v,
+        beta,
+        w,
+        u,
+        A,
+        g_cu,
+        cu_seqlens,
+        chunk_indices,
         H=H,
         Hg=Hg,
-        K=K_dim,
-        V=V_dim,
+        K_dim=K_dim,
+        V_dim=V_dim,
         BT=BT,
-        BK=64,
-        BV=64,
     )
 
     h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
