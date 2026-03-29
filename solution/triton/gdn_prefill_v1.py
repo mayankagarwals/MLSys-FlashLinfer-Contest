@@ -61,8 +61,9 @@ def chunk_local_cumsum_scalar_kernel(
 @triton.jit()
 def chunk_scaled_dot_kkt_fwd_kernel(
     k_ptr,  # [total_seqlen, Hg, K]
-    beta_ptr,  # [total_seqlen, H]
+    b_ptr,  # [total_seqlen, H]
     g_cu_ptr,  # [total_seqlen, H]
+    beta_ptr,  # [total_seqlen, H]
     A_ptr,
     cu_seqlens_ptr,
     chunk_indices_ptr,
@@ -91,8 +92,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     for head_id in range(k_head_id * (H // Hg), (k_head_id + 1) * (H // Hg)):
         # load beta and g
         offs_t = bos + chunk_id * BT + tl.arange(0, BT)
-        beta = tl.load(beta_ptr + (offs_t * H + head_id))
+        b = tl.load(b_ptr + (offs_t * H + head_id)).to(tl.float32)
         g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id))
+
+        # apply sigmoid and store for future use
+        beta = 1.0 / (1.0 + tl.exp(-b))  # is this lowered to rcp?
+        tl.store(beta_ptr + (offs_t * H + head_id), beta)
 
         # apply beta and gamma
         A_ = A * beta[:, None]
@@ -592,9 +597,6 @@ def run(
     T, Hg, K_dim = k.shape
     N, H, V_dim, _ = state.shape
 
-    # beta
-    beta = b.float().sigmoid()
-
     # prepare chunk metadata
     # TODO: use int32
     # NOTE: this causes CUDA sync. to avoid it, we need to use "padded" chunk indices layout,
@@ -626,10 +628,12 @@ def run(
     # obtain WY representation. u is actually the new v.
     # compute strictLower(beta * Gamma * (K @ K.T))
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
+    beta = torch.empty_like(b, dtype=torch.float32)
     chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, Hg)](
         k,
-        beta,
+        b,
         g_cu,
+        beta,
         A,
         cu_seqlens,
         chunk_indices,
