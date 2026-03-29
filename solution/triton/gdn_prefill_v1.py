@@ -72,7 +72,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     BT: tl.constexpr,
 ):
     global_chunk_id = tl.program_id(0)
-    head_id = tl.program_id(1)
+    k_head_id = tl.program_id(1)
 
     seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
     chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
@@ -81,38 +81,36 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     seqlen = eos - bos
 
-    # issue all loads as early as possible
     # don't need masking for loads, since we will apply masking for store
-    # load k
-    offs_t = chunk_id * BT + tl.arange(0, BT)
+    offs_t = bos + chunk_id * BT + tl.arange(0, BT)
     offs_k = tl.arange(0, K_dim)
-    k_ptrs = k_ptr + (
-        (bos + offs_t[:, None]) * Hg * K_dim + head_id // (H // Hg) * K_dim + offs_k
-    )
+    k_ptrs = k_ptr + (offs_t[:, None] * Hg * K_dim + k_head_id * K_dim + offs_k)
     k = tl.load(k_ptrs)  # [BT, K]
-
-    # load beta and g
-    beta = tl.load(beta_ptr + ((bos + offs_t) * H + head_id))
-    g_cu = tl.load(g_cu_ptr + ((bos + offs_t) * H + head_id))
-
-    # compute
     A = tl.dot(k, k.T)  # [BT, BT]
-    A *= beta[:, None]  # apply beta
-    A *= tl.exp(g_cu[:, None] - g_cu[None, :])  # apply gamma
 
-    offs_t = chunk_id * BT + tl.arange(0, BT)
-    mask_t = offs_t < seqlen
-    mask_A = (offs_t[:, None] > offs_t[None, :]) & (mask_t[:, None] & mask_t)
-    A = tl.where(mask_A, A, 0)
-    A_ptrs = tl.make_block_ptr(
-        A_ptr + (bos * H + head_id) * BT,
-        (seqlen, BT),
-        (BT * H, 1),
-        (chunk_id * BT, 0),
-        (BT, BT),
-        (1, 0),
-    )
-    tl.store(A_ptrs, A, boundary_check=(0, 1))
+    for head_id in range(k_head_id * (H // Hg), (k_head_id + 1) * (H // Hg)):
+        # load beta and g
+        offs_t = bos + chunk_id * BT + tl.arange(0, BT)
+        beta = tl.load(beta_ptr + (offs_t * H + head_id))
+        g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id))
+
+        # apply beta and gamma
+        A_ = A * beta[:, None]
+        A_ = A_ * tl.exp(g_cu[:, None] - g_cu[None, :])
+
+        offs_t = chunk_id * BT + tl.arange(0, BT)
+        mask_t = offs_t < seqlen
+        mask_A = (offs_t[:, None] > offs_t[None, :]) & (mask_t[:, None] & mask_t)
+        A_ = tl.where(mask_A, A_, 0)
+        A_ptrs = tl.make_block_ptr(
+            A_ptr + (bos * H + head_id) * BT,
+            (seqlen, BT),
+            (BT * H, 1),
+            (chunk_id * BT, 0),
+            (BT, BT),
+            (1, 0),
+        )
+        tl.store(A_ptrs, A_, boundary_check=(0, 1))
 
 
 @triton.autotune(
@@ -627,9 +625,8 @@ def run(
 
     # obtain WY representation. u is actually the new v.
     # compute strictLower(beta * Gamma * (K @ K.T))
-    # TODO: launch Hg blocks only
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, H)](
+    chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, Hg)](
         k,
         beta,
         g_cu,
