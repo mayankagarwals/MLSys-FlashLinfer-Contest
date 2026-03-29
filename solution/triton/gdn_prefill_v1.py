@@ -1,7 +1,6 @@
 # https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/model_executor/layers/fla/ops/chunk.py
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -14,59 +13,46 @@ def alloc_fn(size: int, alignment: int, stream: int | None):
 triton.set_allocator(alloc_fn)
 
 
-def prepare_lens(cu_seqlens: Tensor) -> Tensor:
-    return cu_seqlens[1:] - cu_seqlens[:-1]
-
-
-# TODO: custom kernel for this, or rewrite in a way that this is not needed
-# this causes CUDA sync
-def prepare_chunk_indices(cu_seqlens: Tensor, chunk_size: int) -> Tensor:
-    indices = torch.cat(
-        [
-            torch.arange(n)
-            for n in triton.cdiv(prepare_lens(cu_seqlens), chunk_size).tolist()
-        ]
-    )
-    return torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(cu_seqlens)
-
-
-def prepare_chunk_offsets(cu_seqlens: Tensor, chunk_size: int) -> Tensor:
-    return torch.cat(
-        [cu_seqlens.new_tensor([0]), triton.cdiv(prepare_lens(cu_seqlens), chunk_size)]
-    ).cumsum(-1)
-
-
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
     key=["H", "BT"],
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_local_cumsum_scalar_kernel(
-    s,
-    o,
-    cu_seqlens,
-    chunk_indices,
+    A_log_ptr,  # [H]
+    a_ptr,  # [T, H]
+    dt_bias_ptr,  # [H]
+    o_ptr,
+    cu_seqlens_ptr,
+    chunk_indices_ptr,
     T,
     H: tl.constexpr,
     BT: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    i_h = tl.program_id(1)
+    global_chunk_id = tl.program_id(0)
+    head_id = tl.program_id(1)
 
-    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
 
-    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     T = eos - bos
 
-    p_s = tl.make_block_ptr(s + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    p_o = tl.make_block_ptr(o + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    # NOTE: strided load. maybe each pid should handle all heads.
+    offs = chunk_id * BT + tl.arange(0, BT)
+    a_ptrs = a_ptr + ((bos + offs) * H + head_id)
+    a = tl.load(a_ptrs).to(tl.float32)  # no mask
 
-    # [BT]
-    b_s = tl.load(p_s, boundary_check=(0,)).to(tl.float32)
-    b_o = tl.cumsum(b_s, axis=0)
-    tl.store(p_o, b_o, boundary_check=(0,))
+    A_log = tl.load(A_log_ptr + head_id).to(tl.float32)
+    dt_bias = tl.load(dt_bias_ptr + head_id).to(tl.float32)
+
+    g = -tl.exp(A_log) * tl.log(1.0 + tl.exp(a + dt_bias))
+    o = tl.cumsum(g, axis=0)
+
+    offs = chunk_id * BT + tl.arange(0, BT)
+    o_ptrs = o_ptr + ((bos + offs) * H + head_id)
+    tl.store(o_ptrs, o, mask=offs < T)
 
 
 @triton.autotune(
@@ -621,19 +607,30 @@ def run(
     T, Hg, K = k.shape
     N, H, V, _ = state.shape
 
-    # compute g and beta
-    # TODO: fuse this with one of the kernels inside chunk_gated_delta_rule_fwd()
-    x = a.float() + dt_bias.float()
-    g = -torch.exp(A_log.float()) * F.softplus(x)  # this is actually log(g)
+    # beta
     beta = b.float().sigmoid()
 
-    # chunk local cumsum for g
+    # prepare chunk metadata
+    # TODO: use int32
+    # NOTE: this causes CUDA sync. to avoid it, we need to use "padded" chunk indices layout,
+    # which requires rewrite of all subsequent kernels.
     BT = 64
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
-    NT = len(chunk_indices)
-    g_cu = torch.empty_like(g, dtype=torch.float32)
-    chunk_local_cumsum_scalar_kernel[(NT, H)](
-        g,
+    num_chunks = triton.cdiv(cu_seqlens.diff(1), BT)  # for each sequence
+    chunk_offsets = torch.cat([cu_seqlens.new_tensor([0]), num_chunks]).cumsum(0)
+
+    # 1st value is sequence ID, 2nd value is chunk_id within that sequence
+    indices = torch.cat([torch.arange(n) for n in num_chunks.tolist()])
+    chunk_indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(
+        cu_seqlens
+    )
+    total_num_chunks = chunk_indices.shape[0]
+
+    # chunk local cumsum for g
+    g_cu = torch.empty_like(a, dtype=torch.float32)
+    chunk_local_cumsum_scalar_kernel[(total_num_chunks, H)](
+        A_log,
+        a,
+        dt_bias,
         g_cu,
         cu_seqlens,
         chunk_indices,
@@ -644,7 +641,7 @@ def run(
 
     # obtain WY representation. u is actually the new v.
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    chunk_scaled_dot_kkt_fwd_kernel[(NT, H)](
+    chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, H)](
         k=k,
         g=g_cu,
         beta=beta,
@@ -658,8 +655,9 @@ def run(
         BT=BT,
     )
 
+    # compute inverse of I + strictTriu(A)
     Ai = torch.zeros_like(A, dtype=k.dtype)
-    merge_16x16_to_64x64_inverse_kernel[(NT, H)](
+    merge_16x16_to_64x64_inverse_kernel[(total_num_chunks, H)](
         A=A,
         Ai=Ai,
         cu_seqlens=cu_seqlens,
@@ -673,7 +671,7 @@ def run(
 
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K)
-    recompute_w_u_fwd_kernel[(NT, H)](
+    recompute_w_u_fwd_kernel[(total_num_chunks, H)](
         k=k,
         v=v,
         beta=beta,
@@ -693,8 +691,7 @@ def run(
         BV=64,
     )
 
-    chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT)
-    h = k.new_empty(NT, H, V, K)
+    h = k.new_empty(total_num_chunks, H, V, K)
     final_state = torch.empty_like(state, dtype=torch.float32)
     v_new = torch.empty_like(u)
 
@@ -723,7 +720,7 @@ def run(
     o = torch.empty_like(v)
 
     def grid(meta):
-        return (triton.cdiv(V, meta["BV"]), NT, H)
+        return (triton.cdiv(V, meta["BV"]), total_num_chunks, H)
 
     chunk_fwd_kernel_o[grid](
         q=q,
