@@ -14,53 +14,15 @@ triton.set_allocator(alloc_fn)
 
 
 @triton.autotune(
-    configs=[triton.Config({}, num_warps=num_warps) for num_warps in [1, 2, 4, 8]],
-    key=["H", "BT"],
-)
-@triton.jit
-def chunk_local_cumsum_scalar_kernel(
-    A_log_ptr,  # [H]
-    a_ptr,  # [T, H]
-    dt_bias_ptr,  # [H]
-    o_ptr,
-    cu_seqlens_ptr,
-    chunk_indices_ptr,
-    H: tl.constexpr,
-    BT: tl.constexpr,
-):
-    global_chunk_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-
-    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
-    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
-
-    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
-    seqlen = eos - bos
-
-    # NOTE: strided load. maybe each pid should handle all heads.
-    offs = chunk_id * BT + tl.arange(0, BT)
-    a_ptrs = a_ptr + ((bos + offs) * H + head_id)
-    a = tl.load(a_ptrs).to(tl.float32)  # no mask
-
-    A_log = tl.load(A_log_ptr + head_id).to(tl.float32)
-    dt_bias = tl.load(dt_bias_ptr + head_id).to(tl.float32)
-
-    g = -tl.exp(A_log) * tl.log(1.0 + tl.exp(a + dt_bias))
-    o = tl.cumsum(g, axis=0)
-
-    offs = chunk_id * BT + tl.arange(0, BT)
-    o_ptrs = o_ptr + ((bos + offs) * H + head_id)
-    tl.store(o_ptrs, o, mask=offs < seqlen)
-
-
-@triton.autotune(
     configs=[triton.Config(dict(), num_warps=num_warps) for num_warps in [2, 4, 8]],
     key=["H", "K", "BT"],
 )
 @triton.jit()
 def chunk_scaled_dot_kkt_fwd_kernel(
     k_ptr,  # [total_seqlen, Hg, K]
+    A_log_ptr,  # [H]
+    a_ptr,  # [T, H]
+    dt_bias_ptr,  # [H]
     b_ptr,  # [total_seqlen, H]
     g_cu_ptr,  # [total_seqlen, H]
     beta_ptr,  # [total_seqlen, H]
@@ -89,15 +51,25 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     k = tl.load(k_ptrs)  # [BT, K]
     A = tl.dot(k, k.T)  # [BT, BT]
 
-    for head_id in range(k_head_id * (H // Hg), (k_head_id + 1) * (H // Hg)):
-        # load beta and g
+    # each K head corresponds to (H // Hg) V heads
+    for i in range(H // Hg):
+        head_id = k_head_id * (H // Hg) + i
+
+        # issue all loads
         offs_t = bos + chunk_id * BT + tl.arange(0, BT)
         b = tl.load(b_ptr + (offs_t * H + head_id)).to(tl.float32)
-        g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id))
+        a = tl.load(a_ptr + (offs_t * H + head_id)).to(tl.float32)
+        A_log = tl.load(A_log_ptr + head_id).to(tl.float32)
+        dt_bias = tl.load(dt_bias_ptr + head_id).to(tl.float32)
 
-        # apply sigmoid and store for future use
-        beta = 1.0 / (1.0 + tl.exp(-b))  # is this lowered to rcp?
-        tl.store(beta_ptr + (offs_t * H + head_id), beta)
+        # compute g and beta
+        beta = 1.0 / (1.0 + tl.exp(-b))  # sigmoid. NOTE: is this lowered to rcp?
+        g = -tl.exp(A_log) * tl.log(1.0 + tl.exp(a + dt_bias))
+        g_cu = tl.cumsum(g, axis=0)
+
+        # store for future use
+        tl.store(beta_ptr + (offs_t * H + head_id), beta, mask=offs_t < bos + seqlen)
+        tl.store(g_cu_ptr + (offs_t * H + head_id), g_cu, mask=offs_t < bos + seqlen)
 
         # apply beta and gamma
         A_ = A * beta[:, None]
@@ -612,25 +584,19 @@ def run(
     )
     total_num_chunks = chunk_indices.shape[0]
 
-    # chunk local cumsum for g
+    # this kernel does multiple things:
+    # - compute K @ K.T
+    # - compute g and its chunk local cumsum
+    # - compute beta
+    # - compute strictLower(beta * Gamma * (K @ K.T))
     g_cu = torch.empty_like(a, dtype=torch.float32)
-    chunk_local_cumsum_scalar_kernel[(total_num_chunks, H)](
+    beta = torch.empty_like(b, dtype=torch.float32)
+    A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
+    chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, Hg)](
+        k,
         A_log,
         a,
         dt_bias,
-        g_cu,
-        cu_seqlens,
-        chunk_indices,
-        H=H,
-        BT=BT,
-    )
-
-    # obtain WY representation. u is actually the new v.
-    # compute strictLower(beta * Gamma * (K @ K.T))
-    A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    beta = torch.empty_like(b, dtype=torch.float32)
-    chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, Hg)](
-        k,
         b,
         g_cu,
         beta,
@@ -656,6 +622,7 @@ def run(
     )
     A = Ai
 
+    # obtain WY representation. u is actually the new v.
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
     recompute_w_u_fwd_kernel[(total_num_chunks, H)](
