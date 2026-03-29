@@ -100,12 +100,20 @@ def chunk_scaled_dot_kkt_fwd_kernel(
 )
 @triton.jit
 def merge_16x16_to_64x64_inverse_kernel(
+    k_ptr,
+    v_ptr,
+    w_ptr,
+    u_ptr,
     A_ptr,
     Ai_ptr,
     beta_ptr,
+    g_cu_ptr,
     cu_seqlens_ptr,
     chunk_indices_ptr,
     H: tl.constexpr,
+    Hg: tl.constexpr,
+    K_dim: tl.constexpr,
+    V_dim: tl.constexpr,
     BT: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
 ):
@@ -119,14 +127,17 @@ def merge_16x16_to_64x64_inverse_kernel(
     eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     T = eos - bos
 
+    # compute inverse
     o_i = tl.arange(0, 16)
     m_A = o_i[:, None] > o_i[None, :]
     m_I = o_i[:, None] == o_i[None, :]
-    A_ptr += (bos * H + head_id) * BT
-    Ai_ptr += (bos * H + head_id) * BT
 
-    desc = tl.make_tensor_descriptor(A_ptr, [T, BT], [H * BT, 1], [16, 16])
-    desc_o = tl.make_tensor_descriptor(Ai_ptr, [T, BT], [H * BT, 1], [16, 16])
+    desc = tl.make_tensor_descriptor(
+        A_ptr + (bos * H + head_id) * BT, [T, BT], [H * BT, 1], [16, 16]
+    )
+    desc_o = tl.make_tensor_descriptor(
+        Ai_ptr + (bos * H + head_id) * BT, [T, BT], [H * BT, 1], [16, 16]
+    )
     Ai_11 = desc.load([chunk_id * BT + 0, 0]).to(tl.float32)
     Ai_22 = desc.load([chunk_id * BT + 16, 16]).to(tl.float32)
     Ai_33 = desc.load([chunk_id * BT + 32, 32]).to(tl.float32)
@@ -139,19 +150,25 @@ def merge_16x16_to_64x64_inverse_kernel(
     Ai_44 = -tl.where(m_A, Ai_44, 0)
 
     for i in range(2, min(16, T - chunk_id * BT)):
-        a_11 = -tl.load(A_ptr + (chunk_id * BT + i) * H * BT + o_i)
+        a_11 = -tl.load(A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i)
         a_11 += tl.sum(a_11[:, None] * Ai_11, 0)
         Ai_11 = tl.where((o_i == i)[:, None], a_11, Ai_11)
     for i in range(16 + 2, min(32, T - chunk_id * BT)):
-        a_22 = -tl.load(A_ptr + (chunk_id * BT + i) * H * BT + o_i + 16)
+        a_22 = -tl.load(
+            A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 16
+        )
         a_22 += tl.sum(a_22[:, None] * Ai_22, 0)
         Ai_22 = tl.where((o_i == i - 16)[:, None], a_22, Ai_22)
     for i in range(32 + 2, min(48, T - chunk_id * BT)):
-        a_33 = -tl.load(A_ptr + (chunk_id * BT + i) * H * BT + o_i + 32)
+        a_33 = -tl.load(
+            A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 32
+        )
         a_33 += tl.sum(a_33[:, None] * Ai_33, 0)
         Ai_33 = tl.where((o_i == i - 32)[:, None], a_33, Ai_33)
     for i in range(48 + 2, min(64, T - chunk_id * BT)):
-        a_44 = -tl.load(A_ptr + (chunk_id * BT + i) * H * BT + o_i + 48)
+        a_44 = -tl.load(
+            A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 48
+        )
         a_44 += tl.sum(a_44[:, None] * Ai_44, 0)
         Ai_44 = tl.where((o_i == i - 48)[:, None], a_44, Ai_44)
     Ai_11 += m_I
@@ -202,60 +219,21 @@ def merge_16x16_to_64x64_inverse_kernel(
         input_precision=DOT_PRECISION,
     )
 
-    # apply beta
-    beta = tl.load(
-        beta_ptr + ((bos + chunk_id * BT + tl.arange(0, BT)) * H + head_id)
-    )  # [BT]
-    beta12, beta34 = beta.reshape(2, 32).T.split()
-    beta1, beta2 = beta12.reshape(2, 16).T.split()
-    beta3, beta4 = beta34.reshape(2, 16).T.split()
+    desc_o.store([chunk_id * BT + 0, 0], Ai_11)
+    desc_o.store([chunk_id * BT + 16, 16], Ai_22)
+    desc_o.store([chunk_id * BT + 32, 32], Ai_33)
+    desc_o.store([chunk_id * BT + 48, 48], Ai_44)
+    desc_o.store([chunk_id * BT + 16, 0], Ai_21)
+    desc_o.store([chunk_id * BT + 32, 0], Ai_31)
+    desc_o.store([chunk_id * BT + 32, 16], Ai_32)
+    desc_o.store([chunk_id * BT + 48, 0], Ai_41)
+    desc_o.store([chunk_id * BT + 48, 16], Ai_42)
+    desc_o.store([chunk_id * BT + 48, 32], Ai_43)
 
-    desc_o.store([chunk_id * BT + 0, 0], Ai_11 * beta1)
-    desc_o.store([chunk_id * BT + 16, 16], Ai_22 * beta2)
-    desc_o.store([chunk_id * BT + 32, 32], Ai_33 * beta3)
-    desc_o.store([chunk_id * BT + 48, 48], Ai_44 * beta4)
-    desc_o.store([chunk_id * BT + 16, 0], Ai_21 * beta1)
-    desc_o.store([chunk_id * BT + 32, 0], Ai_31 * beta1)
-    desc_o.store([chunk_id * BT + 32, 16], Ai_32 * beta2)
-    desc_o.store([chunk_id * BT + 48, 0], Ai_41 * beta1)
-    desc_o.store([chunk_id * BT + 48, 16], Ai_42 * beta2)
-    desc_o.store([chunk_id * BT + 48, 32], Ai_43 * beta3)
+    # syncthreads to make stores visible within a threadblock
+    tl.debug_barrier()
 
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K", "V", "BT"],
-)
-@triton.jit
-def recompute_w_u_fwd_kernel(
-    k_ptr,
-    v_ptr,
-    w_ptr,
-    u_ptr,
-    A_ptr,
-    g_cu_ptr,
-    cu_seqlens_ptr,
-    chunk_indices_ptr,
-    H: tl.constexpr,
-    Hg: tl.constexpr,
-    K_dim: tl.constexpr,
-    V_dim: tl.constexpr,
-    BT: tl.constexpr,
-):
-    global_chunk_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-
-    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
-    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
-
-    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
-    T = eos - bos
-
+    # compute WY representation
     # issue all loads ASAP
     # NOTE: we remove some masking, which might not be valid. sometimes we got NaN -> investigate.
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
@@ -266,22 +244,24 @@ def recompute_w_u_fwd_kernel(
     k_ptrs = k_ptr + (offs_t * Hg * K_dim + k_head_id * K_dim + tl.arange(0, K_dim))
     k = tl.load(k_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, K_dim]
 
-    A_ptrs = A_ptr + (offs_t * H * BT + head_id * BT + tl.arange(0, BT))
-    A = tl.load(A_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, BT]
+    Ai_ptrs = Ai_ptr + (offs_t * H * BT + head_id * BT + tl.arange(0, BT))
+    Ai = tl.load(Ai_ptrs, mask=offs_t < bos + T, other=0.0)  # [BT, BT]
 
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)
+    beta = tl.load(beta_ptr + (offs_t * H + head_id))  # [BT]
     g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id))  # [BT]
 
-    # U = A @ V
-    u = tl.dot(A, v)
+    # U = (Ai * beta) @ V
+    Ab = Ai * beta
+    u = tl.dot(Ab.to(v.dtype), v)
 
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
     u_ptrs = u_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
     tl.store(u_ptrs, u, mask=offs_t < bos + T)
 
-    # W = (A * g_cu) @ K
-    Ag = A * tl.exp(g_cu)
-    w = tl.dot(Ag.to(k.dtype), k)
+    # W = (Ai * beta * g_cu) @ K
+    Abg = Ab * tl.exp(g_cu)
+    w = tl.dot(Abg.to(k.dtype), k)
 
     offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
     w_ptrs = w_ptr + (offs_t * H * K_dim + head_id * K_dim + tl.arange(0, K_dim))
@@ -572,29 +552,19 @@ def run(
         BT=BT,
     )
 
-    # compute inverse(I + strictTriu(A)) * beta
+    # - compute Ai = inverse(I + strictTriu(A))
+    # - obtain WY representation: U = Ai @ V and W = (Ai * g_cu) @ K
     Ai = torch.zeros_like(A, dtype=k.dtype)  # BF16
-    merge_16x16_to_64x64_inverse_kernel[(total_num_chunks, H)](
-        A,
-        Ai,
-        beta,
-        cu_seqlens,
-        chunk_indices,
-        H=H,
-        BT=BT,
-        DOT_PRECISION="ieee",
-    )
-    A = Ai
-
-    # obtain WY representation. u is actually the new v.
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
-    recompute_w_u_fwd_kernel[(total_num_chunks, H)](
+    merge_16x16_to_64x64_inverse_kernel[(total_num_chunks, H)](
         k,
         v,
         w,
         u,
         A,
+        Ai,
+        beta,
         g_cu,
         cu_seqlens,
         chunk_indices,
@@ -603,6 +573,7 @@ def run(
         K_dim=K_dim,
         V_dim=V_dim,
         BT=BT,
+        DOT_PRECISION="ieee",
     )
 
     h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
