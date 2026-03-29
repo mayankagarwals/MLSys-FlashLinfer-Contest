@@ -52,10 +52,18 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         [Hg * K_dim, 1],
         [BT, K_dim],
     )
+    A_desc = tl.make_tensor_descriptor(
+        A_ptr + (bos * H * BT),
+        [seqlen, H, BT],
+        [H * BT, BT, 1],
+        [BT, 1, BT],
+    )
+
     k = k_desc.load([chunk_id * BT, 0])
     A = tl.dot(k, k.T)  # [BT, BT]
 
     # each K head corresponds to (H // Hg) V heads
+    # NOTE: we can load all (H // Hg) at the same time?
     for i in range(H // Hg):
         head_id = k_head_id * (H // Hg) + i
 
@@ -79,20 +87,12 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         A_ = A * beta[:, None]
         A_ = A_ * tl.exp(g_cu[:, None] - g_cu[None, :])
 
-        # TODO: use TMA
         offs_t = chunk_id * BT + tl.arange(0, BT)
         mask_t = offs_t < seqlen
         mask_A = (offs_t[:, None] > offs_t[None, :]) & (mask_t[:, None] & mask_t)
         A_ = tl.where(mask_A, A_, 0)
-        A_ptrs = tl.make_block_ptr(
-            A_ptr + (bos * H + head_id) * BT,
-            (seqlen, BT),
-            (BT * H, 1),
-            (chunk_id * BT, 0),
-            (BT, BT),
-            (1, 0),
-        )
-        tl.store(A_ptrs, A_, boundary_check=(0, 1))
+
+        A_desc.store([chunk_id * BT, head_id, 0], A_.reshape(BT, 1, BT))
 
 
 # concat along the first dim
