@@ -15,7 +15,7 @@ triton.set_allocator(alloc_fn)
 
 @triton.autotune(
     configs=[triton.Config(dict(), num_warps=num_warps) for num_warps in [2, 4, 8]],
-    key=["H", "K", "BT"],
+    key=["H", "K_dim", "BT"],
 )
 @triton.jit
 def chunk_scaled_dot_kkt_fwd_kernel(
@@ -112,7 +112,7 @@ def _concat_2d_dim1(A, B):
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4, 5]
     ],
-    key=["H", "BT"],
+    key=["H", "K_dim", "V_dim", "BT"],
 )
 @triton.jit
 def merge_16x16_to_64x64_inverse_kernel(
@@ -304,7 +304,7 @@ def merge_16x16_to_64x64_inverse_kernel(
         for num_stages in [2, 3, 4]
         for BV in [16, 32, 64, 128]
     ],
-    key=["H", "K", "V", "BT"],
+    key=["H", "K_dim", "V_dim", "BT"],
 )
 @triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h(
@@ -435,23 +435,23 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=["H", "K", "V", "BT"],
+    key=["H", "K_dim", "V_dim", "BT"],
 )
 @triton.jit
 def chunk_fwd_kernel_o(
-    q,
-    k,
-    v,
-    h,
-    g,
-    o,
-    cu_seqlens,
-    chunk_indices,
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    h_ptr,
+    g_cu_ptr,
+    o_ptr,
+    cu_seqlens_ptr,
+    chunk_indices_ptr,
     scale,
     H: tl.constexpr,
     Hg: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
+    K_dim: tl.constexpr,
+    V_dim: tl.constexpr,
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
@@ -461,69 +461,63 @@ def chunk_fwd_kernel_o(
     i_h = tl.program_id(2)
 
     i_tg = i_t
-    i_n = tl.load(chunk_indices + i_t * 2).to(tl.int32)
-    i_t = tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
+    i_n = tl.load(chunk_indices_ptr + i_t * 2).to(tl.int32)
+    i_t = tl.load(chunk_indices_ptr + i_t * 2 + 1).to(tl.int32)
 
-    bos = tl.load(cu_seqlens + i_n).to(tl.int32)
-    eos = tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    bos = tl.load(cu_seqlens_ptr + i_n).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + i_n + 1).to(tl.int32)
     T = eos - bos
 
     # offset calculation
-    q += (bos * Hg + i_h // (H // Hg)) * K
-    k += (bos * Hg + i_h // (H // Hg)) * K
-    v += (bos * H + i_h) * V
-    o += (bos * H + i_h) * V
-    h += (i_tg * H + i_h).to(tl.int64) * V * K
+    q_ptr += (bos * Hg + i_h // (H // Hg)) * K_dim
+    k_ptr += (bos * Hg + i_h // (H // Hg)) * K_dim
+    v_ptr += (bos * H + i_h) * V_dim
+    o_ptr += (bos * H + i_h) * V_dim
+    h_ptr += (i_tg * H + i_h).to(tl.int64) * V_dim * K_dim
 
-    b_o = tl.zeros([BT, BV], dtype=tl.float32)
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
+    o = tl.zeros([BT, BV], dtype=tl.float32)
+    A = tl.zeros([BT, BT], dtype=tl.float32)
 
-    for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(
-            q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
+    for i_k in range(tl.cdiv(K_dim, BK)):
+        q_ptrs = tl.make_block_ptr(
+            q_ptr, (T, K_dim), (Hg * K_dim, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
-        p_k = tl.make_block_ptr(
-            k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT), (BK, BT), (0, 1)
+        k_ptrs = tl.make_block_ptr(
+            k_ptr, (T, K_dim), (Hg * K_dim, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
         )
-        p_h = tl.make_block_ptr(
-            h, (V, K), (K, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
+        h_ptrs = tl.make_block_ptr(
+            h_ptr, (V_dim, K_dim), (K_dim, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
         )
-        # [BT, BK]
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        # [BK, BT]
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        # [BV, BK]
-        b_h = tl.load(p_h, boundary_check=(0, 1))
 
-        # [BT, BK] @ [BK, BV] -> [BT, BV]
-        b_o += tl.dot(b_q, tl.trans(b_h))
-        # [BT, BK] @ [BK, BT] -> [BT, BT]
-        b_A += tl.dot(b_q, b_k)
+        q = tl.load(q_ptrs, boundary_check=(0, 1))  # [BT, BK]
+        k = tl.load(k_ptrs, boundary_check=(0, 1))  # [BT, BK]
+        h = tl.load(h_ptrs, boundary_check=(0, 1))  # [BV, BK]
+
+        o = tl.dot(q, h.T, acc=o)  # [BT, BV]
+        A = tl.dot(q, k.T, acc=A)  # [BT, BT]
 
     # apply g
-    g += bos * H + i_h
-    p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    b_g = tl.load(p_g, boundary_check=(0,))
-    b_o = b_o * tl.exp(b_g)[:, None]
-    b_A = b_A * tl.exp(b_g[:, None] - b_g[None, :])
+    g_cu_ptr += bos * H + i_h
+    g_cu_ptrs = tl.make_block_ptr(g_cu_ptr, (T,), (H,), (i_t * BT,), (BT,), (0,))
+    g_cu = tl.load(g_cu_ptrs, boundary_check=(0,))
+    o = o * tl.exp(g_cu)[:, None]
+    A = A * tl.exp(g_cu[:, None] - g_cu[None, :])
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
-    b_A = tl.where(m_A, b_A, 0)
+    A = tl.where(m_A, A, 0)
 
-    p_v = tl.make_block_ptr(
-        v, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+    v_ptrs = tl.make_block_ptr(
+        v_ptr, (T, V_dim), (H * V_dim, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
     )
-    p_o = tl.make_block_ptr(
-        o, (T, V), (H * V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+    o_ptrs = tl.make_block_ptr(
+        o_ptr, (T, V_dim), (H * V_dim, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
     )
-    b_v = tl.load(p_v, boundary_check=(0, 1))
+    v = tl.load(v_ptrs, boundary_check=(0, 1))
 
-    # to fix mma -> mma layout conversion
-    # already solved by triton v3.2 or higher
-    b_o = b_o * scale + tl.dot(b_A.to(b_v.dtype), b_v) * scale
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+    o = tl.dot(A.to(v.dtype), v, acc=o) * scale
+    tl.store(o_ptrs, o.to(o_ptrs.dtype.element_ty), boundary_check=(0, 1))
 
 
 def run(
@@ -634,23 +628,24 @@ def run(
 
     o = torch.empty_like(v)
 
+    # we only need separate o kernel if h kernel is too small?
     def grid(meta):
         return (triton.cdiv(V_dim, meta["BV"]), total_num_chunks, H)
 
     chunk_fwd_kernel_o[grid](
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=g_cu,
-        o=o,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
+        q,
+        k,
+        v_new,
+        h,
+        g_cu,
+        o,
+        cu_seqlens,
+        chunk_indices,
         scale=scale,
         H=H,
         Hg=Hg,
-        K=K_dim,
-        V=V_dim,
+        K_dim=K_dim,
+        V_dim=V_dim,
         BT=BT,
     )
 
