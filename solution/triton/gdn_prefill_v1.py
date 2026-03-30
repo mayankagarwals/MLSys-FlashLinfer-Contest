@@ -59,6 +59,7 @@ def chunk_scaled_dot_kkt_fwd_kernel(
         [BT, 1, BT],
     )
 
+    # compute K @ K.T
     k = k_desc.load([chunk_id * BT, 0])
     A = tl.dot(k, k.T)  # [BT, BT]
 
@@ -372,6 +373,7 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     h = tl.load(h0_ptrs, boundary_check=(0, 1)).to(tl.float32)  # [BV, K_dim]
 
     # main recurrence
+    # TODO: use TMA
     for chunk_id in range(NT):
         # save intermediate state for o computation
         h_ptrs = tl.make_block_ptr(
@@ -569,6 +571,7 @@ def run(
     # - compute g and its chunk local cumsum
     # - compute beta
     # - compute strictLower(beta * Gamma * (K @ K.T))
+    # NOTE: transpose g_cu and beta to make them T-contiguous?
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
