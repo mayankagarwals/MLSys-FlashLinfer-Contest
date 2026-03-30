@@ -315,9 +315,9 @@ def merge_16x16_to_64x64_inverse_kernel(
 @triton.autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
+        for BV in [16, 32, 64, 128]
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
-        for BV in [16, 32, 64, 128]
     ],
     key=["H", "K_dim", "V_dim", "BT"],
 )
@@ -347,8 +347,8 @@ def chunk_gated_delta_rule_fwd_kernel_h(
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
     eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
-    T = eos - bos
-    NT = tl.cdiv(T, BT)
+    seqlen = eos - bos
+    num_chunks = tl.cdiv(seqlen, BT)
     boh = tl.load(chunk_offsets_ptr + seq_id).to(tl.int32)
 
     # calculate offset
@@ -373,8 +373,8 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     h = tl.load(h0_ptrs, boundary_check=(0, 1)).to(tl.float32)  # [BV, K_dim]
 
     # main recurrence
-    # TODO: use TMA
-    for chunk_id in range(NT):
+    # NOTE: TMA might not be faster?
+    for chunk_id in range(num_chunks):
         # save intermediate state for o computation
         h_ptrs = tl.make_block_ptr(
             h_ptr + chunk_id * stride_h,
@@ -388,13 +388,13 @@ def chunk_gated_delta_rule_fwd_kernel_h(
 
         # issue all loads first
         w_ptrs = tl.make_block_ptr(
-            w_ptr, (T, K_dim), (stride_w, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
+            w_ptr, (seqlen, K_dim), (stride_w, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
         )
         w = tl.load(w_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
 
         v_ptrs = tl.make_block_ptr(
             v_ptr,
-            (T, V_dim),
+            (seqlen, V_dim),
             (stride_v, 1),
             (chunk_id * BT, i_v * BV),
             (BT, BV),
@@ -403,14 +403,14 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         v = tl.load(v_ptrs, boundary_check=(0, 1))
 
         k_ptrs = tl.make_block_ptr(
-            k_ptr, (T, K_dim), (stride_k, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
+            k_ptr, (seqlen, K_dim), (stride_k, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
         )
         k = tl.load(k_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
 
-        last_idx = min((chunk_id + 1) * BT, T) - 1
+        last_idx = min((chunk_id + 1) * BT, seqlen) - 1
         g_cu_last = tl.load(g_cu_ptr + bos * H + last_idx * H + head_id)
         g_cu_ptrs = tl.make_block_ptr(
-            g_cu_ptr + bos * H + head_id, (T,), (H,), (chunk_id * BT,), (BT,), (0,)
+            g_cu_ptr + bos * H + head_id, (seqlen,), (H,), (chunk_id * BT,), (BT,), (0,)
         )
         g_cu = tl.load(g_cu_ptrs, boundary_check=(0,))
 
@@ -420,16 +420,16 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         # save new value for o computation
         v_new_ptrs = tl.make_block_ptr(
             v_new_ptr,
-            (T, V_dim),
+            (seqlen, V_dim),
             (stride_v, 1),
             (chunk_id * BT, i_v * BV),
             (BT, BV),
             (1, 0),
         )
-        tl.store(v_new_ptrs, v_new.to(v_ptrs.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(v_new_ptrs, v_new.to(v_new_ptrs.dtype.element_ty), boundary_check=(0, 1))
 
         # apply g
-        mask_t = (chunk_id * BT + tl.arange(0, BT)) < T
+        mask_t = (chunk_id * BT + tl.arange(0, BT)) < seqlen
         v_new = v_new * tl.where(mask_t, tl.exp(g_cu_last - g_cu), 0)[:, None]
         h *= tl.exp(g_cu_last)
 
