@@ -146,49 +146,37 @@ def merge_16x16_to_64x64_inverse_kernel(
     seqlen = eos - bos
 
     # compute inverse
+    A_ptr += bos * H * BT + head_id * BT
+    Ai_ptr += bos * H * BT + head_id * BT
+    desc = tl.make_tensor_descriptor(A_ptr, [seqlen, BT], [H * BT, 1], [16, 16])
+    desc_o = tl.make_tensor_descriptor(Ai_ptr, [seqlen, BT], [H * BT, 1], [16, 16])
+
+    Ai_11 = -desc.load([chunk_id * BT + 0, 0]).to(tl.float32)
+    Ai_22 = -desc.load([chunk_id * BT + 16, 16]).to(tl.float32)
+    Ai_33 = -desc.load([chunk_id * BT + 32, 32]).to(tl.float32)
+    Ai_44 = -desc.load([chunk_id * BT + 48, 48]).to(tl.float32)
+
+    # 16x16 inverse
     o_i = tl.arange(0, 16)
-    m_A = o_i[:, None] > o_i[None, :]
-    m_I = o_i[:, None] == o_i[None, :]
-
-    desc = tl.make_tensor_descriptor(
-        A_ptr + (bos * H + head_id) * BT, [seqlen, BT], [H * BT, 1], [16, 16]
-    )
-    desc_o = tl.make_tensor_descriptor(
-        Ai_ptr + (bos * H + head_id) * BT, [seqlen, BT], [H * BT, 1], [16, 16]
-    )
-    Ai_11 = desc.load([chunk_id * BT + 0, 0]).to(tl.float32)
-    Ai_22 = desc.load([chunk_id * BT + 16, 16]).to(tl.float32)
-    Ai_33 = desc.load([chunk_id * BT + 32, 32]).to(tl.float32)
-    Ai_44 = desc.load([chunk_id * BT + 48, 48]).to(tl.float32)
-
-    # [16, 16]
-    Ai_11 = -tl.where(m_A, Ai_11, 0)
-    Ai_22 = -tl.where(m_A, Ai_22, 0)
-    Ai_33 = -tl.where(m_A, Ai_33, 0)
-    Ai_44 = -tl.where(m_A, Ai_44, 0)
-
     for i in range(2, min(16, seqlen - chunk_id * BT)):
-        a_11 = -tl.load(A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i)
+        a_11 = -tl.load(A_ptr + ((chunk_id * BT + i) * H * BT + o_i))
         a_11 += tl.sum(a_11[:, None] * Ai_11, 0)
         Ai_11 = tl.where((o_i == i)[:, None], a_11, Ai_11)
     for i in range(16 + 2, min(32, seqlen - chunk_id * BT)):
-        a_22 = -tl.load(
-            A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 16
-        )
+        a_22 = -tl.load(A_ptr + ((chunk_id * BT + i) * H * BT + o_i + 16))
         a_22 += tl.sum(a_22[:, None] * Ai_22, 0)
         Ai_22 = tl.where((o_i == i - 16)[:, None], a_22, Ai_22)
     for i in range(32 + 2, min(48, seqlen - chunk_id * BT)):
-        a_33 = -tl.load(
-            A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 32
-        )
+        a_33 = -tl.load(A_ptr + ((chunk_id * BT + i) * H * BT + o_i + 32))
         a_33 += tl.sum(a_33[:, None] * Ai_33, 0)
         Ai_33 = tl.where((o_i == i - 32)[:, None], a_33, Ai_33)
     for i in range(48 + 2, min(64, seqlen - chunk_id * BT)):
-        a_44 = -tl.load(
-            A_ptr + (bos + chunk_id * BT + i) * H * BT + head_id * BT + o_i + 48
-        )
+        a_44 = -tl.load(A_ptr + ((chunk_id * BT + i) * H * BT + o_i + 48))
         a_44 += tl.sum(a_44[:, None] * Ai_44, 0)
         Ai_44 = tl.where((o_i == i - 48)[:, None], a_44, Ai_44)
+
+    o_i = tl.arange(0, 16)
+    m_I = o_i[:, None] == o_i[None, :]
     Ai_11 += m_I
     Ai_22 += m_I
     Ai_33 += m_I
@@ -201,41 +189,27 @@ def merge_16x16_to_64x64_inverse_kernel(
     A_42 = desc.load([chunk_id * BT + 48, 16]).to(tl.float32)
     A_43 = desc.load([chunk_id * BT + 48, 32]).to(tl.float32)
 
-    Ai_21 = -tl.dot(
-        tl.dot(Ai_22, A_21, input_precision=DOT_PRECISION),
-        Ai_11,
-        input_precision=DOT_PRECISION,
-    )
-    Ai_32 = -tl.dot(
-        tl.dot(Ai_33, A_32, input_precision=DOT_PRECISION),
-        Ai_22,
-        input_precision=DOT_PRECISION,
-    )
-    Ai_43 = -tl.dot(
-        tl.dot(Ai_44, A_43, input_precision=DOT_PRECISION),
-        Ai_33,
-        input_precision=DOT_PRECISION,
-    )
+    tmp = tl.dot(Ai_22, A_21, input_precision=DOT_PRECISION)
+    Ai_21 = -tl.dot(tmp, Ai_11, input_precision=DOT_PRECISION)
 
-    Ai_31 = -tl.dot(
-        Ai_33,
-        tl.dot(A_31, Ai_11, input_precision=DOT_PRECISION)
-        + tl.dot(A_32, Ai_21, input_precision=DOT_PRECISION),
-        input_precision=DOT_PRECISION,
-    )
-    Ai_42 = -tl.dot(
-        Ai_44,
-        tl.dot(A_42, Ai_22, input_precision=DOT_PRECISION)
-        + tl.dot(A_43, Ai_32, input_precision=DOT_PRECISION),
-        input_precision=DOT_PRECISION,
-    )
-    Ai_41 = -tl.dot(
-        Ai_44,
-        tl.dot(A_41, Ai_11, input_precision=DOT_PRECISION)
-        + tl.dot(A_42, Ai_21, input_precision=DOT_PRECISION)
-        + tl.dot(A_43, Ai_31, input_precision=DOT_PRECISION),
-        input_precision=DOT_PRECISION,
-    )
+    tmp = tl.dot(Ai_33, A_32, input_precision=DOT_PRECISION)
+    Ai_32 = -tl.dot(tmp, Ai_22, input_precision=DOT_PRECISION)
+
+    tmp = tl.dot(Ai_44, A_43, input_precision=DOT_PRECISION)
+    Ai_43 = -tl.dot(tmp, Ai_33, input_precision=DOT_PRECISION)
+
+    tmp = tl.dot(A_31, Ai_11, input_precision=DOT_PRECISION)
+    tmp = tl.dot(A_32, Ai_21, acc=tmp, input_precision=DOT_PRECISION)
+    Ai_31 = -tl.dot(Ai_33, tmp, input_precision=DOT_PRECISION)
+
+    tmp = tl.dot(A_42, Ai_22, input_precision=DOT_PRECISION)
+    tmp = tl.dot(A_43, Ai_32, acc=tmp, input_precision=DOT_PRECISION)
+    Ai_42 = -tl.dot(Ai_44, tmp, input_precision=DOT_PRECISION)
+
+    tmp = tl.dot(A_41, Ai_11, input_precision=DOT_PRECISION)
+    tmp = tl.dot(A_42, Ai_21, acc=tmp, input_precision=DOT_PRECISION)
+    tmp = tl.dot(A_43, Ai_31, acc=tmp, input_precision=DOT_PRECISION)
+    Ai_41 = -tl.dot(Ai_44, tmp, input_precision=DOT_PRECISION)
 
     # this is faster (skip global stores + syncthreads),
     # but it sometimes produces NaN for some reasons...
@@ -279,37 +253,44 @@ def merge_16x16_to_64x64_inverse_kernel(
     # compute WY representation
     # issue all loads ASAP
     # NOTE: we remove some masking, which might not be valid. sometimes we got NaN -> investigate.
-    offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
-    v_ptrs = v_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
-    v = tl.load(v_ptrs, mask=offs_t < bos + seqlen, other=0.0)  # [BT, V_dim]
+    k_ptr += bos * Hg * K_dim + head_id // (H // Hg) * K_dim
+    v_ptr += bos * H * V_dim + head_id * V_dim
+    w_ptr += bos * H * K_dim + head_id * K_dim
+    u_ptr += bos * H * V_dim + head_id * V_dim
+    beta_ptr += bos * H + head_id
+    g_cu_ptr += bos * H + head_id
 
-    k_head_id = head_id // (H // Hg)
-    k_ptrs = k_ptr + (offs_t * Hg * K_dim + k_head_id * K_dim + tl.arange(0, K_dim))
-    k = tl.load(k_ptrs, mask=offs_t < bos + seqlen, other=0.0)  # [BT, K_dim]
+    offs_t = chunk_id * BT + tl.arange(0, BT)
+    mask_t = offs_t < seqlen
 
-    Ai_ptrs = Ai_ptr + (offs_t * H * BT + head_id * BT + tl.arange(0, BT))
-    Ai = tl.load(Ai_ptrs, mask=offs_t < bos + seqlen, other=0.0)  # [BT, BT]
+    Ai_ptrs = Ai_ptr + (offs_t[:, None] * H * BT + tl.arange(0, BT))
+    Ai = tl.load(Ai_ptrs, mask=mask_t[:, None], other=0.0)  # [BT, BT]
+    # Ai = tl.load(Ai_ptrs)  # [BT, BT]
 
-    offs_t = bos + chunk_id * BT + tl.arange(0, BT)
-    mask_t = offs_t < bos + seqlen
-    beta = tl.load(beta_ptr + (offs_t * H + head_id), mask=mask_t, other=0.0)  # [BT]
-    g_cu = tl.load(g_cu_ptr + (offs_t * H + head_id), mask=mask_t, other=0.0)  # [BT]
+    v_ptrs = v_ptr + (offs_t[:, None] * H * V_dim + tl.arange(0, V_dim))
+    v = tl.load(v_ptrs, mask=mask_t[:, None], other=0.0)  # [BT, V_dim]
+
+    k_ptrs = k_ptr + (offs_t[:, None] * Hg * K_dim + tl.arange(0, K_dim))
+    k = tl.load(k_ptrs, mask=mask_t[:, None], other=0.0)  # [BT, K_dim]
+
+    beta = tl.load(beta_ptr + offs_t * H, mask=mask_t, other=0.0)  # [BT]
+    g_cu = tl.load(g_cu_ptr + offs_t * H, mask=mask_t, other=0.0)  # [BT]
 
     # U = (Ai * beta) @ V
     Ab = Ai * beta
     u = tl.dot(Ab.to(v.dtype), v)
 
-    offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
-    u_ptrs = u_ptr + (offs_t * H * V_dim + head_id * V_dim + tl.arange(0, V_dim))
-    tl.store(u_ptrs, u, mask=offs_t < bos + seqlen)
+    offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
+    u_ptrs = u_ptr + (offs_t * H * V_dim + tl.arange(0, V_dim))
+    tl.store(u_ptrs, u, mask=offs_t < seqlen)
 
     # W = (Ai * beta * g_cu) @ K
     Abg = Ab * tl.exp(g_cu)
     w = tl.dot(Abg.to(k.dtype), k)
 
-    offs_t = bos + chunk_id * BT + tl.arange(0, BT)[:, None]
-    w_ptrs = w_ptr + (offs_t * H * K_dim + head_id * K_dim + tl.arange(0, K_dim))
-    tl.store(w_ptrs, w, mask=offs_t < bos + seqlen)
+    offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
+    w_ptrs = w_ptr + (offs_t * H * K_dim + tl.arange(0, K_dim))
+    tl.store(w_ptrs, w, mask=offs_t < seqlen)
 
 
 @triton.autotune(
@@ -388,7 +369,12 @@ def chunk_gated_delta_rule_fwd_kernel_h(
 
         # issue all loads first
         w_ptrs = tl.make_block_ptr(
-            w_ptr, (seqlen, K_dim), (stride_w, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
+            w_ptr,
+            (seqlen, K_dim),
+            (stride_w, 1),
+            (chunk_id * BT, 0),
+            (BT, K_dim),
+            (1, 0),
         )
         w = tl.load(w_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
 
@@ -403,7 +389,12 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         v = tl.load(v_ptrs, boundary_check=(0, 1))
 
         k_ptrs = tl.make_block_ptr(
-            k_ptr, (seqlen, K_dim), (stride_k, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
+            k_ptr,
+            (seqlen, K_dim),
+            (stride_k, 1),
+            (chunk_id * BT, 0),
+            (BT, K_dim),
+            (1, 0),
         )
         k = tl.load(k_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
 
@@ -426,7 +417,9 @@ def chunk_gated_delta_rule_fwd_kernel_h(
             (BT, BV),
             (1, 0),
         )
-        tl.store(v_new_ptrs, v_new.to(v_new_ptrs.dtype.element_ty), boundary_check=(0, 1))
+        tl.store(
+            v_new_ptrs, v_new.to(v_new_ptrs.dtype.element_ty), boundary_check=(0, 1)
+        )
 
         # apply g
         mask_t = (chunk_id * BT + tl.arange(0, BT)) < seqlen
@@ -613,7 +606,7 @@ def run(
         K_dim=K_dim,
         V_dim=V_dim,
         BT=BT,
-        DOT_PRECISION="ieee",
+        DOT_PRECISION="tf32x3",  # using tf32 may cause NaN
     )
 
     h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
