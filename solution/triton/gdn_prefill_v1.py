@@ -158,22 +158,39 @@ def merge_16x16_to_64x64_inverse_kernel(
 
     # 16x16 inverse
     o_i = tl.arange(0, 16)
-    for i in range(2, min(16, seqlen - chunk_id * BT)):
-        a_11 = -tl.load(A_ptr + ((chunk_id * BT + i) * H * BT + o_i))
+    for i in range(2, 16):
+        # fully unrolled
+        # masked load here is important
+        a_11 = -tl.load(
+            A_ptr + ((chunk_id * BT + i) * H * BT + o_i),
+            mask=i < seqlen - chunk_id * BT,
+            other=0.0,
+        )
+        a_22 = -tl.load(
+            A_ptr + ((chunk_id * BT + i + 16) * H * BT + o_i + 16),
+            mask=i + 16 < seqlen - chunk_id * BT,
+            other=0.0,
+        )
+        a_33 = -tl.load(
+            A_ptr + ((chunk_id * BT + i + 32) * H * BT + o_i + 32),
+            mask=i + 32 < seqlen - chunk_id * BT,
+            other=0.0,
+        )
+        a_44 = -tl.load(
+            A_ptr + ((chunk_id * BT + i + 48) * H * BT + o_i + 48),
+            mask=i + 48 < seqlen - chunk_id * BT,
+            other=0.0,
+        )
+
         a_11 += tl.sum(a_11[:, None] * Ai_11, 0)
-        Ai_11 = tl.where((o_i == i)[:, None], a_11, Ai_11)
-    for i in range(16 + 2, min(32, seqlen - chunk_id * BT)):
-        a_22 = -tl.load(A_ptr + ((chunk_id * BT + i) * H * BT + o_i + 16))
         a_22 += tl.sum(a_22[:, None] * Ai_22, 0)
-        Ai_22 = tl.where((o_i == i - 16)[:, None], a_22, Ai_22)
-    for i in range(32 + 2, min(48, seqlen - chunk_id * BT)):
-        a_33 = -tl.load(A_ptr + ((chunk_id * BT + i) * H * BT + o_i + 32))
         a_33 += tl.sum(a_33[:, None] * Ai_33, 0)
-        Ai_33 = tl.where((o_i == i - 32)[:, None], a_33, Ai_33)
-    for i in range(48 + 2, min(64, seqlen - chunk_id * BT)):
-        a_44 = -tl.load(A_ptr + ((chunk_id * BT + i) * H * BT + o_i + 48))
         a_44 += tl.sum(a_44[:, None] * Ai_44, 0)
-        Ai_44 = tl.where((o_i == i - 48)[:, None], a_44, Ai_44)
+
+        Ai_11 = tl.where(o_i[:, None] == i, a_11, Ai_11)
+        Ai_22 = tl.where(o_i[:, None] == i, a_22, Ai_22)
+        Ai_33 = tl.where(o_i[:, None] == i, a_33, Ai_33)
+        Ai_44 = tl.where(o_i[:, None] == i, a_44, Ai_44)
 
     o_i = tl.arange(0, 16)
     m_I = o_i[:, None] == o_i[None, :]
