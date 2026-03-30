@@ -455,8 +455,7 @@ def chunk_gated_delta_rule_fwd_kernel_h(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64, 128]
+        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
         for BV in [32, 64, 128]
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
@@ -479,66 +478,72 @@ def chunk_fwd_kernel_o(
     K_dim: tl.constexpr,
     V_dim: tl.constexpr,
     BT: tl.constexpr,
-    BK: tl.constexpr,
     BV: tl.constexpr,
 ):
     i_v = tl.program_id(0)
-    i_t = tl.program_id(1)
-    i_h = tl.program_id(2)
+    global_chunk_id = tl.program_id(1)
+    head_id = tl.program_id(2)
 
-    i_tg = i_t
-    i_n = tl.load(chunk_indices_ptr + i_t * 2).to(tl.int32)
-    i_t = tl.load(chunk_indices_ptr + i_t * 2 + 1).to(tl.int32)
+    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
 
-    bos = tl.load(cu_seqlens_ptr + i_n).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + i_n + 1).to(tl.int32)
-    T = eos - bos
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    seqlen = eos - bos
 
     # offset calculation
-    q_ptr += (bos * Hg + i_h // (H // Hg)) * K_dim
-    k_ptr += (bos * Hg + i_h // (H // Hg)) * K_dim
-    v_ptr += (bos * H + i_h) * V_dim
-    o_ptr += (bos * H + i_h) * V_dim
-    h_ptr += (i_tg * H + i_h).to(tl.int64) * V_dim * K_dim
+    q_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
+    k_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
+    v_ptr += (bos * H + head_id) * V_dim
+    o_ptr += (bos * H + head_id) * V_dim
+    h_ptr += (global_chunk_id * H + head_id) * V_dim * K_dim
+    g_cu_ptr += bos * H + head_id
 
-    o = tl.zeros([BT, BV], dtype=tl.float32)
-    A = tl.zeros([BT, BT], dtype=tl.float32)
+    q_ptrs = tl.make_block_ptr(
+        q_ptr, (seqlen, K_dim), (Hg * K_dim, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
+    )
+    k_ptrs = tl.make_block_ptr(
+        k_ptr, (seqlen, K_dim), (Hg * K_dim, 1), (chunk_id * BT, 0), (BT, K_dim), (1, 0)
+    )
+    h_ptrs = tl.make_block_ptr(
+        h_ptr, (V_dim, K_dim), (K_dim, 1), (i_v * BV, 0), (BV, K_dim), (1, 0)
+    )
+    g_cu_ptrs = tl.make_block_ptr(
+        g_cu_ptr, (seqlen,), (H,), (chunk_id * BT,), (BT,), (0,)
+    )
+    g_cu = tl.load(g_cu_ptrs, boundary_check=(0,))
 
-    for i_k in range(tl.cdiv(K_dim, BK)):
-        q_ptrs = tl.make_block_ptr(
-            q_ptr, (T, K_dim), (Hg * K_dim, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        k_ptrs = tl.make_block_ptr(
-            k_ptr, (T, K_dim), (Hg * K_dim, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0)
-        )
-        h_ptrs = tl.make_block_ptr(
-            h_ptr, (V_dim, K_dim), (K_dim, 1), (i_v * BV, i_k * BK), (BV, BK), (1, 0)
-        )
+    q = tl.load(q_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
+    k = tl.load(k_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
+    h = tl.load(h_ptrs, boundary_check=(0, 1))  # [BV, K_dim]
 
-        q = tl.load(q_ptrs, boundary_check=(0, 1))  # [BT, BK]
-        k = tl.load(k_ptrs, boundary_check=(0, 1))  # [BT, BK]
-        h = tl.load(h_ptrs, boundary_check=(0, 1))  # [BV, BK]
-
-        o = tl.dot(q, h.T, acc=o)  # [BT, BV]
-        A = tl.dot(q, k.T, acc=A)  # [BT, BT]
+    o = tl.dot(q, h.T)  # [BT, BV]
+    A = tl.dot(q, k.T)  # [BT, BT]
 
     # apply g
-    g_cu_ptr += bos * H + i_h
-    g_cu_ptrs = tl.make_block_ptr(g_cu_ptr, (T,), (H,), (i_t * BT,), (BT,), (0,))
-    g_cu = tl.load(g_cu_ptrs, boundary_check=(0,))
     o = o * tl.exp(g_cu)[:, None]
     A = A * tl.exp(g_cu[:, None] - g_cu[None, :])
 
-    o_t = i_t * BT + tl.arange(0, BT)
-    m_t = o_t < T
+    o_t = chunk_id * BT + tl.arange(0, BT)
+    m_t = o_t < seqlen
     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     A = tl.where(m_A, A, 0)
 
     v_ptrs = tl.make_block_ptr(
-        v_ptr, (T, V_dim), (H * V_dim, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        v_ptr,
+        (seqlen, V_dim),
+        (H * V_dim, 1),
+        (chunk_id * BT, i_v * BV),
+        (BT, BV),
+        (1, 0),
     )
     o_ptrs = tl.make_block_ptr(
-        o_ptr, (T, V_dim), (H * V_dim, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0)
+        o_ptr,
+        (seqlen, V_dim),
+        (H * V_dim, 1),
+        (chunk_id * BT, i_v * BV),
+        (BT, BV),
+        (1, 0),
     )
     v = tl.load(v_ptrs, boundary_check=(0, 1))
 
