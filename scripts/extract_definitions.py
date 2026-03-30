@@ -13,9 +13,10 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from dataset_utils import resolve_dataset_root
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_SOURCE_ROOT = Path("/home/simon/flashinfer-competition/mlsys26-contest/definitions")
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "definitions"
 
 
@@ -178,10 +179,10 @@ def main() -> None:
         description="Convert workload definition JSON files to markdown documents."
     )
     parser.add_argument(
-        "--source-root",
-        type=Path,
-        default=DEFAULT_SOURCE_ROOT,
-        help=f"Directory containing workload JSON definitions (default: {DEFAULT_SOURCE_ROOT})",
+        "--local",
+        type=str,
+        default=None,
+        help="Path to a local dataset root. If omitted, use the cached Hugging Face dataset.",
     )
     parser.add_argument(
         "--output-root",
@@ -196,11 +197,14 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    dataset_root = resolve_dataset_root(args.local)
+    source_root = dataset_root / "definitions"
     count = extract_definitions(
-        source_root=args.source_root,
+        source_root=source_root,
         output_root=args.output_root,
         clean=args.clean,
     )
+    print(f"Dataset root: {dataset_root}")
     print(f"Converted {count} definition files into: {args.output_root}")
 
 

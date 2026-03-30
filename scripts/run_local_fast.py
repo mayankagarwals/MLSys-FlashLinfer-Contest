@@ -32,6 +32,7 @@ def main(args: argparse.Namespace):
             raise FileNotFoundError(f"Local dataset not found: {repo_path}")
     else:
         from huggingface_hub import snapshot_download
+
         REPO_NAME = "flashinfer-ai/mlsys26-contest"
         repo_path = Path(snapshot_download(REPO_NAME, repo_type="dataset"))
 
@@ -121,10 +122,17 @@ def main(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fast single-process benchmark")
-    parser.add_argument("--run_baseline", choices=["gdn_decode", "gdn_prefill"],
-                        help="Run FlashInfer baseline instead of config.toml solution")
-    parser.add_argument("--local", type=str, default=None,
-                        help="Path to local dataset (skip HuggingFace download)")
+    parser.add_argument(
+        "--run_baseline",
+        choices=["gdn_decode", "gdn_prefill"],
+        help="Run FlashInfer baseline instead of config.toml solution",
+    )
+    parser.add_argument(
+        "--local",
+        type=str,
+        default=None,
+        help="Path to local dataset (skip HuggingFace download)",
+    )
     args = parser.parse_args()
 
     main(args)
