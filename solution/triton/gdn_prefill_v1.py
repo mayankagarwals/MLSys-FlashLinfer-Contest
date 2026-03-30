@@ -14,10 +14,6 @@ def alloc_fn(size: int, alignment: int, stream: int | None):
 triton.set_allocator(alloc_fn)
 
 
-@triton.autotune(
-    configs=[triton.Config(dict(), num_warps=num_warps) for num_warps in [2, 4, 8]],
-    key=["H", "K_dim", "BT"],
-)
 @triton.jit
 def chunk_scaled_dot_kkt_fwd_kernel(
     k_ptr,  # [T, Hg, K_dim]
@@ -108,14 +104,6 @@ def _concat_2d_dim1(A, B):
     return tl.join(A, B).permute(0, 2, 1).reshape(A.shape[0], A.shape[1] * 2)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4, 5]
-    ],
-    key=["H", "K_dim", "V_dim", "BT"],
-)
 @triton.jit
 def merge_16x16_to_64x64_inverse_kernel(
     k_ptr,
@@ -310,15 +298,6 @@ def merge_16x16_to_64x64_inverse_kernel(
     tl.store(w_ptrs, w, mask=offs_t < seqlen)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BV in [16, 32, 64, 128]
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K_dim", "V_dim", "BT"],
-)
 @triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h(
     k_ptr,
@@ -453,15 +432,6 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     tl.store(ht_ptrs, h.to(ht_ptrs.dtype.element_ty), boundary_check=(0, 1))
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BV in [32, 64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
-    ],
-    key=["H", "K_dim", "V_dim", "BT"],
-)
 @triton.jit
 def chunk_fwd_kernel_o(
     q_ptr,
@@ -605,6 +575,7 @@ def run(
         Hg=Hg,
         K_dim=K_dim,
         BT=BT,
+        num_warps=4,
     )
 
     # - compute Ai = inverse(I + strictTriu(A))
@@ -629,6 +600,7 @@ def run(
         V_dim=V_dim,
         BT=BT,
         DOT_PRECISION="tf32x3",  # using tf32 may cause NaN
+        num_warps=2,
     )
 
     h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
@@ -656,6 +628,9 @@ def run(
         K_dim=K_dim,
         V_dim=V_dim,
         BT=BT,
+        BV=16,
+        num_warps=4,
+        num_stages=3,
     )
 
     o = torch.empty_like(v)
@@ -679,6 +654,8 @@ def run(
         K_dim=K_dim,
         V_dim=V_dim,
         BT=BT,
+        BV=64,
+        num_warps=8,
     )
 
     return o, final_state
