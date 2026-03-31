@@ -7,3 +7,7 @@ author = "CUDA_ERROR_UNKNOWN"
 language = "triton"
 entry_point = "gdn_prefill_v1.py::run"
 destination_passing_style = false
+
+#language = "cuda"
+#entry_point = "gdn_prefill_kernel_recurrent.cu::gdn_prefill_recurrent_v1"
+#destination_passing_style = true
