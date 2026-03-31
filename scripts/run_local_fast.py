@@ -82,8 +82,6 @@ def main(args: argparse.Namespace):
     rows = []
 
     for workload in workloads:
-        print(workload.uuid, workload.axes)
-
         # Load safetensors if needed
         safe_tensors = None
         if any(inp.type == "safetensors" for inp in workload.inputs.values()):
@@ -103,13 +101,18 @@ def main(args: argparse.Namespace):
             log_path="/tmp/flashinfer-bench",
             device=device,
         )
+
         sample = dict(uuid=workload.uuid, **workload.axes)
-        if evaluation.performance is not None:
-            sample.update(latency_us=evaluation.performance.latency_ms * 1e3)
+        correct = False
         if evaluation.correctness is not None:
             sample.update(max_abs_error=evaluation.correctness.max_absolute_error)
             sample.update(max_rel_error=evaluation.correctness.max_relative_error)
+        if evaluation.performance is not None:
+            sample.update(latency_us=evaluation.performance.latency_ms * 1e3)
+            correct=True
         rows.append(sample)
+
+        print(workload.uuid, workload.axes, f"{correct=}")
 
     # Cleanup
     runnable.cleanup()
