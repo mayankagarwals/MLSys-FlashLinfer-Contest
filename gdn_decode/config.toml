@@ -5,8 +5,12 @@ author = "CUDA_ERROR_UNKNOWN"
 
 [build]
 language = "cuda"
-entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"
+entry_point = "gdn_decode_kernel_8.cu::gdn_decode_v8"
 destination_passing_style = true
+
+#language = "cuda"
+#entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"
+#destination_passing_style = true
 
 #language = "cuda"
 #entry_point = "gdn_decode_kernel_4.cu::gdn_decode_v4"
