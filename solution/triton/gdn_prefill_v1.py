@@ -137,13 +137,13 @@ def merge_16x16_to_64x64_inverse_kernel(
     # compute inverse
     A_ptr += bos * H * BT + head_id * BT
     Ai_ptr += bos * H * BT + head_id * BT
-    desc = tl.make_tensor_descriptor(A_ptr, [seqlen, BT], [H * BT, 1], [16, 16])
-    desc_o = tl.make_tensor_descriptor(Ai_ptr, [seqlen, BT], [H * BT, 1], [16, 16])
 
-    Ai_11 = -desc.load([chunk_id * BT + 0, 0]).to(tl.float32)
-    Ai_22 = -desc.load([chunk_id * BT + 16, 16]).to(tl.float32)
-    Ai_33 = -desc.load([chunk_id * BT + 32, 32]).to(tl.float32)
-    Ai_44 = -desc.load([chunk_id * BT + 48, 48]).to(tl.float32)
+    offs_t = chunk_id * BT + tl.arange(0, 16)[:, None]
+    offsets = offs_t * H * BT + tl.arange(0, 16)
+    Ai_11 = -tl.load(A_ptr + (offsets + (0 * H * BT + 0)), mask=offs_t < seqlen - 0)
+    Ai_22 = -tl.load(A_ptr + (offsets + (16 * H * BT + 16)), mask=offs_t < seqlen - 16)
+    Ai_33 = -tl.load(A_ptr + (offsets + (32 * H * BT + 32)), mask=offs_t < seqlen - 32)
+    Ai_44 = -tl.load(A_ptr + (offsets + (48 * H * BT + 48)), mask=offs_t < seqlen - 48)
 
     # 16x16 inverse
     o_i = tl.arange(0, 16)
@@ -188,12 +188,14 @@ def merge_16x16_to_64x64_inverse_kernel(
     Ai_33 += m_I
     Ai_44 += m_I
 
-    A_21 = desc.load([chunk_id * BT + 16, 0]).to(tl.float32)
-    A_31 = desc.load([chunk_id * BT + 32, 0]).to(tl.float32)
-    A_32 = desc.load([chunk_id * BT + 32, 16]).to(tl.float32)
-    A_41 = desc.load([chunk_id * BT + 48, 0]).to(tl.float32)
-    A_42 = desc.load([chunk_id * BT + 48, 16]).to(tl.float32)
-    A_43 = desc.load([chunk_id * BT + 48, 32]).to(tl.float32)
+    offs_t = chunk_id * BT + tl.arange(0, 16)[:, None]
+    offsets = offs_t * H * BT + tl.arange(0, 16)
+    A_21 = tl.load(A_ptr + (offsets + (16 * H * BT + 0)), mask=offs_t < seqlen - 16)
+    A_31 = tl.load(A_ptr + (offsets + (32 * H * BT + 0)), mask=offs_t < seqlen - 32)
+    A_32 = tl.load(A_ptr + (offsets + (32 * H * BT + 16)), mask=offs_t < seqlen - 32)
+    A_41 = tl.load(A_ptr + (offsets + (48 * H * BT + 0)), mask=offs_t < seqlen - 48)
+    A_42 = tl.load(A_ptr + (offsets + (48 * H * BT + 16)), mask=offs_t < seqlen - 48)
+    A_43 = tl.load(A_ptr + (offsets + (48 * H * BT + 32)), mask=offs_t < seqlen - 48)
 
     tmp = tl.dot(Ai_22, A_21, input_precision=DOT_PRECISION)
     Ai_21 = -tl.dot(tmp, Ai_11, input_precision=DOT_PRECISION)
@@ -229,27 +231,32 @@ def merge_16x16_to_64x64_inverse_kernel(
     # Ai = _concat_2d_dim0(_concat_2d_dim0(Ai_1, Ai_2), _concat_2d_dim0(Ai_3, Ai_4))
 
     # NOTE: we can move zeros stores to the start of program
-    zero16x16 = tl.zeros((16, 16), dtype=tl.float32)
+    z16x16 = tl.zeros((16, 16), dtype=tl.float32)
 
-    desc_o.store([chunk_id * BT + 0, 0], Ai_11)
-    desc_o.store([chunk_id * BT + 0, 16], zero16x16)
-    desc_o.store([chunk_id * BT + 0, 32], zero16x16)
-    desc_o.store([chunk_id * BT + 0, 48], zero16x16)
+    offs_t = chunk_id * BT + tl.arange(0, 16)[:, None]
+    offsets = offs_t * H * BT + tl.arange(0, 16)
+    tl.store(Ai_ptr + (offsets + 0), Ai_11, mask=offs_t < seqlen)
+    tl.store(Ai_ptr + (offsets + 16), z16x16, mask=offs_t < seqlen)
+    tl.store(Ai_ptr + (offsets + 32), z16x16, mask=offs_t < seqlen)
+    tl.store(Ai_ptr + (offsets + 48), z16x16, mask=offs_t < seqlen)
 
-    desc_o.store([chunk_id * BT + 16, 0], Ai_21)
-    desc_o.store([chunk_id * BT + 16, 16], Ai_22)
-    desc_o.store([chunk_id * BT + 16, 32], zero16x16)
-    desc_o.store([chunk_id * BT + 16, 48], zero16x16)
+    offsets = (offs_t + 16) * H * BT + tl.arange(0, 16)
+    tl.store(Ai_ptr + (offsets + 0), Ai_21, mask=offs_t < seqlen - 16)
+    tl.store(Ai_ptr + (offsets + 16), Ai_22, mask=offs_t < seqlen - 16)
+    tl.store(Ai_ptr + (offsets + 32), z16x16, mask=offs_t < seqlen - 16)
+    tl.store(Ai_ptr + (offsets + 48), z16x16, mask=offs_t < seqlen - 16)
 
-    desc_o.store([chunk_id * BT + 32, 0], Ai_31)
-    desc_o.store([chunk_id * BT + 32, 16], Ai_32)
-    desc_o.store([chunk_id * BT + 32, 32], Ai_33)
-    desc_o.store([chunk_id * BT + 32, 48], zero16x16)
+    offsets = (offs_t + 32) * H * BT + tl.arange(0, 16)
+    tl.store(Ai_ptr + (offsets + 0), Ai_31, mask=offs_t < seqlen - 32)
+    tl.store(Ai_ptr + (offsets + 16), Ai_32, mask=offs_t < seqlen - 32)
+    tl.store(Ai_ptr + (offsets + 32), Ai_33, mask=offs_t < seqlen - 32)
+    tl.store(Ai_ptr + (offsets + 48), z16x16, mask=offs_t < seqlen - 32)
 
-    desc_o.store([chunk_id * BT + 48, 0], Ai_41)
-    desc_o.store([chunk_id * BT + 48, 16], Ai_42)
-    desc_o.store([chunk_id * BT + 48, 32], Ai_43)
-    desc_o.store([chunk_id * BT + 48, 48], Ai_44)
+    offsets = (offs_t + 48) * H * BT + tl.arange(0, 16)
+    tl.store(Ai_ptr + (offsets + 0), Ai_41, mask=offs_t < seqlen - 48)
+    tl.store(Ai_ptr + (offsets + 16), Ai_42, mask=offs_t < seqlen - 48)
+    tl.store(Ai_ptr + (offsets + 32), Ai_43, mask=offs_t < seqlen - 48)
+    tl.store(Ai_ptr + (offsets + 48), Ai_44, mask=offs_t < seqlen - 48)
 
     # syncthreads to make global stores visible within a threadblock
     # (data is still in L2, might not reach gmem yet)
