@@ -3,12 +3,14 @@
 
 #include <cstdint>
 #include <cuda_bf16.h>
+#include <cuda_pipeline.h>
 #include <math.h>
 
 namespace {
 
-// v8: Dual-path kernel — dispatches small-batch (v7-style, one warp per row)
-// or big-batch (one block per head, serial V-tile loop) based on B.
+// v8: Dual-path kernel.
+// B <= kBatchThreshold: v7-style, one warp per V-row, 32 tiles, no smem.
+// B >  kBatchThreshold: multi-CTA with cp.async pipelined state loads.
 
 constexpr int kHeadSize = gdn_decode::kHeadSize;
 constexpr int64_t kNumQHeads = gdn_decode::kNumQHeads;
@@ -18,29 +20,35 @@ constexpr int64_t kNumVHeads = gdn_decode::kNumVHeads;
 constexpr int kWarpSize = 32;
 constexpr int kWarpsPerBlock = 4;
 constexpr int kNumThreads = kWarpSize * kWarpsPerBlock;
-constexpr int kRowsPerBlock = kWarpsPerBlock;
-constexpr int kSmallNumVTiles = kHeadSize / kRowsPerBlock;
-constexpr int kElemsPerLane = kHeadSize / kWarpSize;
+constexpr int kRowsPerBlock = kWarpsPerBlock;            // 4
+constexpr int kElemsPerLane = kHeadSize / kWarpSize;     // 4
+constexpr int kSmallNumVTiles = kHeadSize / kRowsPerBlock; // 32
 
 constexpr int kTileV = 8;
-constexpr int kBigNumVTiles = kHeadSize / kTileV;
-constexpr int kItersPerTile = kTileV / kRowsPerBlock;
+constexpr int kNumVTiles = kHeadSize / kTileV;           // 16
+constexpr int kRowsPerIter = kWarpsPerBlock;              // 4
+constexpr int kItersPerTile = kTileV / kRowsPerIter;      // 2
+
+constexpr int kNumCTAs = 8;
+constexpr int kVTilesPerCTA = kNumVTiles / kNumCTAs;      // 2
+constexpr int kNumStages = 2;
 
 constexpr int64_t kQGroupSize = kNumVHeads / kNumQHeads;
 constexpr int64_t kKGroupSize = kNumVHeads / kNumKHeads;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
 
-constexpr int64_t kBatchThreshold = 32;
+constexpr int64_t kBatchThreshold = 4;
 
-static_assert(kHeadSize == 128, "kernel_8 expects head size 128");
-static_assert(kNumThreads == 128, "kernel_8 expects 128 threads per block");
-static_assert(kRowsPerBlock == 4, "kernel_8 expects four rows per block");
-static_assert(kElemsPerLane == 4, "kernel_8 expects four elements per lane");
-static_assert(kTileV % kRowsPerBlock == 0, "tile_v must be divisible by warps");
-static_assert(kItersPerTile == 2, "kernel_8 expects 2 iterations per v-tile");
+static_assert(kHeadSize == 128, "expects head size 128");
+static_assert(kNumThreads == 128, "expects 128 threads per block");
+static_assert(kElemsPerLane == 4, "expects 4 elements per lane");
+static_assert(kSmallNumVTiles == 32, "expects 32 v-tiles for small-batch path");
+static_assert(kNumVTiles % kNumCTAs == 0, "V tiles must divide evenly across CTAs");
+static_assert(kVTilesPerCTA == 2, "expects 2 v-tiles per CTA");
+static_assert(kItersPerTile == 2, "expects 2 warp iterations per tile");
 
 // ============================================================================
-// Shared device helpers
+// Device helpers
 // ============================================================================
 
 __device__ __forceinline__ float SoftplusStable(float x) {
@@ -102,8 +110,28 @@ LoadF32x4GlobalNc(const float *__restrict__ ptr) {
   return out;
 }
 
+// cp.async: copy 16 bytes (one float4) from global to shared, bypassing L1
+__device__ __forceinline__ void CpAsyncF32x4(float *smem_ptr,
+                                              const float *gmem_ptr) {
+  const uint32_t smem_addr =
+      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile(
+      "cp.async.cg.shared.global [%0], [%1], 16;"
+      :
+      : "r"(smem_addr), "l"(gmem_ptr)
+      : "memory");
+}
+
+__device__ __forceinline__ void CpAsyncCommit() {
+  asm volatile("cp.async.commit_group;" ::: "memory");
+}
+
+__device__ __forceinline__ void CpAsyncWaitAll() {
+  asm volatile("cp.async.wait_all;" ::: "memory");
+}
+
 // ============================================================================
-// Small-batch kernel: grid = B * HV * (V/4), no shared memory
+// Small-batch kernel: grid = B * HV * 32, no shared memory.
 // One warp per V-row, fully parallel across all rows.
 // ============================================================================
 
@@ -186,16 +214,51 @@ __global__ void GdnDecodeSmallBatch(
 }
 
 // ============================================================================
-// Big-batch kernel: grid = B * HV, one block per (batch, head).
-// Each block serially processes all V rows with v values in shared memory.
+// Multi-CTA kernel with cp.async pipelined state loads.
+// Grid = B * HV * kNumCTAs.  Each CTA handles kVTilesPerCTA v-tiles.
+//
+// Shared memory layout:
+//   sData[kNumStages][kTileV][kHeadSize]  — double-buffered state rows
+//   sV[kLocalVCount]                      — v values for this CTA
+//   sOutput[kLocalVCount]                 — output accumulator
+//
+// Pipeline:
+//   1. Prefetch first tile's state rows into stage 0 via cp.async
+//   2. Main loop over tiles:
+//      a. Wait for current stage's cp.async to complete
+//      b. Issue cp.async for next tile into alternate stage
+//      c. Compute on current stage's data from shared memory
+//   3. Write output from sOutput to global
 // ============================================================================
 
-struct SmemBigBatch {
-  float sV[kHeadSize];
-  float sOutput[kHeadSize];
+constexpr int kLocalVCount = kTileV * kVTilesPerCTA; // 16
+
+struct SmemPipelined {
+  float sData[kNumStages][kTileV][kHeadSize];
+  float sV[kLocalVCount];
+  float sOutput[kLocalVCount];
 };
 
-__global__ void GdnDecodeBigBatch(
+// Issue cp.async for one tile's state rows (TILE_V=8 rows × K=128 floats each).
+// 128 threads cooperatively load 8 rows. Thread layout: 4 warps × 32 lanes.
+// Each row is 128 floats = 32 float4s. With 32 lanes, each lane copies one float4.
+// With 4 warps, we cover 4 rows per pass, need 2 passes for 8 rows.
+__device__ __forceinline__ void IssueTileAsyncCopy(
+    float sData_stage[][kHeadSize], const float *__restrict__ state,
+    int64_t hv_base, int v_start_global, int warp_id, int lane) {
+#pragma unroll
+  for (int pass = 0; pass < kItersPerTile; ++pass) {
+    const int row_in_tile = pass * kRowsPerIter + warp_id;
+    const int global_v = v_start_global + row_in_tile;
+    const int64_t state_row_base =
+        (hv_base * kHeadSize + global_v) * static_cast<int64_t>(kHeadSize);
+    CpAsyncF32x4(&sData_stage[row_in_tile][lane * kElemsPerLane],
+                  state + state_row_base + lane * kElemsPerLane);
+  }
+  CpAsyncCommit();
+}
+
+__global__ void GdnDecodePipelined(
     const __nv_bfloat16 *__restrict__ q, const __nv_bfloat16 *__restrict__ k,
     const __nv_bfloat16 *__restrict__ v, const float *__restrict__ state,
     const float *__restrict__ A_log, const __nv_bfloat16 *__restrict__ a,
@@ -204,9 +267,12 @@ __global__ void GdnDecodeBigBatch(
     float *__restrict__ new_state) {
 
   extern __shared__ char smem_raw[];
-  SmemBigBatch &smem = *reinterpret_cast<SmemBigBatch *>(smem_raw);
+  SmemPipelined &smem = *reinterpret_cast<SmemPipelined *>(smem_raw);
 
-  const int64_t bh = static_cast<int64_t>(blockIdx.x);
+  const int64_t block_linear = static_cast<int64_t>(blockIdx.x);
+  const int64_t cta_idx = block_linear % kNumCTAs;
+  const int64_t bh = block_linear / kNumCTAs;
+
   const int64_t batch_idx = bh / kNumVHeads;
   const int64_t hv_idx = bh % kNumVHeads;
   const float negated_exp_A_log = -expf(A_log[hv_idx]);
@@ -221,32 +287,80 @@ __global__ void GdnDecodeBigBatch(
   const int64_t q_base = (batch_idx * kNumQHeads + q_head) * kHeadSize;
   const int64_t k_base = (batch_idx * kNumKHeads + k_head) * kHeadSize;
   const int64_t hv_base = (batch_idx * kNumVHeads + hv_idx);
-  const float beta = Sigmoid(__bfloat162float(b[hv_base]));
 
-  const float g =
-      ComputeGdnScalars(negated_exp_A_log, a[hv_base], dt_bias[hv_idx]);
+  // Compute g and beta on lane 0 only, then broadcast via shuffle
+  float g, beta;
+  if (lane == 0) {
+    const float x = __bfloat162float(a[hv_base]) + dt_bias[hv_idx];
+    const float softplus_x = SoftplusStable(x);
+    g = expf(negated_exp_A_log * softplus_x);
+    beta = Sigmoid(__bfloat162float(b[hv_base]));
+  }
+  g = __shfl_sync(kFullWarpMask, g, 0);
+  beta = __shfl_sync(kFullWarpMask, beta, 0);
 
   const int kk_base = lane * kElemsPerLane;
-  const float4 q_vec = LoadBf16x4GlobalNc(q + q_base + kk_base);
+  float4 q_vec = LoadBf16x4GlobalNc(q + q_base + kk_base);
   const float4 k_vec = LoadBf16x4GlobalNc(k + k_base + kk_base);
 
-  // Pre-load all V values into shared memory (128 threads, 128 elements).
-  {
-    const int64_t v_global = hv_base * kHeadSize + tid;
+  // Pre-scale q so we don't multiply by scale per row
+  q_vec.x *= scale;
+  q_vec.y *= scale;
+  q_vec.z *= scale;
+  q_vec.w *= scale;
+
+  const int v_start = cta_idx * kVTilesPerCTA * kTileV;
+
+  // Pre-load this CTA's v values into shared memory.
+  if (tid < kLocalVCount) {
+    const int64_t v_global = hv_base * kHeadSize + v_start + tid;
     smem.sV[tid] = __bfloat162float(v[v_global]);
   }
+
+  // =========================================================================
+  // Prefetch: issue cp.async for the first tile (stage 0)
+  // =========================================================================
+  {
+    const int tile0_v_start = v_start;
+    IssueTileAsyncCopy(smem.sData[0], state, hv_base, tile0_v_start, warp_id,
+                       lane);
+  }
+
+  // Ensure sV writes are visible before compute loop
   __syncthreads();
 
+  // =========================================================================
+  // Main loop over tiles with double-buffered cp.async
+  // =========================================================================
 #pragma unroll
-  for (int tile = 0; tile < kBigNumVTiles; ++tile) {
+  for (int tile = 0; tile < kVTilesPerCTA; ++tile) {
+    const int stage = tile % kNumStages;
+    const int tile_v_start = v_start + tile * kTileV;
+
+    // Wait for current stage's async copies to complete
+    CpAsyncWaitAll();
+    __syncthreads();
+
+    // Issue async copy for next tile (if any) into alternate stage
+    if (tile + 1 < kVTilesPerCTA) {
+      const int next_stage = (tile + 1) % kNumStages;
+      const int next_tile_v_start = v_start + (tile + 1) * kTileV;
+      IssueTileAsyncCopy(smem.sData[next_stage], state, hv_base,
+                         next_tile_v_start, warp_id, lane);
+    }
+
+    // Compute on current stage's data
 #pragma unroll
     for (int iter = 0; iter < kItersPerTile; ++iter) {
-      const int v_idx = tile * kTileV + iter * kRowsPerBlock + warp_id;
-      const int64_t v_offset = hv_base * kHeadSize + v_idx;
-      const int64_t state_row_base = v_offset * kHeadSize;
+      const int row_in_tile = iter * kRowsPerIter + warp_id;
+      const int local_v = tile * kTileV + row_in_tile;
+      const int global_v = tile_v_start + row_in_tile;
+      const int64_t v_offset = hv_base * kHeadSize + global_v;
+      const int64_t state_row_base = v_offset * static_cast<int64_t>(kHeadSize);
 
-      const float4 state_vec =
-          LoadF32x4GlobalNc(state + state_row_base + lane * kElemsPerLane);
+      // Load state from shared memory (already fetched via cp.async)
+      const float4 state_vec = *reinterpret_cast<const float4 *>(
+          &smem.sData[stage][row_in_tile][lane * kElemsPerLane]);
 
       float4 old_state_vec;
       old_state_vec.x = g * state_vec.x;
@@ -260,7 +374,7 @@ __global__ void GdnDecodeBigBatch(
       old_v_partial = fmaf(k_vec.w, old_state_vec.w, old_v_partial);
 
       const float old_v = WarpAllReduceSum(old_v_partial);
-      const float delta = beta * (smem.sV[v_idx] - old_v);
+      const float delta = beta * (smem.sV[local_v] - old_v);
 
       float4 updated_vec;
       updated_vec.x = fmaf(k_vec.x, delta, old_state_vec.x);
@@ -278,14 +392,16 @@ __global__ void GdnDecodeBigBatch(
 
       const float out_acc = WarpAllReduceSum(out_partial);
       if (lane == 0) {
-        smem.sOutput[v_idx] = scale * out_acc;
+        smem.sOutput[local_v] = out_acc;
       }
     }
   }
 
   __syncthreads();
-  {
-    const int64_t out_global = hv_base * kHeadSize + tid;
+
+  // Write output from shared memory to global.
+  if (tid < kLocalVCount) {
+    const int64_t out_global = hv_base * kHeadSize + v_start + tid;
     output[out_global] = __float2bfloat16_rn(smem.sOutput[tid]);
   }
 }
@@ -316,13 +432,18 @@ void RunGdnDecodeKernel8(TensorView q, TensorView k, TensorView v,
   const cudaStream_t stream = get_cuda_stream(q.device());
 
   const float *state_ptr = static_cast<const float *>(state.data_ptr());
-  const __nv_bfloat16 *q_ptr = static_cast<const __nv_bfloat16 *>(q.data_ptr());
-  const __nv_bfloat16 *k_ptr = static_cast<const __nv_bfloat16 *>(k.data_ptr());
-  const __nv_bfloat16 *v_ptr = static_cast<const __nv_bfloat16 *>(v.data_ptr());
+  const __nv_bfloat16 *q_ptr =
+      static_cast<const __nv_bfloat16 *>(q.data_ptr());
+  const __nv_bfloat16 *k_ptr =
+      static_cast<const __nv_bfloat16 *>(k.data_ptr());
+  const __nv_bfloat16 *v_ptr =
+      static_cast<const __nv_bfloat16 *>(v.data_ptr());
   const float *A_log_ptr = static_cast<const float *>(A_log.data_ptr());
-  const __nv_bfloat16 *a_ptr = static_cast<const __nv_bfloat16 *>(a.data_ptr());
+  const __nv_bfloat16 *a_ptr =
+      static_cast<const __nv_bfloat16 *>(a.data_ptr());
   const float *dt_bias_ptr = static_cast<const float *>(dt_bias.data_ptr());
-  const __nv_bfloat16 *b_ptr = static_cast<const __nv_bfloat16 *>(b.data_ptr());
+  const __nv_bfloat16 *b_ptr =
+      static_cast<const __nv_bfloat16 *>(b.data_ptr());
   __nv_bfloat16 *output_ptr = static_cast<__nv_bfloat16 *>(output.data_ptr());
   float *new_state_ptr = static_cast<float *>(new_state.data_ptr());
 
@@ -332,9 +453,9 @@ void RunGdnDecodeKernel8(TensorView q, TensorView k, TensorView v,
         q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
         scale_f, output_ptr, new_state_ptr);
   } else {
-    const dim3 grid(B * kNumVHeads, 1, 1);
-    const size_t smem_bytes = sizeof(SmemBigBatch);
-    GdnDecodeBigBatch<<<grid, kNumThreads, smem_bytes, stream>>>(
+    const dim3 grid(B * kNumVHeads * kNumCTAs, 1, 1);
+    const size_t smem_bytes = sizeof(SmemPipelined);
+    GdnDecodePipelined<<<grid, kNumThreads, smem_bytes, stream>>>(
         q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
         scale_f, output_ptr, new_state_ptr);
   }
