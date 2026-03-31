@@ -608,9 +608,8 @@ def run(
 
     # reduce BV to increase no. of SMs used.
     # helpful when N * H is small.
-    def grid(meta):
-        return (triton.cdiv(V_dim, meta["BV"]), N * H)
-
+    BV = 16
+    grid = (triton.cdiv(V_dim, BV), N * H)
     chunk_gated_delta_rule_fwd_kernel_h[grid](
         k,
         u,
@@ -627,7 +626,7 @@ def run(
         K_dim=K_dim,
         V_dim=V_dim,
         BT=BT,
-        BV=16,
+        BV=BV,
         num_warps=4,
         num_stages=3,
     )
@@ -635,9 +634,8 @@ def run(
     o = torch.empty_like(v)
 
     # we only need separate o kernel if h kernel is too small?
-    def grid(meta):
-        return (triton.cdiv(V_dim, meta["BV"]), total_num_chunks, H)
-
+    BV = 64
+    grid = (triton.cdiv(V_dim, BV), total_num_chunks, H)
     chunk_fwd_kernel_o[grid](
         q,
         k,
@@ -653,7 +651,7 @@ def run(
         K_dim=K_dim,
         V_dim=V_dim,
         BT=BT,
-        BV=64,
+        BV=BV,
         num_warps=8,
     )
 
