@@ -1,11 +1,15 @@
 [solution]
-name = "gdn-prefill-cuda-recurrent"
+name = "gdn-prefill-cutedsl"
 definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
 [build]
-language = "triton"
-entry_point = "gdn_prefill_v1.py::run"
+#language = "triton"
+#entry_point = "gdn_prefill_v1.py::run"
+#destination_passing_style = false
+
+language = "python"
+entry_point = "main.py::run"
 destination_passing_style = false
 
 #language = "cuda"
