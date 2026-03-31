@@ -5,7 +5,7 @@ author = "CUDA_ERROR_UNKNOWN"
 
 [build]
 language = "triton"
-entry_point = "gdn_prefill_v1.py::run"
+entry_point = "gdn_prefill_v2.py::run"
 destination_passing_style = false
 
 #language = "python"
