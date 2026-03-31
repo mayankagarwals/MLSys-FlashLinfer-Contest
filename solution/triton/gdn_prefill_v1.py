@@ -1,6 +1,7 @@
 # https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/model_executor/layers/fla/ops/chunk.py
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -537,18 +538,16 @@ def run(
     N, H, V_dim, _ = state.shape
 
     # prepare chunk metadata
-    # TODO: use int32
     # NOTE: this causes CUDA sync. to avoid it, we need to use "padded" chunk indices layout,
     # which requires rewrite of all subsequent kernels.
     BT = 64
     num_chunks = triton.cdiv(cu_seqlens.diff(1), BT)  # for each sequence
-    chunk_offsets = torch.cat([cu_seqlens.new_tensor([0]), num_chunks]).cumsum(0)
+    chunk_offsets = F.pad(num_chunks, (1, 0)).cumsum(0)
 
     # 1st value is sequence ID, 2nd value is chunk_id within that sequence
     indices = torch.cat([torch.arange(n) for n in num_chunks.tolist()])
-    chunk_indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1).to(
-        cu_seqlens
-    )
+    chunk_indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
+    chunk_indices = chunk_indices.to(cu_seqlens.device, non_blocking=True)
     total_num_chunks = chunk_indices.shape[0]
 
     # this kernel does multiple things:
