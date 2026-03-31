@@ -482,11 +482,11 @@ def chunk_fwd_kernel_o(
     g_cu_ptrs = tl.make_block_ptr(
         g_cu_ptr, (seqlen,), (H,), (chunk_id * BT,), (BT,), (0,)
     )
-    g_cu = tl.load(g_cu_ptrs, boundary_check=(0,))
 
     q = tl.load(q_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
     k = tl.load(k_ptrs, boundary_check=(0, 1))  # [BT, K_dim]
     h = tl.load(h_ptrs, boundary_check=(0, 1))  # [BV, K_dim]
+    g_cu = tl.load(g_cu_ptrs, boundary_check=(0,))
 
     o = tl.dot(q, h.T)  # [BT, BV]
     A = tl.dot(q, k.T)  # [BT, BT]
@@ -495,10 +495,10 @@ def chunk_fwd_kernel_o(
     o = o * tl.exp(g_cu)[:, None]
     A = A * tl.exp(g_cu[:, None] - g_cu[None, :])
 
-    o_t = chunk_id * BT + tl.arange(0, BT)
-    m_t = o_t < seqlen
-    m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
-    A = tl.where(m_A, A, 0)
+    # apply causal mask
+    offs_t = tl.arange(0, BT)
+    mask_A = offs_t[:, None] >= offs_t[None, :]
+    A = tl.where(mask_A, A, 0.0)
 
     v_ptrs = tl.make_block_ptr(
         v_ptr,
