@@ -310,15 +310,6 @@ def merge_16x16_to_64x64_inverse_kernel(
     tl.store(w_ptrs, w, mask=offs_t < seqlen)
 
 
-# @triton.autotune(
-#     [
-#         triton.Config(dict(BV=BV), num_warps=num_warps, num_stages=num_stages)
-#         for BV in [16, 32, 64, 128]
-#         for num_warps in [2, 4, 8]
-#         for num_stages in [2, 3, 4, 5]
-#     ],
-#     key=["H", "Hg", "K_dim", "V_dim", "BT"],
-# )
 @triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h(
     q_ptr,
@@ -430,6 +421,17 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     tl.store(ht_ptr + (offs_v * K_dim + offs_k), h)
 
 
+chunk_gated_delta_rule_fwd_kernel_h_autotune = triton.autotune(
+    [
+        triton.Config(dict(BV=BV), num_warps=num_warps, num_stages=num_stages)
+        for BV in [16, 32, 64, 128]
+        for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4, 5]
+    ],
+    key=["H", "Hg", "K_dim", "V_dim", "BT"],
+)(chunk_gated_delta_rule_fwd_kernel_h)
+
+
 def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
     k: Tensor,  # (total_seqlen, num_k_heads, head_dim)
@@ -514,6 +516,32 @@ def run(
 
     # reduce BV to increase no. of SMs used.
     # helpful when N * H is small.
+    # run autotune
+    # def grid(meta):
+    #     return (triton.cdiv(V_dim, meta["BV"]), N * H)
+
+    # chunk_gated_delta_rule_fwd_kernel_h_autotune[grid](
+    #     q,
+    #     k,
+    #     u,
+    #     w,
+    #     o,
+    #     g_cu,
+    #     state,
+    #     final_state,
+    #     cu_seqlens,
+    #     scale,
+    #     H=H,
+    #     Hg=Hg,
+    #     K_dim=K_dim,
+    #     V_dim=V_dim,
+    #     BT=BT,
+    # )
+    # for cfg in chunk_gated_delta_rule_fwd_kernel_h_autotune.cache.values():
+    #     print(cfg)
+    #     raise
+
+    # after running autotune, hard-code the config
     BV = 32
     grid = (triton.cdiv(V_dim, BV), N * H)
 
