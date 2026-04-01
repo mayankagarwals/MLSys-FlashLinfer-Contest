@@ -32,12 +32,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
     v: cute.Tensor,  # [B, T, HV, V]
     b: cute.Tensor,  # [B, T, HV]
     o: cute.Tensor,  # [B, T, HV, V] - output
-    softplus_beta: cutlass.Constexpr[float],
-    softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     B: cutlass.Constexpr[int],
-    T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -157,18 +154,16 @@ def gdn_decode_kernel_small_batch_pretranspose(
     r_beta = 0.0
     if lane_id == 0:
         x = r_a + r_dt_bias
-        beta_x = softplus_beta * x
+        beta_x = x
         softplus_x = 0.0
 
-        if beta_x <= softplus_threshold:
+        if beta_x <= 20.0:
             # softplus(x) = (1/beta) * log(1 + exp(beta*x))
             # Compute in Float32
             exp_beta_x = cute.exp(beta_x, fastmath=True)
             log_input = cutlass.Float32(1.0 + exp_beta_x)
             log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
-            softplus_x = cutlass.Float32(
-                (cutlass.Float32(1.0) / softplus_beta) * log_result
-            )
+            softplus_x = log_result
         else:
             softplus_x = x
 
@@ -276,12 +271,9 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     v: cute.Tensor,
     b: cute.Tensor,
     o: cute.Tensor,
-    softplus_beta: cutlass.Constexpr[float],
-    softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
     HV: cutlass.Constexpr[int],
     B: cutlass.Constexpr[int],
-    T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
@@ -340,12 +332,9 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         v,
         b,
         o,
-        softplus_beta,
-        softplus_threshold,
         scale,
         HV,
         B,
-        T,
         H,
         K,
         V,
@@ -416,12 +405,9 @@ def run_pretranspose_decode(
             v_tensor,
             b_tensor,
             o_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
             scale=scale,
             HV=HV,
             B=B,
-            T=T,
             H=H,
             K=K,
             V=V,
