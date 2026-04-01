@@ -6,7 +6,7 @@ CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
     name="my_package",
-    cuda_files=[str(CURRENT_DIR / "gdn_prefill_cuda_recurrent_v1.cu")],
+    cuda_files=[str(CURRENT_DIR / "cuda_recurrent_v1.cu")],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
         "-O3",

@@ -1,8 +1,8 @@
 import torch
 from torch import Tensor
 
-from .gdn_prefill_cuda_recurrent_v1 import run as gdn_prefill_cuda_recurrent_v1
-from .gdn_prefill_triton_v2 import run as triton_v2
+from .cuda_recurrent_v1 import run as cuda_recurrent_v1
+from .triton_v2 import run as triton_v2
 
 
 def run(
@@ -26,7 +26,7 @@ def run(
     # recurrent impl
     o = torch.empty_like(v)
     new_state = torch.empty_like(state)
-    gdn_prefill_cuda_recurrent_v1(
+    cuda_recurrent_v1(
         q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, o, new_state
     )
     return o, new_state
