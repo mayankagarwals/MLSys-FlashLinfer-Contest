@@ -42,7 +42,7 @@
  *             Same formula but indexed by sequence, not by token.
  */
 
-#include "gdn_prefill_utils.h"
+#include "gdn_prefill_cuda_utils.h"
 #include "tvm_ffi_utils.h"
 
 #include <cstdint>

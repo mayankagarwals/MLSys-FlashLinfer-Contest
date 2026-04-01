@@ -4,8 +4,8 @@ definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
 [build]
-language = "triton"
-entry_point = "gdn_prefill_v2.py::run"
+language = "python"
+entry_point = "gdn_prefill_mix.py::run"
 destination_passing_style = false
 
 #language = "python"
