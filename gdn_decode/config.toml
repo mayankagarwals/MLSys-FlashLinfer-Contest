@@ -1,15 +1,15 @@
 [solution]
-name = "gdn-decode-cuda-reduction"
+name = "gdn-decode-mix"
 definition = "gdn_decode_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
 [build]
-language = "cuda"
-entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"
-destination_passing_style = true
+language = "python"
+entry_point = "gdn_decode_mix.py::run"
+destination_passing_style = false
 
 #language = "cuda"
-#entry_point = "gdn_decode_kernel_4.cu::gdn_decode_v4"
+#entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"
 #destination_passing_style = true
 
 #language = "triton"
