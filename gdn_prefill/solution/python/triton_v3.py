@@ -1,7 +1,6 @@
 # https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/model_executor/layers/fla/ops/chunk.py
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -313,16 +312,16 @@ def merge_16x16_to_64x64_inverse_kernel(
 
 @triton.jit
 def chunk_gated_delta_rule_fwd_kernel_h(
+    q_ptr,
     k_ptr,
-    v_ptr,
+    u_ptr,
     w_ptr,
-    v_new_ptr,
+    o_ptr,
     g_cu_ptr,
-    h_ptr,
     h0_ptr,
     ht_ptr,
     cu_seqlens_ptr,
-    chunk_offsets_ptr,
+    scale,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K_dim: tl.constexpr,
@@ -339,17 +338,15 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
     seqlen = eos - bos
     num_chunks = tl.cdiv(seqlen, BT)
-    boh = tl.load(chunk_offsets_ptr + seq_id).to(tl.int32)
 
     # calculate offset
-    h_ptr += ((boh * H + head_id) * V_dim * K_dim).to(tl.int64)
-    v_ptr += ((bos * H + head_id) * V_dim).to(tl.int64)
-    k_ptr += ((bos * Hg + head_id // (H // Hg)) * K_dim).to(tl.int64)
-    w_ptr += ((bos * H + head_id) * K_dim).to(tl.int64)
-    v_new_ptr += ((bos * H + head_id) * V_dim).to(tl.int64)
+    q_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
+    k_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
+    u_ptr += (bos * H + head_id) * V_dim
+    w_ptr += (bos * H + head_id) * K_dim
+    o_ptr += (bos * H + head_id) * V_dim
 
     stride_v = H * V_dim
-    stride_h = H * V_dim * K_dim
     stride_k = Hg * K_dim
     stride_w = H * K_dim
 
@@ -365,21 +362,26 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     # main recurrence
     # NOTE: TMA might not be faster?
     for chunk_id in range(num_chunks):
-        # save intermediate state for o computation
-        tl.store(h_ptr + (chunk_id * stride_h + offs_v * K_dim + offs_k), h)
+        # do the following
+        # V_new = U - W @ H.T
+        # Gamma = G / G.T
+        #
+        # O = G * (Q @ H.T) + causal((Q @ K.T) * Gamma) @ V_new
+        # H = G[-1] * H + (V_new * (G[-1] / G)).T @ K
 
-        # issue all loads first
         offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
-        mask_t = offs_t < seqlen
         offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
 
         w_ptrs = w_ptr + (offs_t * stride_w + offs_k)
-        v_ptrs = v_ptr + (offs_t * stride_v + offs_v_block)
+        u_ptrs = u_ptr + (offs_t * stride_v + offs_v_block)
         k_ptrs = k_ptr + (offs_t * stride_k + offs_k)
+        q_ptrs = q_ptr + (offs_t * stride_k + offs_k)
 
+        mask_t = offs_t < seqlen
         w = tl.load(w_ptrs, mask=mask_t, other=0.0)  # [BT, K_dim]
-        v = tl.load(v_ptrs, mask=mask_t, other=0.0)  # [BT, BV]
+        u = tl.load(u_ptrs, mask=mask_t, other=0.0)  # [BT, BV]
         k = tl.load(k_ptrs, mask=mask_t, other=0.0)  # [BT, K_dim]
+        q = tl.load(q_ptrs, mask=mask_t, other=0.0)  # [BT, K_dim]
 
         last_idx = min((chunk_id + 1) * BT, seqlen) - 1
         g_cu_last = tl.load(g_cu_ptr + ((bos + last_idx) * H + head_id))
@@ -389,95 +391,34 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         g_cu = tl.load(g_cu_ptrs, mask=offs_t_1d < seqlen, other=0.0)
 
         # computation
-        v_new = v - tl.dot(w, h.to(w.dtype).T)  # [BT, BV]
-
-        # save new value for o computation
-        v_new_ptrs = v_new_ptr + (offs_t * stride_v + offs_v_block)
-        tl.store(v_new_ptrs, v_new, mask=(offs_t < seqlen))
+        h_bf16 = h.to(q.dtype)
+        v_new = u - tl.dot(w, h_bf16.T)  # [BT, BV]
+        o = tl.dot(q, h_bf16.T)  # [BT, BV]
+        qk = tl.dot(q, k.T)  # [BT, BT]
 
         # apply g
-        mask_t = offs_t_1d < seqlen
-        v_new = v_new * tl.where(mask_t, tl.exp(g_cu_last - g_cu), 0)[:, None]
+        o *= tl.exp(g_cu)[:, None]
+        qk *= tl.exp(g_cu[:, None] - g_cu[None, :])
         h *= tl.exp(g_cu_last)
 
+        # apply causal mask (and t mask)
+        causal_offs_t = tl.arange(0, BT)
+        mask_qk = causal_offs_t[:, None] >= causal_offs_t[None, :]
+        qk = tl.where(mask_qk, qk, 0.0)
+
+        # final output
+        o = tl.dot(qk.to(q.dtype), v_new.to(q.dtype), acc=o) * scale
+        o_ptrs = o_ptr + (offs_t * (H * V_dim) + offs_v_block)
+        tl.store(o_ptrs, o, mask=mask_t)
+
         # update state
-        h = tl.dot(v_new.to(k.dtype).T, k, acc=h)
+        scaled_v_new = (
+            v_new * tl.where(offs_t_1d < seqlen, tl.exp(g_cu_last - g_cu), 0)[:, None]
+        )
+        h = tl.dot(scaled_v_new.to(k.dtype).T, k, acc=h)
 
     # epilogue
     tl.store(ht_ptr + (offs_v * K_dim + offs_k), h)
-
-
-@triton.jit
-def chunk_fwd_kernel_o(
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    h_ptr,
-    g_cu_ptr,
-    o_ptr,
-    cu_seqlens_ptr,
-    chunk_indices_ptr,
-    scale,
-    H: tl.constexpr,
-    Hg: tl.constexpr,
-    K_dim: tl.constexpr,
-    V_dim: tl.constexpr,
-    BT: tl.constexpr,
-    BV: tl.constexpr,
-):
-    i_v = tl.program_id(0)
-    global_chunk_id = tl.program_id(1)
-    head_id = tl.program_id(2)
-
-    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
-    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
-
-    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
-    seqlen = eos - bos
-
-    # offset calculation
-    q_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
-    k_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
-    v_ptr += (bos * H + head_id) * V_dim
-    o_ptr += (bos * H + head_id) * V_dim
-    h_ptr += (global_chunk_id * H + head_id) * V_dim * K_dim
-    g_cu_ptr += bos * H + head_id
-
-    offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
-    offs_k = tl.arange(0, K_dim)[None, :]
-    offs_v = i_v * BV + tl.arange(0, BV)
-    mask_t = offs_t < seqlen
-
-    q_ptrs = q_ptr + (offs_t * (Hg * K_dim) + offs_k)
-    k_ptrs = k_ptr + (offs_t * (Hg * K_dim) + offs_k)
-    h_ptrs = h_ptr + (offs_v[:, None] * K_dim + offs_k)
-
-    q = tl.load(q_ptrs, mask=mask_t, other=0.0)  # [BT, K_dim]
-    k = tl.load(k_ptrs, mask=mask_t, other=0.0)  # [BT, K_dim]
-    h = tl.load(h_ptrs)  # [BV, K_dim]
-
-    offs_t_1d = chunk_id * BT + tl.arange(0, BT)
-    g_cu = tl.load(g_cu_ptr + offs_t_1d * H, mask=offs_t_1d < seqlen, other=0.0)
-
-    o = tl.dot(q, h.T)  # [BT, BV]
-    A = tl.dot(q, k.T)  # [BT, BT]
-
-    # apply g
-    o = o * tl.exp(g_cu)[:, None]
-    A = A * tl.exp(g_cu[:, None] - g_cu[None, :])
-
-    # apply causal mask
-    causal_offs_t = tl.arange(0, BT)
-    mask_A = causal_offs_t[:, None] >= causal_offs_t[None, :]
-    A = tl.where(mask_A, A, 0.0)
-
-    v_ptrs = v_ptr + (offs_t * (H * V_dim) + offs_v)
-    v = tl.load(v_ptrs, mask=mask_t, other=0.0)
-
-    o = tl.dot(A.to(v.dtype), v, acc=o) * scale
-    o_ptrs = o_ptr + (offs_t * (H * V_dim) + offs_v)
-    tl.store(o_ptrs, o, mask=mask_t)
 
 
 def run(
@@ -500,7 +441,6 @@ def run(
     # which requires rewrite of all subsequent kernels.
     BT = 64
     num_chunks = triton.cdiv(cu_seqlens.diff(1), BT)  # for each sequence
-    chunk_offsets = F.pad(num_chunks, (1, 0)).cumsum(0)
 
     # 1st value is sequence ID, 2nd value is chunk_id within that sequence
     indices = torch.cat([torch.arange(n) for n in num_chunks.tolist()])
@@ -560,25 +500,24 @@ def run(
         num_warps=2,
     )
 
-    h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
     final_state = torch.empty_like(state, dtype=torch.float32)
-    v_new = torch.empty_like(u)
+    o = torch.empty_like(v)
 
     # reduce BV to increase no. of SMs used.
     # helpful when N * H is small.
     BV = 16
     grid = (triton.cdiv(V_dim, BV), N * H)
     chunk_gated_delta_rule_fwd_kernel_h[grid](
+        q,
         k,
         u,
         w,
-        v_new,
+        o,
         g_cu,
-        h,
         state,
         final_state,
         cu_seqlens,
-        chunk_offsets,
+        scale,
         H=H,
         Hg=Hg,
         K_dim=K_dim,
@@ -587,30 +526,6 @@ def run(
         BV=BV,
         num_warps=4,
         num_stages=3,
-    )
-
-    o = torch.empty_like(v)
-
-    # we only need separate o kernel if h kernel is too small?
-    BV = 64
-    grid = (triton.cdiv(V_dim, BV), total_num_chunks, H)
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v_new,
-        h,
-        g_cu,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale=scale,
-        H=H,
-        Hg=Hg,
-        K_dim=K_dim,
-        V_dim=V_dim,
-        BT=BT,
-        BV=BV,
-        num_warps=8,
     )
 
     return o, final_state
