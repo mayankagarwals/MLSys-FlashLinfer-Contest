@@ -11,7 +11,3 @@ destination_passing_style = false
 #language = "python"
 #entry_point = "main.py::run"
 #destination_passing_style = false
-
-#language = "cuda"
-#entry_point = "gdn_prefill_kernel_recurrent.cu::gdn_prefill_recurrent_v1"
-#destination_passing_style = true
