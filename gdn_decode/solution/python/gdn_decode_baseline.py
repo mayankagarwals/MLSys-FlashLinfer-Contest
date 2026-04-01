@@ -32,7 +32,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     v: cute.Tensor,  # [B, T, HV, V]
     b: cute.Tensor,  # [B, T, HV]
     o: cute.Tensor,  # [B, T, HV, V] - output
-    scale: cutlass.Constexpr[float],
+    scale: cutlass.Float32,
     HV: cutlass.Constexpr[int],
     B: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
@@ -271,7 +271,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     v: cute.Tensor,
     b: cute.Tensor,
     o: cute.Tensor,
-    scale: cutlass.Constexpr[float],
+    scale: cutlass.Float32,
     HV: cutlass.Constexpr[int],
     B: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
@@ -344,13 +344,13 @@ kernel_cache = dict()
 
 def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     B, HV, V, K = state.shape
-    _, T, H, _ = k.shape
-    output = torch.empty(B, T, HV, V, dtype=q.dtype, device=q.device)
+    H = k.shape[2]
+    output = torch.empty_like(v)
 
     h0_source = state.view(B * HV, V, K)
 
     # Compile kernel with TVM FFI (cached)
-    cache_key = (B, T, H, HV, K, V, q.dtype, scale)
+    cache_key = (B, H, HV, K, V, q.dtype)
     if cache_key not in kernel_cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -377,7 +377,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
             v_tensor,
             b_tensor,
             o_tensor,
-            scale=scale,
+            scale,
             HV=HV,
             B=B,
             H=H,
@@ -390,7 +390,9 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
 
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    kernel_cache[cache_key](h0_source, A_log, a, dt_bias, q, k, v, b, output, stream)
+    kernel_cache[cache_key](
+        h0_source, A_log, a, dt_bias, q, k, v, b, output, scale, stream
+    )
 
     # state is updated in-place
     return output, state
