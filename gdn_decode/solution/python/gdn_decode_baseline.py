@@ -280,12 +280,6 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     stream: cuda.CUstream = None,
 ):
     """Launch original pipelined kernel for small batch pretranspose."""
-    # h0_source: (B*HV, V, K)
-    batch_size, v_dim, k_dim = (
-        h0_source.layout.shape[0],
-        h0_source.layout.shape[1],
-        h0_source.layout.shape[2],
-    )
     # Grid size: use B*HV
     grid_batch = B * HV
 
@@ -302,8 +296,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
 
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
-    num_v_tiles = cute.ceil_div(v_dim, TILE_V)
-    v_dim * k_dim * batch_size * 4 / 1024 / 1024
+    num_v_tiles = cute.ceil_div(V, TILE_V)
 
     # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
     vec_size = TILE_K // 32
@@ -316,7 +309,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     # sData: TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
     # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
-    smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 4 * k_dim + 2 * v_dim + 32
+    smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 4 * K + 2 * V + 32
 
     gdn_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
@@ -349,36 +342,15 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
 kernel_cache = dict()
 
 
-def run_pretranspose_decode(
-    h0_source: torch.Tensor,
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    dt_bias: torch.Tensor,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    b: torch.Tensor,
-    output: torch.Tensor,
-    B: int,
-    T: int,
-    H: int,
-    HV: int,
-    K: int,
-    V: int,
-    scale: float,
-):
-    """Compile and execute the pretranspose decode kernel.
+def run(q, k, v, state, A_log, a, dt_bias, b, scale):
+    B, HV, V, K = state.shape
+    _, T, H, _ = k.shape
+    output = torch.empty(B, T, HV, V, dtype=q.dtype, device=q.device)
 
-    Args:
-        h0_source: State tensor reshaped to [B*HV, V, K]
-        A_log, a, dt_bias, q, k, v, b: Input tensors.
-        output: Pre-allocated output tensor [B, T, HV, V].
-        B, T, H, HV, K, V: Dimension sizes.
-        scale: Query scale factor.
-    """
+    h0_source = state.view(B * HV, V, K)
+
     # Compile kernel with TVM FFI (cached)
     cache_key = (B, T, H, HV, K, V, q.dtype, scale)
-
     if cache_key not in kernel_cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -420,28 +392,5 @@ def run_pretranspose_decode(
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     kernel_cache[cache_key](h0_source, A_log, a, dt_bias, q, k, v, b, output, stream)
 
-
-def run(q, k, v, state, A_log, a, dt_bias, b, scale):
-    B, HV, V, K = state.shape
-    _, T, H, _ = k.shape
-    output = torch.empty(B, T, HV, V, dtype=q.dtype, device=q.device)
-
-    run_pretranspose_decode(
-        state.view(B * HV, V, K),
-        A_log,
-        a,
-        dt_bias,
-        q,
-        k,
-        v,
-        b,
-        output,
-        B,
-        T,
-        H,
-        HV,
-        K,
-        V,
-        scale,
-    )
+    # state is updated in-place
     return output, state
