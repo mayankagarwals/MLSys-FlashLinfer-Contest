@@ -33,7 +33,7 @@ constexpr int64_t kQGroupSize = kNumVHeads / kNumQHeads;
 constexpr int64_t kKGroupSize = kNumVHeads / kNumKHeads;
 constexpr unsigned kFullWarpMask = 0xffffffffu;
 
-constexpr int64_t kBatchThreshold = 4;
+constexpr int64_t kBatchThreshold = 8;
 
 constexpr int kLocalVCount = kTileV * kVTilesPerCTA;
 
@@ -197,7 +197,6 @@ __global__ void GdnDecodeSmallBatch(
 struct SmemPipelined {
   float sData[kNumStages][kTileV][kHeadSize];
   float sV[kHeadSize];
-  __nv_bfloat16 sOutput[kLocalVCount];
 };
 
 __device__ __forceinline__ void IssueTileAsyncCopy(
@@ -300,7 +299,6 @@ __global__ void GdnDecodePipelined(
 #pragma unroll
     for (int iter = 0; iter < kItersPerTile; ++iter) {
       const int row_in_tile = iter * kRowsPerIter + warp_id;
-      const int local_v = tile * kTileV + row_in_tile;
       const int global_v = tile_v_start + row_in_tile;
       const int64_t v_offset = hv_base * kHeadSize + global_v;
       const int64_t state_row_base = v_offset * static_cast<int64_t>(kHeadSize);
@@ -336,16 +334,12 @@ __global__ void GdnDecodePipelined(
       const float out_acc = WarpAllReduceSum(sum_hq);
 
       if (lane == 0) {
-        smem.sOutput[local_v] = __float2bfloat16_rn(out_acc);
+        output[v_offset] = __float2bfloat16_rn(out_acc);
       }
     }
   }
 
-  __syncthreads();
 
-  if (tid < kLocalVCount) {
-    output[hv_base * kHeadSize + v_start + tid] = smem.sOutput[tid];
-  }
 }
 
 // ============================================================================
