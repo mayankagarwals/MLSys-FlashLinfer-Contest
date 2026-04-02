@@ -16,17 +16,40 @@ triton.set_allocator(alloc_fn)
 
 
 @triton.jit
-def compute_chunks(
-    cu_seqlens_ptr,
-    num_chunks_ptr,
+def compute_chunks_kernel1(
+    cu_seqlens_ptr,  # [N+1]
+    num_chunks_ptr,  # [N+1]
     BT: tl.constexpr,
 ):
-    idx = tl.program_id(0)
-    seqlen = tl.load(cu_seqlens_ptr + idx + 1) - tl.load(cu_seqlens_ptr + idx)
+    seq_id = tl.program_id(0)
+    seqlen = tl.load(cu_seqlens_ptr + seq_id + 1) - tl.load(cu_seqlens_ptr + seq_id)
+
     num_chunks = tl.cdiv(seqlen, BT)
-    tl.store(num_chunks_ptr + idx + 1, num_chunks)
-    if idx == 0:
+    tl.store(num_chunks_ptr + seq_id + 1, num_chunks)
+
+    # prefix with 0 for cumsum later
+    if seq_id == 0:
         tl.store(num_chunks_ptr, 0)
+
+
+@triton.jit
+def compute_chunks_kernel2(
+    num_chunks_ptr,  # [N+1]
+    chunk_offsets_ptr,  # [N+1]
+    chunk_indices_ptr,  # [total_num_chunks, 2]
+    BLOCK_SIZE: tl.constexpr = 32 * 4,
+):
+    seq_id = tl.program_id(0)
+    num_chunks = tl.load(num_chunks_ptr + seq_id + 1)
+    offset = tl.load(chunk_offsets_ptr + seq_id)
+
+    for i in range(tl.cdiv(num_chunks, BLOCK_SIZE)):
+        # 1st value is sequence ID, 2nd value is chunk_id within that sequence
+        x = i * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        data = tl.join(seq_id, x)  # [BLOCK_SIZE, 2]
+
+        ptrs = chunk_indices_ptr + (offset + x[:, None]) * 2 + tl.arange(0, 2)
+        tl.store(ptrs, data, mask=x[:, None] < num_chunks)
 
 
 @triton.jit
@@ -544,20 +567,24 @@ def run(
     # which requires rewrite of all subsequent kernels.
     BT = 64
 
-    # equivalent to this
+    # # PyTorch version
     # num_chunks = triton.cdiv(cu_seqlens.diff(1), BT)  # for each sequence
     # chunk_offsets = F.pad(num_chunks, (1, 0)).cumsum(0)
 
-    num_chunks = q.new_empty(N + 1, dtype=torch.int32)
-    compute_chunks[(N,)](cu_seqlens, num_chunks, BT=BT, num_warps=1)
-    chunk_offsets = num_chunks.cumsum(0)
-    num_chunks = num_chunks[1:]
+    # # 1st value is sequence ID, 2nd value is chunk_id within that sequence
+    # indices = torch.cat([torch.arange(n) for n in num_chunks.tolist()])
+    # chunk_indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
+    # chunk_indices = chunk_indices.to(cu_seqlens.device, non_blocking=True)
+    # total_num_chunks = chunk_indices.shape[0]
 
-    # 1st value is sequence ID, 2nd value is chunk_id within that sequence
-    indices = torch.cat([torch.arange(n) for n in num_chunks.tolist()])
-    chunk_indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
-    chunk_indices = chunk_indices.to(cu_seqlens.device, non_blocking=True)
-    total_num_chunks = chunk_indices.shape[0]
+    # triton version
+    num_chunks = q.new_empty(N + 1, dtype=torch.int32)
+    compute_chunks_kernel1[(N,)](cu_seqlens, num_chunks, BT=BT, num_warps=1)
+    chunk_offsets = num_chunks.cumsum(0)
+
+    total_num_chunks = chunk_offsets[-1].item()
+    chunk_indices = q.new_empty((total_num_chunks, 2), dtype=torch.int32)
+    compute_chunks_kernel2[(N,)](num_chunks, chunk_offsets, chunk_indices, num_warps=1)
 
     # this kernel does multiple things:
     # - compute K @ K.T
