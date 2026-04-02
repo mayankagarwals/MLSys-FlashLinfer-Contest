@@ -15,6 +15,76 @@ triton.set_allocator(alloc_fn)
 
 
 @triton.jit
+def compute_chunks_kernel(
+    cu_seqlens_ptr,  # [N+1]
+    num_chunks_ptr,  # [N]
+    chunk_offsets_ptr,  # [N+1]
+    chunk_indices_ptr,  # [total_num_chunks, 2]
+    flag_ptr,
+    N,
+    BT: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    FILL_BLOCK: tl.constexpr = 128,
+):
+    pid = tl.program_id(0)
+
+    # 1st phase: compute num_chunks and chunk_offsets
+    if pid == 0:
+        # since N is small (max is 57 among the given workloads),
+        # we can use 1 threadblock to do everything
+        offsets = tl.arange(0, BLOCK_SIZE)
+        bos = tl.load(cu_seqlens_ptr + offsets, offsets < N)
+        eos = tl.load(cu_seqlens_ptr + (offsets + 1), offsets < N - 1)
+        seqlens = eos - bos
+
+        num_chunks = tl.cdiv(seqlens, BT)
+        chunk_offsets = tl.cumsum(num_chunks, axis=0)
+
+        tl.store(num_chunks_ptr + offsets, num_chunks, offsets < N)
+        tl.store(chunk_offsets_ptr + (offsets + 1), chunk_offsets, offsets < N - 1)
+        tl.store(chunk_offsets_ptr, 0)  # prefix with 0
+
+        # flag_ptr is initialized to 0
+        # signal done
+        tl.atomic_add(flag_ptr, 1, sem="release", scope="gpu")
+
+        # just to be safe, gmem stores are visible to within this threadblock
+        tl.debug_barrier()
+
+    else:
+        # other threadblocks spin, check if the flag is flipped
+        # this is equivalent to ld.acquire.gpu
+        while tl.atomic_add(flag_ptr, 0, sem="acquire", scope="gpu") == 0:
+            pass
+
+    # 2nd phase: fill chunk_indices
+    seq_id = pid
+    num_chunk = tl.load(num_chunks_ptr + seq_id)
+    chunk_offset = tl.load(chunk_offsets_ptr + seq_id)
+
+    for i in range(tl.cdiv(num_chunk, FILL_BLOCK)):
+        # 1st value is sequence ID, 2nd value is chunk_id within that sequence
+        x = i * FILL_BLOCK + tl.arange(0, FILL_BLOCK)
+        data = tl.join(seq_id, x)  # [FILL_BLOCK, 2]
+
+        offs = (chunk_offset + x[:, None]) * 2 + tl.arange(0, 2)
+        tl.store(chunk_indices_ptr + offs, data, mask=x[:, None] < num_chunk)
+
+    # we reuse the same flag_ptr to check for the completion of all threadblocks
+    # this is safe since even if threadblock A increments flag_ptr here, another
+    # threadblock B spins on flag_ptr still interprets non-zero as 1st phase
+    # being completed.
+    before = tl.atomic_add(flag_ptr, 1)
+
+    # atomic_add returns the value BEFORE atomic_add.
+    # the final value of flag_ptr will be 1 + num_pids.
+    # hence, the last threadblock will see before = num_pids.
+    # last threadblock resets flag_ptr.
+    if before == tl.num_programs(0):
+        tl.store(flag_ptr, 0)
+
+
+@triton.jit
 def chunk_scaled_dot_kkt_fwd_kernel(
     k_ptr,  # [T, Hg, K_dim]
     A_log_ptr,  # [H]
@@ -432,6 +502,9 @@ chunk_gated_delta_rule_fwd_kernel_h_autotune = triton.autotune(
 )(chunk_gated_delta_rule_fwd_kernel_h)
 
 
+_FLAG = None
+
+
 def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
     k: Tensor,  # (total_seqlen, num_k_heads, head_dim)
@@ -448,16 +521,42 @@ def run(
     N, H, V_dim, _ = state.shape
 
     # prepare chunk metadata
-    # NOTE: this causes CUDA sync. to avoid it, we need to use "padded" chunk indices layout,
-    # which requires rewrite of all subsequent kernels.
     BT = 64
-    num_chunks = triton.cdiv(cu_seqlens.diff(1), BT)  # for each sequence
 
-    # 1st value is sequence ID, 2nd value is chunk_id within that sequence
-    indices = torch.cat([torch.arange(n) for n in num_chunks.tolist()])
-    chunk_indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
-    chunk_indices = chunk_indices.to(cu_seqlens.device, non_blocking=True)
-    total_num_chunks = chunk_indices.shape[0]
+    # # PyTorch version
+    # num_chunks = triton.cdiv(cu_seqlens.diff(1), BT)  # for each sequence
+    # chunk_offsets = F.pad(num_chunks, (1, 0)).cumsum(0)
+
+    # # 1st value is sequence ID, 2nd value is chunk_id within that sequence
+    # indices = torch.cat([torch.arange(n) for n in num_chunks.tolist()])
+    # chunk_indices = torch.stack([indices.eq(0).cumsum(0) - 1, indices], 1)
+    # chunk_indices = chunk_indices.to(cu_seqlens.device, non_blocking=True)
+    # total_num_chunks = chunk_indices.shape[0]
+
+    # Triton version
+    # flag for grid sync
+    global _FLAG
+    if _FLAG is None:
+        _FLAG = q.new_zeros(1, dtype=torch.int32)
+
+    # we allocate more than enough for chunk_indices so that we don't need to know
+    # the value of total_num_chunks before calling the kernel.
+    upper_bound_chunks = (N - 1) + triton.cdiv(T - (N - 1), BT)
+    num_chunks = q.new_empty(N, dtype=torch.int32)
+    chunk_offsets = q.new_empty(N + 1, dtype=torch.int32)
+    chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
+    compute_chunks_kernel[(N,)](
+        cu_seqlens,
+        num_chunks,
+        chunk_offsets,
+        chunk_indices,
+        _FLAG,
+        N=BT,
+        BT=BT,
+        # max N is 57 -> max BLOCK_SIZE is 64, still very small
+        BLOCK_SIZE=triton.next_power_of_2(N),
+    )
+    total_num_chunks = chunk_offsets[-1].item()  # CUDA sync
 
     # this kernel does multiple things:
     # - compute K @ K.T
