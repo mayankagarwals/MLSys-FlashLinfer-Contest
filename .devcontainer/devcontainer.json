@@ -1,0 +1,13 @@
+{
+  "name": "flashinfer-ci-cu132",
+  "build": {
+    "dockerfile": "../docker/Dockerfile",
+    "context": ".."
+  },
+  "runArgs": [
+    "--gpus=all",
+    "--cap-add=SYS_ADMIN",
+    "--ipc=host"
+  ],
+  "remoteUser": "root"
+}
