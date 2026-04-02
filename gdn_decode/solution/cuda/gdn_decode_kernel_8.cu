@@ -196,7 +196,6 @@ __global__ void GdnDecodeSmallBatch(
 
 struct SmemPipelined {
   float sData[kNumStages][kTileV][kHeadSize];
-  float sV[kHeadSize];
 };
 
 __device__ __forceinline__ void IssueTileAsyncCopy(
@@ -249,9 +248,6 @@ __global__ void GdnDecodePipelined(
   const float r_dt_bias = dt_bias[hv_idx];
   const float r_b = __bfloat162float(b[hv_base]);
 
-  // Load ALL 128 v values into smem (128 threads, 1 element each)
-  smem.sV[tid] = __bfloat162float(v[hv_base * kHeadSize + tid]);
-
   // Prefetch first tile (stage 0)
   IssueTileAsyncCopy(smem.sData[0], state, hv_base, v_start, warp_id, lane);
   CpAsyncCommit();
@@ -279,7 +275,6 @@ __global__ void GdnDecodePipelined(
   q_vec.z *= scale;
   q_vec.w *= scale;
 
-  __syncthreads();
 
 #pragma unroll
   for (int tile = 0; tile < kVTilesPerCTA; ++tile) {
@@ -287,7 +282,8 @@ __global__ void GdnDecodePipelined(
     const int tile_v_start = v_start + tile * kTileV;
 
     CpAsyncWaitAll();
-    __syncthreads();
+    // Each warp consumes only the rows it issued into shared memory.
+    __syncwarp(kFullWarpMask);
 
     if (tile + 1 < kVTilesPerCTA) {
       const int next_stage = (tile + 1) % kNumStages;
@@ -318,7 +314,13 @@ __global__ void GdnDecodePipelined(
       sum_hk = fmaf(k_vec.w, h.w, sum_hk);
       const float old_v = WarpAllReduceSum(sum_hk);
 
-      const float delta = beta * (smem.sV[global_v] - old_v);
+      float v_scalar = 0.0f;
+      if (lane == 0) {
+        v_scalar = __bfloat162float(v[v_offset]);
+      }
+      v_scalar = __shfl_sync(kFullWarpMask, v_scalar, 0);
+      const float delta = beta * (v_scalar - old_v);
+      
 
       h.x = fmaf(k_vec.x, delta, h.x);
       h.y = fmaf(k_vec.y, delta, h.y);
