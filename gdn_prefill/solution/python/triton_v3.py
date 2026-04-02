@@ -415,19 +415,20 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     u_ptr += (bos * H + head_id) * V_dim
     w_ptr += (bos * H + head_id) * K_dim
     o_ptr += (bos * H + head_id) * V_dim
+    g_cu_ptr += bos * H + head_id
 
-    stride_v = H * V_dim
-    stride_k = Hg * K_dim
-    stride_w = H * K_dim
+    stride_v: tl.constexpr = H * V_dim
+    stride_k: tl.constexpr = Hg * K_dim
+    stride_w: tl.constexpr = H * K_dim
 
     h0_ptr = h0_ptr + i_nh * V_dim * K_dim
     ht_ptr = ht_ptr + i_nh * V_dim * K_dim
 
-    offs_v = i_v * BV + tl.arange(0, BV)[:, None]
-    offs_k = tl.arange(0, K_dim)[None, :]
+    offs_v = i_v * BV + tl.arange(0, BV)
+    offs_k = tl.arange(0, K_dim)
 
     # load initial state
-    h = tl.load(h0_ptr + (offs_v * K_dim + offs_k)).to(tl.float32)  # [BV, K_dim]
+    h = tl.load(h0_ptr + (offs_v * K_dim + offs_k[:, None]))  # [K_dim, BV]
 
     # main recurrence
     # NOTE: TMA might not be faster?
@@ -440,35 +441,30 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         # H = G[-1] * H + (V_new * (G[-1] / G)).T @ K
 
         offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
-        offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
-
         w_ptrs = w_ptr + (offs_t * stride_w + offs_k)
-        u_ptrs = u_ptr + (offs_t * stride_v + offs_v_block)
+        u_ptrs = u_ptr + (offs_t * stride_v + offs_v)
         k_ptrs = k_ptr + (offs_t * stride_k + offs_k)
         q_ptrs = q_ptr + (offs_t * stride_k + offs_k)
 
         mask_t = offs_t < seqlen
-        w = tl.load(w_ptrs, mask=mask_t, other=0.0)  # [BT, K_dim]
-        u = tl.load(u_ptrs, mask=mask_t, other=0.0)  # [BT, BV]
-        k = tl.load(k_ptrs, mask=mask_t, other=0.0)  # [BT, K_dim]
-        q = tl.load(q_ptrs, mask=mask_t, other=0.0)  # [BT, K_dim]
+        w = tl.load(w_ptrs, mask=mask_t)  # [BT, K_dim]
+        u = tl.load(u_ptrs, mask=mask_t)  # [BT, BV]
+        k = tl.load(k_ptrs, mask=mask_t)  # [BT, K_dim]
+        q = tl.load(q_ptrs, mask=mask_t)  # [BT, K_dim]
 
         last_idx = min((chunk_id + 1) * BT, seqlen) - 1
-        g_cu_last = tl.load(g_cu_ptr + ((bos + last_idx) * H + head_id))
-
-        offs_t_1d = chunk_id * BT + tl.arange(0, BT)
-        g_cu_ptrs = g_cu_ptr + ((bos + offs_t_1d) * H + head_id)
-        g_cu = tl.load(g_cu_ptrs, mask=offs_t_1d < seqlen, other=0.0)
+        g_cu = tl.load(g_cu_ptr + offs_t * H, mask=mask_t, other=0.0)
+        g_cu_last = tl.load(g_cu_ptr + last_idx * H)
 
         # computation
         h_bf16 = h.to(q.dtype)
-        v_new = u - tl.dot(w, h_bf16.T)  # [BT, BV]
-        o = tl.dot(q, h_bf16.T)  # [BT, BV]
+        v_new = u - tl.dot(w, h_bf16)  # [BT, BV]
+        o = tl.dot(q, h_bf16)  # [BT, BV]
         qk = tl.dot(q, k.T)  # [BT, BT]
 
         # apply g
-        o *= tl.exp(g_cu)[:, None]
-        qk *= tl.exp(g_cu[:, None] - g_cu[None, :])
+        o *= tl.exp(g_cu)
+        qk *= tl.exp(g_cu - g_cu.T)
         h *= tl.exp(g_cu_last)
 
         # apply causal mask (and t mask)
@@ -478,17 +474,17 @@ def chunk_gated_delta_rule_fwd_kernel_h(
 
         # final output
         o = tl.dot(qk.to(q.dtype), v_new.to(q.dtype), acc=o) * scale
-        o_ptrs = o_ptr + (offs_t * (H * V_dim) + offs_v_block)
+        o_ptrs = o_ptr + (offs_t * stride_v + offs_v)
         tl.store(o_ptrs, o, mask=mask_t)
 
         # update state
-        scaled_v_new = (
-            v_new * tl.where(offs_t_1d < seqlen, tl.exp(g_cu_last - g_cu), 0)[:, None]
-        )
-        h = tl.dot(scaled_v_new.to(k.dtype).T, k, acc=h)
+        scaled_v_new = v_new * tl.where(mask_t, tl.exp(g_cu_last - g_cu), 0)
+        h = tl.dot(k.T, scaled_v_new.to(k.dtype), acc=h)
 
     # epilogue
-    tl.store(ht_ptr + (offs_v * K_dim + offs_k), h)
+    offs_v = i_v * BV + tl.arange(0, BV)
+    offs_k = tl.arange(0, K_dim)
+    tl.store(ht_ptr + (offs_v * K_dim + offs_k[:, None]), h)
 
 
 chunk_gated_delta_rule_fwd_kernel_h_autotune = triton.autotune(
@@ -662,7 +658,7 @@ def run(
         BT=BT,
         BV=BV,
         num_warps=8,
-        num_stages=2,
+        num_stages=3,
     )
 
     return o, final_state
