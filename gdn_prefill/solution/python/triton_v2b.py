@@ -563,8 +563,6 @@ def run(
     N, H, V_dim, _ = state.shape
 
     # prepare chunk metadata
-    # NOTE: this causes CUDA sync. to avoid it, we need to use "padded" chunk indices layout,
-    # which requires rewrite of all subsequent kernels.
     BT = 64
 
     # # PyTorch version
@@ -577,14 +575,20 @@ def run(
     # chunk_indices = chunk_indices.to(cu_seqlens.device, non_blocking=True)
     # total_num_chunks = chunk_indices.shape[0]
 
-    # triton version
+    # Triton version
+    # fuse many small kernels into 1. delay CUDA sync as much as possible
     num_chunks = q.new_empty(N + 1, dtype=torch.int32)
     compute_chunks_kernel1[(N,)](cu_seqlens, num_chunks, BT=BT, num_warps=1)
     chunk_offsets = num_chunks.cumsum(0)
 
-    total_num_chunks = chunk_offsets[-1].item()
-    chunk_indices = q.new_empty((total_num_chunks, 2), dtype=torch.int32)
+    # we allocate more than enough for chunk_indices to avoid CUDA sync caused by
+    # chunk_offsets[-1].item()
+    upper_bound_chunks = (N - 1) + triton.cdiv(T - (N - 1), BT)
+    chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
     compute_chunks_kernel2[(N,)](num_chunks, chunk_offsets, chunk_indices, num_warps=1)
+
+    # CUDA sync
+    total_num_chunks = chunk_offsets[-1].item()
 
     # this kernel does multiple things:
     # - compute K @ K.T
