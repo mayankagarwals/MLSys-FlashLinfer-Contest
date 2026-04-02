@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .triton_v2 import run as triton_v2
+from .triton_v2b import run as triton_v2b
 
 
 def run(
@@ -21,7 +21,7 @@ def run(
 
     # chunk impl
     if T >= 256:
-        return triton_v2(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+        return triton_v2b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # recurrent impl
     o = torch.empty_like(v)
