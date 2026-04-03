@@ -1,23 +1,116 @@
 /*
- * GDN Prefill — Chunked CUDA Kernel with tcgen05 tensor cores (Blackwell SM_100a)
- * FUSED variant with TMA (Tensor Memory Access) for global→smem tile loads.
- *
- * Pipeline:
- * 1. PrepMetaKernel: GPU metadata (chunk indices, offsets)
- * 2. PreprocessKernel: g_cumsum, beta (no tensor cores)
- * 3a. ComputeAKernel_TC: k@k^T via tcgen05 + beta*exp(g)*mask → A_mat [TMA loads]
- * 3b. SolveTrilKernel: forward substitution (I+A)^{-1} in-place on A_mat
- * 4. ComputeWUKernel_TC: A_inv @ input via tcgen05 [manual loads — scaled+transposed]
- * 5. FusedRecurrenceOutput: InterChunkFwdH + ChunkFwdO fused [TMA for w,q,k loads]
- *
- * TMA replaces load_global_to_tile for plain bf16 global→tile loads.
- * Manual loads kept for: fp32→bf16 conversion, scaled loads, transpose patterns.
- *
- * tcgen05 tile layout (verified in tcgen05_minimal_test.cu):
- *   byte_off = tc * LBO + tr * SBO + wr * 16 + wc * 2
- *   tc = col/8, tr = row/8, wr = row%8, wc = col%8
- *   LBO = H * 16, SBO = 128
- *   BM MUST be 128 (hardware constraint). Pad A to 128 rows, read first 64 rows.
+* The chunked formulas are:
+*
+*   T = inv(I + strictLower(B * Gamma * (K @ K.T))) * B.T
+*   W = (T * G.T) @ K          — WY correction keys
+*   U = T @ V                  — WY corrected values
+*
+*   V' = U - W @ S             — delta-corrected values
+*   O  = G * (Q @ S)           — inter-chunk output (query old state)
+*      + ((Q @ K.T) * M') @ V' — intra-chunk output (attention within chunk)
+*   S  = G[-1] * S + K.T @ (V' * (G[-1] / G))  — state update
+*
+* where:
+*   G      = cumulative gate products within chunk, shape (C, 1)
+*   G[-1]  = total gate decay across chunk (scalar)
+*   Gamma  = G / G.T, pairwise gate ratios, shape (C, C)
+*   M'     = causal_mask * Gamma, gate-weighted causal mask (C, C)
+*   B      = per-token learning rates (beta), shape (C, 1)
+*   S      = recurrent state carried between chunks, shape (D_k, D_v)
+*
+* Key insight: T, W, U depend only on data within the chunk (no state
+* dependency), so Kernels 1-3 can run in parallel across ALL chunks.
+* Only Kernel 4 (which uses S) must run sequentially per sequence.
+*
+* === Kernel Pipeline ===
+*
+* Kernel 1: PreprocessKernel (all chunks in parallel)
+*   - Computes g_cumsum = cumulative_sum(log_gate) and beta = sigmoid(b)
+*   - These are scalar per-token values, no tensor cores needed
+*   - Grid: (total_chunks, num_heads)
+*
+* Kernel 2a: ComputeAKernel_TC (all chunks in parallel)
+*   - Computes A = strictLower(B * Gamma * (K @ K.T))
+*   - K @ K.T via tcgen05 tensor cores (the expensive part)
+*   - Post-multiply by beta * exp(g_diff) with strict lower mask
+*   - K tiles loaded via TMA (async DMA, no thread involvement)
+*   - Output: A_mat (C × C) per chunk, strictly lower triangular
+*
+* Kernel 2b: SolveTrilKernel (all chunks in parallel)
+*   - Computes inv(I + A) via column-parallel forward substitution
+*   - I is never materialized: diagonal implicitly 1, identity column
+*     generated on the fly as (tid == i) ? 1 : 0
+*   - Unit lower triangular → always invertible, no pivoting needed
+*   - Each of 64 threads solves one column independently
+*   - Result overwrites A_mat in-place
+*
+* Kernel 3: ComputeWUKernel_TC (all chunks in parallel)
+*   - Computes W = (T * G.T) @ K and U = T @ V
+*   - Both share the same A_inv left operand (loaded once, fp32→bf16)
+*   - The "* B.T" from T = inv(...) * B.T is absorbed into input scaling:
+*     W input: K scaled by beta * exp(g)  (fuses B.T and G.T)
+*     U input: V scaled by beta           (fuses B.T only)
+*   - 4 tile jobs via blockIdx.z: {W_lo, W_hi, U_lo, U_hi} (64-col halves)
+*
+* Kernel 4: FusedRecurrenceOutput (sequential over chunks, parallel over seqs/heads)
+*   - The only kernel with state dependency → sequential chunk loop
+*   - Fuses V', O (both terms), and S update into one kernel because:
+*     (a) All depend on state S which lives in shared memory (s_h)
+*     (b) Splitting would require global memory round-trips for S and V'
+*     (c) Enables TMA overlap between steps
+*   - State s_h[BV=32][K=128] persists in shared memory across all chunks
+*   - M' is never materialized: causal mask applied as (col <= row) check,
+*     gate ratio computed on the fly as exp(g[row] - g[col])
+*
+*   Per-chunk steps with TMA overlap:
+*
+*     Step 1: W @ S^T via tcgen05
+*       TMA loads W → tile_a (async)
+*       OVERLAP: convert s_h fp32 → tile_b bf16 while TMA runs
+*       MMA: tile_a @ tile_b → s_wh
+*       Prefetch g_cumsum → s_gc (needed in steps 3-5, latency hiding)
+*
+*     Step 2: V' = U - W@S
+*       TMA loads Q → tile_a (async, for step 3)
+*       OVERLAP: compute s_vnew = u_in - s_wh while TMA runs
+*
+*     Step 3: inter-chunk output = G * (Q @ S)
+*       Q already in tile_a (from step 2 TMA), S still in tile_b
+*       MMA: Q @ S^T → s_wh
+*       Write scale * exp(g) * (Q @ S) to output
+*
+*     Step 4: intra-chunk output = ((Q @ K.T) * M') @ V'
+*       TMA loads K → tile_b (async, overwrites S — no longer needed)
+*       MMA: Q @ K^T → s_wh
+*       Apply causal mask + gate ratio element-wise (M' on the fly)
+*       Manual dot product: masked_attn @ V' (small matmul, not worth tcgen05)
+*       Accumulate into output (read-modify-write)
+*
+*     Step 5: state update S = G[-1] * S + K.T @ (V' * G[-1]/G)
+*       Decay state: s_h *= exp(g_last)
+*       Gate V': s_vnew *= exp(g_last - g[t])
+*       Transpose K and gated V' into tile layout
+*       MMA: K^T @ gated_V' → accumulate into s_h
+*
+*   After all chunks: write s_h → new_state in global memory
+*
+* === Hardware Details (Blackwell SM_100a) ===
+*
+* - tcgen05 tensor cores: BM must be 128 (hardware constraint), so 64-row
+*   matrices are padded to 128 rows; only first 64 rows of output are read
+* - TMA (Tensor Memory Access): async global→smem loads with no thread
+*   involvement, coordinated via mbarriers. Used for plain bf16 loads
+*   (K, Q, W). NOT used when fp32→bf16 conversion or scaling is needed
+* - TMEM: tensor memory private to the MMA unit, allocated once per kernel,
+*   reused across all MMA operations
+* - Tile layout: non-standard byte addressing for tcgen05 compatibility
+*   byte_off = tc * LBO + tr * SBO + wr * 16 + wc * 2
+*
+* === Dimensions ===
+*
+* K=128 (key/query dim), V=128 (value dim), BT=64 (chunk size), BV=32 (v tile)
+* Hq=4 (query heads), Hk=4 (key heads), Hv=8 (value heads, GQA)
+
  */
 
 #include "cuda_utils.h"
