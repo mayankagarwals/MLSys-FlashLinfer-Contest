@@ -40,7 +40,7 @@ def compute_chunks_kernel(
         num_chunks = tl.cdiv(seqlens, BT)
         chunk_offsets = tl.cumsum(num_chunks, axis=0)
 
-        tl.store(num_chunks_ptr + offsets, num_chunks, offsets < N + 1)
+        tl.store(num_chunks_ptr + offsets, num_chunks, offsets < N)
         tl.store(chunk_offsets_ptr + (offsets + 1), chunk_offsets, offsets < N)
         tl.store(chunk_offsets_ptr, 0)  # prefix with 0
 
@@ -105,10 +105,10 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     k_head_id = tl.program_id(1)
 
     seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
-    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + (global_chunk_id * 2 + 1)).to(tl.int32)
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
 
     # compute K @ K.T
@@ -218,10 +218,10 @@ def merge_16x16_to_64x64_inverse_kernel(
     head_id = tl.program_id(1)
 
     seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
-    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + (global_chunk_id * 2 + 1)).to(tl.int32)
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
 
     # compute inverse
@@ -399,7 +399,7 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     head_id = i_nh % H
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
     num_chunks = tl.cdiv(seqlen, BT)
     boh = tl.load(chunk_offsets_ptr + seq_id).to(tl.int32)
@@ -410,6 +410,7 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     k_ptr += ((bos * Hg + head_id // (H // Hg)) * K_dim).to(tl.int64)
     w_ptr += ((bos * H + head_id) * K_dim).to(tl.int64)
     v_new_ptr += ((bos * H + head_id) * V_dim).to(tl.int64)
+    g_cu_ptr += bos * H + head_id
 
     stride_v = H * V_dim
     stride_h = H * V_dim * K_dim
@@ -423,21 +424,13 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     offs_k = tl.arange(0, K_dim)[None, :]
 
     # load initial state
-    h = tl.load(
-        h0_ptr + offs_v * K_dim + offs_k,
-        mask=(offs_v < V_dim),
-        other=0.0,
-    ).to(tl.float32)  # [BV, K_dim]
+    h = tl.load(h0_ptr + (offs_v * K_dim + offs_k)).to(tl.float32)  # [BV, K_dim]
 
     # main recurrence
     # NOTE: TMA might not be faster?
     for chunk_id in range(num_chunks):
         # save intermediate state for o computation
-        tl.store(
-            h_ptr + chunk_id * stride_h + offs_v * K_dim + offs_k,
-            h,
-            mask=offs_v < V_dim,
-        )
+        tl.store(h_ptr + (chunk_id * stride_h + offs_v * K_dim + offs_k), h)
 
         # issue all loads first
         offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
@@ -445,52 +438,48 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
 
         w = tl.load(
-            w_ptr + offs_t * stride_w + offs_k,
+            w_ptr + (offs_t * stride_w + offs_k),
             mask=mask_t,
             other=0.0,
         )  # [BT, K_dim]
 
         v = tl.load(
-            v_ptr + offs_t * stride_v + offs_v_block,
-            mask=mask_t & (offs_v_block < V_dim),
+            v_ptr + (offs_t * stride_v + offs_v_block),
+            mask=mask_t,
             other=0.0,
-        )
+        )  # [BT, BV]
 
         k = tl.load(
-            k_ptr + offs_t * stride_k + offs_k,
+            k_ptr + (offs_t * stride_k + offs_k),
             mask=mask_t,
             other=0.0,
         )  # [BT, K_dim]
 
         last_idx = min((chunk_id + 1) * BT, seqlen) - 1
-        g_cu_last = tl.load(g_cu_ptr + bos * H + last_idx * H + head_id)
+        g_cu_last = tl.load(g_cu_ptr + last_idx * H)
         offs_t_1d = chunk_id * BT + tl.arange(0, BT)
-        g_cu = tl.load(
-            g_cu_ptr + bos * H + head_id + offs_t_1d * H,
-            mask=offs_t_1d < seqlen,
-            other=0.0,
-        )
+        g_cu = tl.load(g_cu_ptr + offs_t_1d * H, mask=offs_t_1d < seqlen, other=0.0)
 
         # computation
         v_new = v - tl.dot(w, h.to(w.dtype).T)  # [BT, BV]
 
         # save new value for o computation
         tl.store(
-            v_new_ptr + offs_t * stride_v + offs_v_block,
+            v_new_ptr + (offs_t * stride_v + offs_v_block),
             v_new,
-            mask=(offs_t < seqlen) & (offs_v_block < V_dim),
+            mask=offs_t < seqlen,
         )
 
         # apply g
         mask_t = offs_t_1d < seqlen
-        v_new = v_new * tl.where(mask_t, tl.exp(g_cu_last - g_cu), 0)[:, None]
+        v_new *= tl.where(mask_t, tl.exp(g_cu_last - g_cu), 0)[:, None]
         h *= tl.exp(g_cu_last)
 
         # update state
         h = tl.dot(v_new.to(k.dtype).T, k, acc=h)
 
     # epilogue
-    tl.store(ht_ptr + offs_v * K_dim + offs_k, h, mask=offs_v < V_dim)
+    tl.store(ht_ptr + (offs_v * K_dim + offs_k), h)
 
 
 @triton.jit
@@ -516,10 +505,10 @@ def chunk_fwd_kernel_o(
     head_id = tl.program_id(2)
 
     seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
-    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + (global_chunk_id * 2 + 1)).to(tl.int32)
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
 
     # offset calculation
@@ -537,14 +526,12 @@ def chunk_fwd_kernel_o(
     mask_t = offs_t < seqlen
 
     q = tl.load(
-        q_ptr + offs_t * (Hg * K_dim) + offs_k, mask=mask_t, other=0.0
+        q_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0
     )  # [BT, K_dim]
     k = tl.load(
-        k_ptr + offs_t * (Hg * K_dim) + offs_k, mask=mask_t, other=0.0
+        k_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0
     )  # [BT, K_dim]
-    h = tl.load(
-        h_ptr + offs_v * K_dim + offs_k, mask=offs_v < V_dim, other=0.0
-    )  # [BV, K_dim]
+    h = tl.load(h_ptr + (offs_v * K_dim + offs_k))  # [BV, K_dim]
     offs_t_1d = chunk_id * BT + tl.arange(0, BT)
     g_cu = tl.load(g_cu_ptr + offs_t_1d * H, mask=offs_t_1d < seqlen, other=0.0)
 
@@ -560,16 +547,16 @@ def chunk_fwd_kernel_o(
     mask_A = causal_offs_t[:, None] >= causal_offs_t[None, :]
     A = tl.where(mask_A, A, 0.0)
     v = tl.load(
-        v_ptr + offs_t * (H * V_dim) + offs_v_block,
-        mask=mask_t & (offs_v_block < V_dim),
+        v_ptr + (offs_t * (H * V_dim) + offs_v_block),
+        mask=mask_t,
         other=0.0,
     )
 
     o = tl.dot(A.to(v.dtype), v, acc=o) * scale
     tl.store(
-        o_ptr + offs_t * (H * V_dim) + offs_v_block,
+        o_ptr + (offs_t * (H * V_dim) + offs_v_block),
         o,
-        mask=mask_t & (offs_v_block < V_dim),
+        mask=mask_t,
     )
 
 
