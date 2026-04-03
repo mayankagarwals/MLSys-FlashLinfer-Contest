@@ -33,15 +33,15 @@ def compute_chunks_kernel(
         # since N is small (max is 57 among the given workloads),
         # we can use 1 threadblock to do everything
         offsets = tl.arange(0, BLOCK_SIZE)
-        bos = tl.load(cu_seqlens_ptr + offsets, offsets < N)
-        eos = tl.load(cu_seqlens_ptr + (offsets + 1), offsets < N - 1)
+        bos = tl.load(cu_seqlens_ptr + offsets, offsets < N + 1)
+        eos = tl.load(cu_seqlens_ptr + (offsets + 1), offsets < N)
         seqlens = eos - bos
 
         num_chunks = tl.cdiv(seqlens, BT)
         chunk_offsets = tl.cumsum(num_chunks, axis=0)
 
-        tl.store(num_chunks_ptr + offsets, num_chunks, offsets < N)
-        tl.store(chunk_offsets_ptr + (offsets + 1), chunk_offsets, offsets < N - 1)
+        tl.store(num_chunks_ptr + offsets, num_chunks, offsets < N + 1)
+        tl.store(chunk_offsets_ptr + (offsets + 1), chunk_offsets, offsets < N)
         tl.store(chunk_offsets_ptr, 0)  # prefix with 0
 
         # flag_ptr is initialized to 0
@@ -547,7 +547,7 @@ def run(
         chunk_offsets,
         chunk_indices,
         _FLAG,
-        N=BT,
+        N=N,
         BT=BT,
         # max N is 57 -> max BLOCK_SIZE is 64, still very small
         BLOCK_SIZE=triton.next_power_of_2(N),
