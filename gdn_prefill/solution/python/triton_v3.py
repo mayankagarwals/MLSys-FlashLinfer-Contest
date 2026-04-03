@@ -40,7 +40,7 @@ def compute_chunks_kernel(
         num_chunks = tl.cdiv(seqlens, BT)
         chunk_offsets = tl.cumsum(num_chunks, axis=0)
 
-        tl.store(num_chunks_ptr + offsets, num_chunks, offsets < N + 1)
+        tl.store(num_chunks_ptr + offsets, num_chunks, offsets < N)
         tl.store(chunk_offsets_ptr + (offsets + 1), chunk_offsets, offsets < N)
         tl.store(chunk_offsets_ptr, 0)  # prefix with 0
 
@@ -105,10 +105,10 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     k_head_id = tl.program_id(1)
 
     seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
-    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + (global_chunk_id * 2 + 1)).to(tl.int32)
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
 
     # compute K @ K.T
@@ -202,10 +202,10 @@ def merge_16x16_to_64x64_inverse_kernel(
     head_id = tl.program_id(1)
 
     seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
-    chunk_id = tl.load(chunk_indices_ptr + global_chunk_id * 2 + 1).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + (global_chunk_id * 2 + 1)).to(tl.int32)
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
 
     # compute inverse
@@ -405,7 +405,7 @@ def chunk_gated_delta_rule_fwd_kernel_h(
     head_id = i_nh % H
 
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
-    eos = tl.load(cu_seqlens_ptr + seq_id + 1).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
     num_chunks = tl.cdiv(seqlen, BT)
 
