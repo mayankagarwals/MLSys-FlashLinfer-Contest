@@ -1,2 +1,2 @@
-* Verify code changes and benchmark performance using `uv run gdn_prefill/scripts/run_local_fast.py`
+* Verify code changes and benchmark performance using `uv run gdn_prefill/scripts/run_local_fast.py` in cast you modify one of the prefill kernels. Similar for `gdn_decode`.
 * Use `uv` to run python from the shell.
