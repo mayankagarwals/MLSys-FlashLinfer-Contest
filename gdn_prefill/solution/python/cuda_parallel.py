@@ -15,8 +15,8 @@ _ext._get_cuda_target = lambda: "-gencode=arch=compute_100a,code=sm_100a"
 CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
-    name="gdn_prefill_cuda_tcgen05",
-    cuda_files=[str(CURRENT_DIR / "cuda_parallel_v1.cu")],
+    name="gdn_prefill_cuda_v2",
+    cuda_files=[str(CURRENT_DIR / "cuda_parallel_v2.cu")],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
         "-O3",
