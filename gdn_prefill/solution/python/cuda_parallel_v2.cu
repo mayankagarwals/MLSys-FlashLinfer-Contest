@@ -1846,7 +1846,7 @@ HRecurrenceKernel(
 
     // MMA: w @ h^T
     {
-      tcgen05_fence();
+
       if (warp_id == 0 && elect_sync()) {
         for (int ki = 0; ki < TC_BK / MMA_K; ki++) {
           uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1862,7 +1862,7 @@ HRecurrenceKernel(
       if (warp_id == 0 && elect_sync())
         mbarrier_init(mbar_mma, 1);
       __syncthreads();
-      tcgen05_fence();
+
     }
 
     // Read w@h^T TMEM -> s_wh; overlap with g_cumsum load
@@ -1879,10 +1879,9 @@ HRecurrenceKernel(
     __syncthreads();
 
     // Step 2: v_new = u - w@h^T, store v_new to d_u, gate v_new, scale h
-    // OVERLAP: Issue TMA k -> tile_b (needed for step 5)
+    // OVERLAP: Issue TMA k → tile_b (needed for step 5 k transpose)
     tma_load_tile_3d(tileB_smem, &k_tmap_64, (int)cstart, k_col_group,
                      mbar_tma, cp_tileB, warp_id);
-
     {
       float g_last = s_gc[clen - 1];
 
@@ -1918,7 +1917,7 @@ HRecurrenceKernel(
     // Step 5: Update state h += k^T @ v_new_gated via tcgen05
     {
       constexpr int BK_kv = kBT;
-      // Load k^T into tile_a [128,64] -- transpose from tile_b (k from TMA)
+      // Load k^T into tile_a [128,64] — transpose from tile_b (k from TMA)
       const int total_a = TC_BM * (BK_kv / 8);
       for (int i = tid; i < total_a; i += 128) {
         int col_k = i / (BK_kv / 8);
@@ -1964,7 +1963,7 @@ HRecurrenceKernel(
 
       // MMA: k^T @ vnew_gated -> TMEM [128,64], 4 K-tiles
       {
-        tcgen05_fence();
+
         if (warp_id == 0 && elect_sync()) {
           for (int ki = 0; ki < BK_kv / MMA_K; ki++) {
             uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1980,7 +1979,7 @@ HRecurrenceKernel(
         if (warp_id == 0 && elect_sync())
           mbarrier_init(mbar_mma, 1);
         __syncthreads();
-        tcgen05_fence();
+
       }
 
       // Prefetch w for NEXT chunk (overlapped with TMEM read)
