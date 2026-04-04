@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .cuda_parallel_v1 import run as cuda_parallel_v1
+from .cuda_parallel import run as cuda_parallel
 
 
 def run(
@@ -19,9 +19,9 @@ def run(
 ):
     T = q.shape[0]
 
-    # chunk impl (CUDA parallel v1)
+    # chunk impl (CUDA parallel)
     if T >= 256:
-        return cuda_parallel_v1(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+        return cuda_parallel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # recurrent impl
     o = torch.empty_like(v)
