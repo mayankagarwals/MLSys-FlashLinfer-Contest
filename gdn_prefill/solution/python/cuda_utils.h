@@ -126,6 +126,11 @@ inline void ValidateState(const TensorView &state, int64_t num_seqs) {
 // TMA (Tensor Memory Access) helpers
 // ═══════════════════════════════════════════════════════════════════
 
+// https://github.com/NVIDIA/cutlass/blob/v4.3.2/include/cute/arch/copy_sm90_desc.hpp#L193-L197
+constexpr uint64_t EVICT_NORMAL = 0x1000000000000000;
+constexpr uint64_t EVICT_FIRST  = 0x12F0000000000000;
+constexpr uint64_t EVICT_LAST   = 0x14F0000000000000;
+
 // 2D TMA descriptor (host-side creation)
 inline void init_tma_desc_2d(
     CUtensorMap *tmap,
@@ -167,25 +172,30 @@ inline void init_tma_desc_3d(
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NAN_REQUEST_ZERO_FMA);
 }
 
+__device__ inline
+void prefetch_tensormap(const void *tmap_ptr) {
+  asm volatile("prefetch.tensormap [%0];" :: "l"(tmap_ptr));
+}
+
 // TMA device-side loads
 __device__ __forceinline__
 void tma_load_2d(uint32_t smem_addr, const void *tmap_ptr,
-                 int coord_x, int coord_y, uint32_t mbar_addr) {
+                 int x, int y, uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
   asm volatile(
-    "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes "
-    "[%0], [%1, {%2, %3}], [%4];"
-    :: "r"(smem_addr), "l"(tmap_ptr), "r"(coord_x), "r"(coord_y),
-       "r"(mbar_addr) : "memory");
+    "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+    "[%0], [%1, {%2, %3}], [%4], %5;"
+    :: "r"(smem_addr), "l"(tmap_ptr), "r"(x), "r"(y),
+       "r"(mbar_addr), "l"(cache_policy) : "memory");
 }
 
 __device__ __forceinline__
 void tma_load_3d(uint32_t smem_addr, const void *tmap_ptr,
-                 int coord_x, int coord_y, int coord_z, uint32_t mbar_addr) {
+                 int x, int y, int z, uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
   asm volatile(
-    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes "
-    "[%0], [%1, {%2, %3, %4}], [%5];"
-    :: "r"(smem_addr), "l"(tmap_ptr), "r"(coord_x), "r"(coord_y), "r"(coord_z),
-       "r"(mbar_addr) : "memory");
+    "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+    "[%0], [%1, {%2, %3, %4}], [%5], %6;"
+    :: "r"(smem_addr), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
+       "r"(mbar_addr), "l"(cache_policy) : "memory");
 }
 
 // ═══════════════════════════════════════════════════════════════════
