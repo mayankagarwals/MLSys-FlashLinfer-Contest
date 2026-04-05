@@ -176,9 +176,7 @@ void tma_load_tile_3d(uint32_t smem_addr, const CUtensorMap *tmap,
                       int warp_id) {
   if (warp_id == 0 && elect_sync()) {
     tma_load_3d(smem_addr, tmap, 0, row_offset, col_group_offset, mbar_addr);
-    asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-      :: "r"(mbar_addr), "r"(cp_bytes) : "memory");
+    mbarrier_arrive_expect_tx(mbar_addr, cp_bytes);
   }
 }
 
@@ -192,9 +190,7 @@ void tma_load_two_tiles_3d(
   if (warp_id == 0 && elect_sync()) {
     tma_load_3d(smem_addr_a, tmap_a, 0, row_a, col_group_a, mbar_addr);
     tma_load_3d(smem_addr_b, tmap_b, 0, row_b, col_group_b, mbar_addr);
-    asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-      :: "r"(mbar_addr), "r"(total_cp_bytes) : "memory");
+    mbarrier_arrive_expect_tx(mbar_addr, total_cp_bytes);
   }
 }
 
