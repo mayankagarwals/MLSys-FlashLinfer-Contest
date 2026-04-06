@@ -242,6 +242,11 @@ void mbarrier_init(uint32_t mbar_addr, int count) {
 }
 
 __device__ __forceinline__
+void fence_mbarrier_init() {
+  asm volatile("fence.mbarrier_init.release.cluster;");
+}
+
+__device__ __forceinline__
 void mbarrier_wait(uint32_t mbar_addr, int phase) {
   uint32_t ticks = 0x989680;
   asm volatile(
@@ -296,9 +301,8 @@ void tcgen05_relinquish_alloc_permit() {
 // ═══════════════════════════════════════════════════════════════════
 
 // Instruction descriptor: bf16 inputs → fp32 accumulator
-template <int MMA_M, int MMA_N>
 __device__ __forceinline__
-constexpr uint32_t make_tcgen05_idesc() {
+constexpr uint32_t make_tcgen05_idesc(int MMA_M, int MMA_N) {
   return (1U << 4U)   // dtype = FP32
        | (1U << 7U)   // atype = BF16
        | (1U << 10U)  // btype = BF16
@@ -562,4 +566,66 @@ void tcgen05_fence_before_thread_sync() {
 __device__ __forceinline__
 void tcgen05_fence_after_thread_sync() {
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
+}
+
+template <uint32_t barrier>
+__device__ __forceinline__
+void bar_sync(uint32_t count) {
+  asm volatile("bar.sync %0, %1;" :: "n"(barrier), "r"(count));
+}
+
+template <int num>
+__device__ __forceinline__
+void ldmatrix(uint32_t *data, uint32_t addr) {
+  static_assert(num == 1 || num == 2 || num == 4);
+  if constexpr (num == 1)
+    asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];"
+                : "=r"(data[0])
+                : "r"(addr));
+  else if constexpr (num == 2)
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];"
+                : "=r"(data[0]), "=r"(data[1])
+                : "r"(addr));
+  else if constexpr (num == 4)
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(data[0]), "=r"(data[1]), "=r"(data[2]), "=r"(data[3])
+                : "r"(addr));
+}
+
+template <int num>
+__device__ __forceinline__
+void ldmatrix_trans(uint32_t *data, uint32_t addr) {
+  static_assert(num == 1 || num == 2 || num == 4);
+  if constexpr (num == 1)
+    asm volatile("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];"
+                : "=r"(data[0])
+                : "r"(addr));
+  else if constexpr (num == 2)
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
+                : "=r"(data[0]), "=r"(data[1])
+                : "r"(addr));
+  else if constexpr (num == 4)
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+                : "=r"(data[0]), "=r"(data[1]), "=r"(data[2]), "=r"(data[3])
+                : "r"(addr));
+}
+
+__device__ inline
+void ldg_u32x8(void *data_, void *ptr) {
+  uint32_t *data = reinterpret_cast<uint32_t *>(data_);
+  asm volatile(
+    "ld.global.v8.f32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+    : "=r"(data[0]), "=r"(data[1]), "=r"(data[2]), "=r"(data[3]),
+      "=r"(data[4]), "=r"(data[5]), "=r"(data[6]), "=r"(data[7])
+    : "l"(ptr));
+}
+
+__device__ inline
+void stg_u32x8(void *ptr, void *data_) {
+  uint32_t *data = reinterpret_cast<uint32_t *>(data_);
+  asm volatile(
+    "st.global.v8.u32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+    :: "l"(ptr),
+      "f"(data[0]), "f"(data[1]), "f"(data[2]), "f"(data[3]),
+      "f"(data[4]), "f"(data[5]), "f"(data[6]), "f"(data[7]));
 }

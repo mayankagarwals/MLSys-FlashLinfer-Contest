@@ -292,13 +292,13 @@ ComputeAKernel_TC(
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
     tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), BN);
   }
   __syncthreads();
   const uint32_t taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+  constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
 
   // TMA load k into s_A [128,128] and s_B [64,128]
   // 3D coords: (0, row_offset=cstart, col_group=k_head * K / 8)
@@ -412,13 +412,13 @@ ComputeQKKernel_TC(
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
     tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), BN);
   }
   __syncthreads();
   const uint32_t taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+  constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
 
   // TMA load q into s_A [128,128] and k into s_B [64,128]
   int q_col = (int)(q_head * kK / 8);
@@ -583,13 +583,13 @@ ComputeWUKernel_TC(
 
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_addr, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
     tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), BN);
   }
   __syncthreads();
   const uint32_t taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+  constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
 
   if (tid < kBT) {
     float b = (tid < clen) ? beta_f[(cstart + tid) * kHv + hv] : 0.0f;
@@ -729,13 +729,13 @@ FusedPrepKernel(
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
     tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), BN);
   }
   __syncthreads();
   const uint32_t taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+  constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
 
   // ════════════════════════════════════════════════════════════
   // Phase 1: Compute A_mat (same as ComputeAKernel_TC)
@@ -1321,13 +1321,13 @@ FusedRecurrenceOutput(
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
     tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), TC_BN);
   }
   __syncthreads();
   const uint32_t taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<TC_BM, TC_BN>();
+  constexpr uint32_t idesc = make_tcgen05_idesc(TC_BM, TC_BN);
 
   // TMA mbarrier phase tracking (persists across chunks)
   int tma_phase = 0;
@@ -1803,13 +1803,13 @@ HRecurrenceKernel(
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
     tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), TC_BN);
   }
   __syncthreads();
   const uint32_t taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<TC_BM, TC_BN>();
+  constexpr uint32_t idesc = make_tcgen05_idesc(TC_BM, TC_BN);
 
   // TMA mbarrier phase tracking
   int tma_phase = 0;
