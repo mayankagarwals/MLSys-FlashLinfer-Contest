@@ -192,89 +192,89 @@ void kkt_v1_kernel_cutlass(
     float *g_cu_smem_ptr = g_warp_sum_ptr + 4 * 2;
 
     for (int global_chunk_id = bid; global_chunk_id < total_num_chunks; global_chunk_id += gridDim.x) {
-        int2 tmp = reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
-        const int seq_id = tmp.x;
-        const int chunk_id = tmp.y;
-        const int bos = cu_seqlens_ptr[seq_id];
-        const int eos = cu_seqlens_ptr[seq_id + 1];
+      int2 tmp = reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
+      const int seq_id = tmp.x;
+      const int chunk_id = tmp.y;
+      const int bos = cu_seqlens_ptr[seq_id];
+      const int eos = cu_seqlens_ptr[seq_id + 1];
 
-        const int off_t = bos + chunk_id * BT + warp_id * 16 + (lane_id % 16);
+      const int off_t = bos + chunk_id * BT + warp_id * 16 + (lane_id % 16);
 
-        float b = __bfloat162float(b_ptr[off_t * H + head_id]);
-        float a = __bfloat162float(a_ptr[off_t * H + head_id]);
+      float b = __bfloat162float(b_ptr[off_t * H + head_id]);
+      float a = __bfloat162float(a_ptr[off_t * H + head_id]);
 
-        float beta = __frcp_rn(1.0f + __expf(-b));
-        float g = A * __logf(1.0f + __expf(a + dt_bias));
+      float beta = __frcp_rn(1.0f + __expf(-b));  // sigmoid
+      float g = A * __logf(1.0f + __expf(a + dt_bias));
 
-        // store to gmem for future use
-        if (off_t < eos)
-          beta_ptr[off_t * H + head_id] = beta;
+      // store to gmem for future use
+      if (off_t < eos)
+        beta_ptr[off_t * H + head_id] = beta;
 
-        // parallel scan among half warp (16)
-        // illustrating for 4 lanes
-        // lane  | lane0 | lane1 | lane2    | lane3
-        // iter0 | a0    |    a1 |       a2 |          a3
-        // iter1 | a0    | a0+a1 |    a1+a2 |       a2+a3
-        // iter2 | a0    | a0+a1 | a0+a1+a2 | a0+a1+a2+a3
-        for (int i = 1; i < 16; i *= 2) {
-          float lower_g = __shfl_up_sync(0xFFFF'FFFF, g, i);  // g from lower lane
-          if ((lane_id % 16) >= i)
-            g += lower_g;
+      // parallel scan among half warp (16)
+      // illustrating for 4 lanes
+      // lane  | lane0 | lane1 | lane2    | lane3
+      // iter0 | a0    |    a1 |       a2 |          a3
+      // iter1 | a0    | a0+a1 |    a1+a2 |       a2+a3
+      // iter2 | a0    | a0+a1 | a0+a1+a2 | a0+a1+a2+a3
+      for (int i = 1; i < 16; i *= 2) {
+        float lower_g = __shfl_up_sync(0xFFFF'FFFF, g, i);  // g from lower lane
+        if ((lane_id % 16) >= i)
+          g += lower_g;
+      }
+      // store warp sum to smem. layout [4,2]
+      if (lane_id % 16 == 15)
+        g_warp_sum_ptr[warp_id * 2 + (lane_id / 16)] = g;
+      bar_sync<1>(128);
+
+      // add warp sum from lower warps
+      // we finish doing g cumsum in registers
+      if (warp_id >= 1) g += g_warp_sum_ptr[0 * 2 + (lane_id / 16)];
+      if (warp_id >= 2) g += g_warp_sum_ptr[1 * 2 + (lane_id / 16)];
+      if (warp_id >= 3) g += g_warp_sum_ptr[2 * 2 + (lane_id / 16)];
+
+      // store to gmem for future use
+      if (off_t < eos)
+        g_cu_ptr[off_t * H + head_id] = g;
+
+      // store to smem for computing Gamma. layout [2, BT]
+      g_cu_smem_ptr[(lane_id / 16) * BT + (warp_id * 16 + (lane_id % 16))] = g;
+      bar_sync<1>(128);
+
+      // wait MMA
+      if (warp_id == 0)
+        mbarrier_wait(mma_mbar_addr + stage_id * 8, mma_parity);
+      bar_sync<1>(128);
+      tcgen05_fence_after_thread_sync();
+
+      // load MMA result
+      // only lower half warp contains result
+      tcgen05_ld<SHAPE::_32x32b, 64>(kkt, 0, stage_id * BT);
+      tcgen05_wait_ld();
+      tcgen05_fence_before_thread_sync();
+      mbarrier_arrive(epi_mbar_addr + stage_id * 8);
+
+      // row/col within [BT,BT] tile
+      const int row = warp_id * 16 + (lane_id % 16);
+      for (int col = 0; col < BT; col++) {
+        kkt[col] = __shfl_up_sync(0xFFFF'FFFF, kkt[col], 16);  // broadcast from lower half to upper half
+
+        // strict lower mask + time mask
+        if (row > col && bos + chunk_id * BT + col < eos) {
+          kkt[col] *= beta * __expf(g - g_cu_smem_ptr[(lane_id / 16) * BT + col]);
+        } else {
+          kkt[col] = 0;
         }
-        // store warp sum to smem. layout [4,2]
-        if (lane_id % 16 == 15)
-          g_warp_sum_ptr[warp_id * 2 + (lane_id / 16)] = g;
-        bar_sync<1>(128);
+      }
 
-        // add warp sum from lower warps
-        // we finish doing g cumsum in registers
-        if (warp_id >= 1) g += g_warp_sum_ptr[0 * 2 + (lane_id / 16)];
-        if (warp_id >= 2) g += g_warp_sum_ptr[1 * 2 + (lane_id / 16)];
-        if (warp_id >= 3) g += g_warp_sum_ptr[2 * 2 + (lane_id / 16)];
+      // store A to gmem
+      if (off_t < eos) {
+        for (int i = 0; i < BT / 8; i++)
+          stg_u32x8_fast(A_ptr + (off_t * H * BT + head_id * BT + i * 8), kkt + i * 8);
+      }
 
-        // store to gmem for future use
-        if (off_t < eos)
-          g_cu_ptr[off_t * H + head_id] = g;
-
-        // store to smem for computing Gamma. layout [2, BT]
-        g_cu_smem_ptr[(lane_id / 16) * BT + (warp_id * 16 + (lane_id % 16))] = g;
-        bar_sync<1>(128);
-
-        // wait MMA
-        if (warp_id == 0)
-          mbarrier_wait(mma_mbar_addr + stage_id * 8, mma_parity);
-        bar_sync<1>(128);
-        tcgen05_fence_after_thread_sync();
-
-        // load MMA result
-        // only lower half warp contains result
-        tcgen05_ld<SHAPE::_32x32b, 64>(kkt, 0, stage_id * BT);
-        tcgen05_wait_ld();
-        tcgen05_fence_before_thread_sync();
-        mbarrier_arrive(epi_mbar_addr + stage_id * 8);
-
-        // row/col within [BT,BT] tile
-        const int row = warp_id * 16 + (lane_id % 16);
-        for (int col = 0; col < BT; col++) {
-          kkt[col] = __shfl_up_sync(0xFFFF'FFFF, kkt[col], 16);  // broadcast from lower half to upper half
-
-          // strict lower mask + time mask
-          if (row > col && bos + chunk_id * BT + col < eos) {
-            kkt[col] *= beta * __expf(g - g_cu_smem_ptr[(lane_id / 16) * BT + col]);
-          } else {
-            kkt[col] = 0;
-          }
-        }
-
-        // store A to gmem
-        if (off_t < eos) {
-          for (int i = 0; i < BT / 8; i++)
-            stg_u32x8(A_ptr + (off_t * H * BT + head_id * BT + i * 8), kkt + i * 8);
-        }
-
-        stage_id = (stage_id + 1) % NUM_STAGES;
-        if (stage_id == 0)
-          mma_parity ^= 1;
+      stage_id = (stage_id + 1) % NUM_STAGES;
+      if (stage_id == 0)
+        mma_parity ^= 1;
     }
   }
 

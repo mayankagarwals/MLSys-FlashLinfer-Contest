@@ -720,6 +720,17 @@ void stg_u32x8(void *ptr, const void *data_) {
       "r"(data[4]), "r"(data[5]), "r"(data[6]), "r"(data[7]));
 }
 
+// using .L1::no_allocate, meant for epilogue stores (no read again).
+__device__ inline
+void stg_u32x8_fast(void *ptr, const void *data_) {
+  const uint32_t *data = reinterpret_cast<const uint32_t *>(data_);
+  asm volatile(
+    "st.global.relaxed.cta.L1::no_allocate.v8.u32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+    :: "l"(ptr),
+      "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]),
+      "r"(data[4]), "r"(data[5]), "r"(data[6]), "r"(data[7]));
+}
+
 template <typename T>
 __device__ inline
 T warp_uniform(T x) { return __shfl_sync(0xFFFF'FFFF, x, 0); }
