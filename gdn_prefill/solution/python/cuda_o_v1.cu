@@ -48,19 +48,24 @@ constexpr uint32_t SWIZZLE_BYTES =
 constexpr uint32_t SWIZZLE_SBO = 8U * 128U;
 
 //// Shared Memory Offsets in Bytes
-constexpr uint32_t A_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
-constexpr uint32_t B_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
+constexpr uint32_t Q_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
+constexpr uint32_t K_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
 constexpr uint32_t V_SMEM_SIZE = BLOCK_V * BLOCK_T * sizeof(nv_bfloat16);
+constexpr uint32_t H_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
+constexpr uint32_t ATTN_SMEM_SIZE = BLOCK_T * BLOCK_T * sizeof(nv_bfloat16);
 constexpr uint32_t OUTPUT_SMEM_SIZE = BLOCK_T * BLOCK_V * sizeof(float);
 constexpr uint32_t G_SMEM_SIZE = BLOCK_T * sizeof(float);
-constexpr uint32_t OFFSET_MATRIX_A = 0U;
-constexpr uint32_t OFFSET_MATRIX_B = OFFSET_MATRIX_A + A_SMEM_SIZE;
-constexpr uint32_t OFFSET_V = OFFSET_MATRIX_B + B_SMEM_SIZE;
-constexpr uint32_t OFFSET_OUTPUT = OFFSET_V + V_SMEM_SIZE;
+constexpr uint32_t OFFSET_Q = 0U;
+constexpr uint32_t OFFSET_K = OFFSET_Q + Q_SMEM_SIZE;
+constexpr uint32_t OFFSET_V = OFFSET_K + K_SMEM_SIZE;
+constexpr uint32_t OFFSET_H = OFFSET_V + V_SMEM_SIZE;
+constexpr uint32_t OFFSET_ATTN = OFFSET_H + H_SMEM_SIZE;
+constexpr uint32_t OFFSET_OUTPUT = OFFSET_ATTN + ATTN_SMEM_SIZE;
 constexpr uint32_t OFFSET_G = OFFSET_OUTPUT + OUTPUT_SMEM_SIZE;
-constexpr uint32_t OFFSET_QKH_TMA_BAR = OFFSET_G + G_SMEM_SIZE;
-constexpr uint32_t OFFSET_V_TMA_BAR = OFFSET_QKH_TMA_BAR + 8U;
-constexpr uint32_t OFFSET_MMA_BAR = OFFSET_V_TMA_BAR + 8U;
+constexpr uint32_t OFFSET_QK_TMA_BAR = OFFSET_G + G_SMEM_SIZE;
+constexpr uint32_t OFFSET_V_TMA_BAR = OFFSET_QK_TMA_BAR + 8U;
+constexpr uint32_t OFFSET_H_TMA_BAR = OFFSET_V_TMA_BAR + 8U;
+constexpr uint32_t OFFSET_MMA_BAR = OFFSET_H_TMA_BAR + 8U;
 constexpr uint32_t OFFSET_TMEM_ADDR = OFFSET_MMA_BAR + 8U;
 constexpr uint32_t SMEM_SIZE = (OFFSET_TMEM_ADDR + 4U + 1023U) & ~1023U;
 
@@ -95,13 +100,6 @@ static CUtensorMap encode_tma(void *ptr, uint64_t outer, uint64_t rows,
       globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
       CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return tmap;
-}
-
-static CUtensorMap encode_v_tma(void *ptr, uint64_t rows, uint64_t cols) {
-  CUtensorMap tmap;
-  init_tma_desc_3d(&tmap, reinterpret_cast<const __nv_bfloat16 *>(ptr), rows,
-                   cols, BLOCK_V, BLOCK_T);
   return tmap;
 }
 
@@ -190,13 +188,16 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   extern __shared__ __align__(1024) char smem_ptr[];
   const uint32_t smem = __cvta_generic_to_shared(smem_ptr);
 
-  const uint32_t matrix_a_smem = smem + OFFSET_MATRIX_A;
-  const uint32_t matrix_b_smem = smem + OFFSET_MATRIX_B;
+  const uint32_t q_smem = smem + OFFSET_Q;
+  const uint32_t k_smem = smem + OFFSET_K;
   const uint32_t v_smem = smem + OFFSET_V;
+  const uint32_t h_smem = smem + OFFSET_H;
+  const uint32_t attn_smem = smem + OFFSET_ATTN;
   const uint32_t output_smem = smem + OFFSET_OUTPUT;
   const uint32_t g_smem = smem + OFFSET_G;
-  const uint32_t qkh_tma_barrier = smem + OFFSET_QKH_TMA_BAR;
+  const uint32_t qk_tma_barrier = smem + OFFSET_QK_TMA_BAR;
   const uint32_t v_tma_barrier = smem + OFFSET_V_TMA_BAR;
+  const uint32_t h_tma_barrier = smem + OFFSET_H_TMA_BAR;
   const uint32_t mma_barrier = smem + OFFSET_MMA_BAR;
   const uint32_t tmem_alloc_smem = smem + OFFSET_TMEM_ADDR;
 
@@ -206,8 +207,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
 
   if (warp_id == TMA_WARP) {
     if (elect_sync()) {
-      mbarrier_init(qkh_tma_barrier, 1);
+      mbarrier_init(qk_tma_barrier, 1);
       mbarrier_init(v_tma_barrier, 1);
+      mbarrier_init(h_tma_barrier, 1);
       mbarrier_init(mma_barrier, 1);
       prefetch_tensormap(&q_tmap);
       prefetch_tensormap(&k_tmap);
@@ -226,8 +228,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   }
   __syncthreads();
 
-  constexpr uint32_t QK_TMA_PHASE = 0U;
-  constexpr uint32_t QH_TMA_PHASE = 1U;
+  constexpr uint32_t TMA_PHASE = 0U;
   constexpr uint32_t QK_MMA_PHASE = 0U;
   constexpr uint32_t OV_MMA_PHASE = 1U;
   constexpr uint32_t QH_MMA_PHASE = 0U;
@@ -240,21 +241,23 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       BLOCK_V;
 
   if (warp_id == TMA_WARP && elect_sync()) {
-    tma_load_4d(matrix_a_smem, &q_tmap, 0, 0, 0, q_outer, qkh_tma_barrier);
-    tma_load_4d(matrix_b_smem, &k_tmap, 0, 0, 0, k_outer, qkh_tma_barrier);
+    tma_load_4d(q_smem, &q_tmap, 0, 0, 0, q_outer, qk_tma_barrier);
+    tma_load_4d(k_smem, &k_tmap, 0, 0, 0, k_outer, qk_tma_barrier);
     tma_load_3d(v_smem, &v_tmap, 0, v_row, 0, v_tma_barrier);
-    mbarrier_arrive_expect_tx(qkh_tma_barrier, A_SMEM_SIZE + B_SMEM_SIZE);
+    tma_load_4d(h_smem, &h_tmap, 0, v_start, 0, h_outer, h_tma_barrier);
+    mbarrier_arrive_expect_tx(qk_tma_barrier, Q_SMEM_SIZE + K_SMEM_SIZE);
     mbarrier_arrive_expect_tx(v_tma_barrier, V_SMEM_SIZE);
+    mbarrier_arrive_expect_tx(h_tma_barrier, H_SMEM_SIZE);
   }
   if (warp_id == MMA_WARP && elect_sync()) {
-    mbarrier_wait(qkh_tma_barrier, QK_TMA_PHASE);
+    mbarrier_wait(qk_tma_barrier, TMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    mma_swizzled<NUM_SWIZZLE_ATOMS>(0, matrix_a_smem, matrix_b_smem);
+    mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, k_smem);
     tcgen05_commit(mma_barrier);
   }
 
   nv_bfloat16 *attn_smem_ptr =
-      reinterpret_cast<nv_bfloat16 *>(smem_ptr + (matrix_a_smem - smem));
+      reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_smem - smem));
 
   if (warp_id < NUM_CUDA_WARPS) {
     mbarrier_wait(mma_barrier, QK_MMA_PHASE);
@@ -315,9 +318,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   __syncthreads();
 
   if (warp_id == MMA_WARP && elect_sync()) {
-    mbarrier_wait(v_tma_barrier, 0);
+    mbarrier_wait(v_tma_barrier, TMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    mma_noswizzle_64x64(OUTPUT_TMEM_COL, matrix_a_smem, v_smem);
+    mma_noswizzle_64x64(OUTPUT_TMEM_COL, attn_smem, v_smem);
     tcgen05_commit(mma_barrier);
   }
 
@@ -354,21 +357,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     }
   }
 
-  if (warp_id == TMA_WARP) {
-    mbarrier_wait(mma_barrier, OV_MMA_PHASE);
-    tcgen05_fence_after_thread_sync();
-  }
-  if (warp_id == TMA_WARP && elect_sync()) {
-    tma_load_4d(matrix_a_smem, &q_tmap, 0, 0, 0, q_outer, qkh_tma_barrier);
-    tma_load_4d(matrix_b_smem, &h_tmap, 0, v_start, 0, h_outer,
-                qkh_tma_barrier);
-    mbarrier_arrive_expect_tx(qkh_tma_barrier, A_SMEM_SIZE + B_SMEM_SIZE);
-  }
-
   if (warp_id == MMA_WARP && elect_sync()) {
-    mbarrier_wait(qkh_tma_barrier, QH_TMA_PHASE);
+    mbarrier_wait(h_tma_barrier, TMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    mma_swizzled<NUM_SWIZZLE_ATOMS>(0, matrix_a_smem, matrix_b_smem);
+    mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, h_smem);
     tcgen05_commit(mma_barrier);
   }
 
@@ -478,8 +470,10 @@ void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new_t,
       encode_tma(q_chunks.data_ptr(), total_num_qk_tiles, BLOCK_T, HEAD_DIM);
   auto k_tmap =
       encode_tma(k_chunks.data_ptr(), total_num_qk_tiles, BLOCK_T, HEAD_DIM);
-  auto v_tmap =
-      encode_v_tma(v_new_t.data_ptr(), total_num_v_rows * BLOCK_V, BLOCK_T);
+  CUtensorMap v_tmap;
+  init_tma_desc_3d(&v_tmap,
+                   reinterpret_cast<const __nv_bfloat16 *>(v_new_t.data_ptr()),
+                   total_num_v_rows * BLOCK_V, BLOCK_T, BLOCK_V, BLOCK_T);
   auto h_tmap =
       encode_tma(h.data_ptr(), total_num_output_tiles, VALUE_DIM, HEAD_DIM);
 
