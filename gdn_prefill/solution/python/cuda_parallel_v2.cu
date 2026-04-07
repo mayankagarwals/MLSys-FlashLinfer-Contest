@@ -176,9 +176,7 @@ void tma_load_tile_3d(uint32_t smem_addr, const CUtensorMap *tmap,
                       int warp_id) {
   if (warp_id == 0 && elect_sync()) {
     tma_load_3d(smem_addr, tmap, 0, row_offset, col_group_offset, mbar_addr);
-    asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-      :: "r"(mbar_addr), "r"(cp_bytes) : "memory");
+    mbarrier_arrive_expect_tx(mbar_addr, cp_bytes);
   }
 }
 
@@ -192,9 +190,7 @@ void tma_load_two_tiles_3d(
   if (warp_id == 0 && elect_sync()) {
     tma_load_3d(smem_addr_a, tmap_a, 0, row_a, col_group_a, mbar_addr);
     tma_load_3d(smem_addr_b, tmap_b, 0, row_b, col_group_b, mbar_addr);
-    asm volatile(
-      "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-      :: "r"(mbar_addr), "r"(total_cp_bytes) : "memory");
+    mbarrier_arrive_expect_tx(mbar_addr, total_cp_bytes);
   }
 }
 
@@ -282,27 +278,27 @@ ComputeAKernel_TC(
   __nv_bfloat16 *s_B = reinterpret_cast<__nv_bfloat16 *>(smem + BM * BK * 2);  // [64,128] tile = 16KB
   char *after_tiles = smem + BM * BK * 2 + BN * BK * 2;
   uint64_t *mbars = reinterpret_cast<uint64_t *>(after_tiles);  // 2 mbarriers: [0]=TMA, [1]=MMA
-  int *tmem_buf = reinterpret_cast<int *>(mbars + 2);
+  uint32_t *tmem_buf = reinterpret_cast<uint32_t *>(mbars + 2);
   float *s_result = reinterpret_cast<float *>(tmem_buf + 1);  // [64*64] = 16KB
   float *s_g = s_result + kBT * kBT;                           // [64]
   float *s_beta = s_g + kBT;                                   // [64]
 
-  const uint32_t A_smem_base = cvt_smem_ptr(s_A);
-  const uint32_t B_smem_base = cvt_smem_ptr(s_B);
-  const uint32_t mbar_tma = cvt_smem_ptr(&mbars[0]);
-  const uint32_t mbar_mma = cvt_smem_ptr(&mbars[1]);
+  const uint32_t A_smem_base = __cvta_generic_to_shared(s_A);
+  const uint32_t B_smem_base = __cvta_generic_to_shared(s_B);
+  const uint32_t mbar_tma = __cvta_generic_to_shared(&mbars[0]);
+  const uint32_t mbar_mma = __cvta_generic_to_shared(&mbars[1]);
 
   // Init mbarriers + alloc TMEM
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
-    tcgen05_alloc(cvt_smem_ptr(tmem_buf), BN);
+    tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), BN);
   }
   __syncthreads();
-  const int taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+  const uint32_t taddr = tmem_buf[0];
+  constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
 
   // TMA load k into s_A [128,128] and s_B [64,128]
   // 3D coords: (0, row_offset=cstart, col_group=k_head * K / 8)
@@ -321,7 +317,7 @@ ComputeAKernel_TC(
   __syncthreads();
 
   // MMA: batch all 8 K-tiles, single commit
-  tcgen05_fence();
+  tcgen05_fence_after_thread_sync();
   if (warp_id == 0 && elect_sync()) {
     for (int ki = 0; ki < BK / MMA_K; ki++) {
       uint32_t a_base = A_smem_base + ki * 2 * (BM * 16);
@@ -334,12 +330,13 @@ ComputeAKernel_TC(
     tcgen05_commit(mbar_mma);
   }
   mbarrier_wait(mbar_mma, 0);
-  tcgen05_fence();
+  tcgen05_fence_after_thread_sync();
 
   // Read TMEM → s_result [64,64] (padded), only first 64 rows of 128x64 output
   for (int n = 0; n < BN / 8; n++) {
     float tmp[8];
-    tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+    tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+    tcgen05_wait_ld();
     int my_row = warp_id * 32 + (tid % 32);
     if (my_row < kBT) {
       for (int c = 0; c < 8; c++)
@@ -403,25 +400,25 @@ ComputeQKKernel_TC(
   __nv_bfloat16 *s_B = reinterpret_cast<__nv_bfloat16 *>(smem + BM * BK * 2);
   char *after_tiles = smem + BM * BK * 2 + BN * BK * 2;
   uint64_t *mbars = reinterpret_cast<uint64_t *>(after_tiles);
-  int *tmem_buf = reinterpret_cast<int *>(mbars + 2);
+  uint32_t *tmem_buf = reinterpret_cast<uint32_t *>(mbars + 2);
   float *s_result = reinterpret_cast<float *>(tmem_buf + 1);
   float *s_g = s_result + kBT * kBT;
 
-  const uint32_t A_smem_base = cvt_smem_ptr(s_A);
-  const uint32_t B_smem_base = cvt_smem_ptr(s_B);
-  const uint32_t mbar_tma = cvt_smem_ptr(&mbars[0]);
-  const uint32_t mbar_mma = cvt_smem_ptr(&mbars[1]);
+  const uint32_t A_smem_base = __cvta_generic_to_shared(s_A);
+  const uint32_t B_smem_base = __cvta_generic_to_shared(s_B);
+  const uint32_t mbar_tma = __cvta_generic_to_shared(&mbars[0]);
+  const uint32_t mbar_mma = __cvta_generic_to_shared(&mbars[1]);
 
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
-    tcgen05_alloc(cvt_smem_ptr(tmem_buf), BN);
+    tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), BN);
   }
   __syncthreads();
-  const int taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+  const uint32_t taddr = tmem_buf[0];
+  constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
 
   // TMA load q into s_A [128,128] and k into s_B [64,128]
   int q_col = (int)(q_head * kK / 8);
@@ -437,7 +434,7 @@ ComputeQKKernel_TC(
   __syncthreads();
 
   // MMA: q @ k^T
-  tcgen05_fence();
+  tcgen05_fence_after_thread_sync();
   if (warp_id == 0 && elect_sync()) {
     for (int ki = 0; ki < BK / MMA_K; ki++) {
       uint32_t a_base = A_smem_base + ki * 2 * (BM * 16);
@@ -450,12 +447,13 @@ ComputeQKKernel_TC(
     tcgen05_commit(mbar_mma);
   }
   mbarrier_wait(mbar_mma, 0);
-  tcgen05_fence();
+  tcgen05_fence_after_thread_sync();
 
   // Read TMEM → s_result [64,64]
   for (int n = 0; n < BN / 8; n++) {
     float tmp[8];
-    tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+    tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+    tcgen05_wait_ld();
     int my_row = warp_id * 32 + (tid % 32);
     if (my_row < kBT)
       for (int c = 0; c < 8; c++)
@@ -576,22 +574,22 @@ ComputeWUKernel_TC(
       smem + BM * BK_inner * 2);
   char *after_tiles = smem + BM * BK_inner * 2 + BN * BK_inner * 2;
   uint64_t *mbars = reinterpret_cast<uint64_t *>(after_tiles);
-  int *tmem_buf = reinterpret_cast<int *>(mbars + 1);
+  uint32_t *tmem_buf = reinterpret_cast<uint32_t *>(mbars + 1);
   float *s_bg = reinterpret_cast<float *>(tmem_buf + 1);
 
-  const uint32_t Ainv_smem = cvt_smem_ptr(s_Ainv);
-  const uint32_t input_smem = cvt_smem_ptr(s_input);
-  const uint32_t mbar_addr = cvt_smem_ptr(mbars);
+  const uint32_t Ainv_smem = __cvta_generic_to_shared(s_Ainv);
+  const uint32_t input_smem = __cvta_generic_to_shared(s_input);
+  const uint32_t mbar_addr = __cvta_generic_to_shared(mbars);
 
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_addr, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
-    tcgen05_alloc(cvt_smem_ptr(tmem_buf), BN);
+    tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), BN);
   }
   __syncthreads();
-  const int taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+  const uint32_t taddr = tmem_buf[0];
+  constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
 
   if (tid < kBT) {
     float b = (tid < clen) ? beta_f[(cstart + tid) * kHv + hv] : 0.0f;
@@ -628,7 +626,7 @@ ComputeWUKernel_TC(
 
   int phase = 0;
   for (int ki = 0; ki < BK_inner / MMA_K; ki++) {
-    tcgen05_fence();
+    tcgen05_fence_after_thread_sync();
     if (warp_id == 0 && elect_sync()) {
       uint32_t a_base = Ainv_smem + ki * 2 * (BM * 16);
       uint32_t b_base = input_smem + ki * 2 * (BN * 16);
@@ -640,11 +638,12 @@ ComputeWUKernel_TC(
     mbarrier_wait(mbar_addr, phase);
     phase ^= 1;
   }
-  tcgen05_fence();
+  tcgen05_fence_after_thread_sync();
 
   for (int n = 0; n < BN / 8; n++) {
     float tmp[8];
-    tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+    tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+    tcgen05_wait_ld();
     int my_row = warp_id * 32 + (tid % 32);
     if (my_row < clen) {
       if (is_w) {
@@ -714,29 +713,29 @@ FusedPrepKernel(
   __nv_bfloat16 *s_B_tiles = reinterpret_cast<__nv_bfloat16 *>(smem + BM * BK * 2);      // [64,128] tile = 16KB
   char *after_tiles = smem + BM * BK * 2 + BN * BK * 2;
   uint64_t *mbars = reinterpret_cast<uint64_t *>(after_tiles);  // 2 mbarriers: [0]=TMA, [1]=MMA
-  int *tmem_buf = reinterpret_cast<int *>(mbars + 2);
+  uint32_t *tmem_buf = reinterpret_cast<uint32_t *>(mbars + 2);
   float *s_result = reinterpret_cast<float *>(tmem_buf + 1);       // [64*64] = 16KB
   float *s_result_inv = s_result + kBT * kBT;                      // [64*64] = 16KB
   float *s_g = s_result_inv + kBT * kBT;                           // [64]
   float *s_beta = s_g + kBT;                                       // [64]
   float *s_bg = s_beta + kBT;                                      // [64]
 
-  const uint32_t A_smem_base = cvt_smem_ptr(s_A_tiles);
-  const uint32_t B_smem_base = cvt_smem_ptr(s_B_tiles);
-  const uint32_t mbar_tma = cvt_smem_ptr(&mbars[0]);
-  const uint32_t mbar_mma = cvt_smem_ptr(&mbars[1]);
+  const uint32_t A_smem_base = __cvta_generic_to_shared(s_A_tiles);
+  const uint32_t B_smem_base = __cvta_generic_to_shared(s_B_tiles);
+  const uint32_t mbar_tma = __cvta_generic_to_shared(&mbars[0]);
+  const uint32_t mbar_mma = __cvta_generic_to_shared(&mbars[1]);
 
   // Init mbarriers + alloc TMEM
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
-    tcgen05_alloc(cvt_smem_ptr(tmem_buf), BN);
+    tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), BN);
   }
   __syncthreads();
-  const int taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+  const uint32_t taddr = tmem_buf[0];
+  constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
 
   // ════════════════════════════════════════════════════════════
   // Phase 1: Compute A_mat (same as ComputeAKernel_TC)
@@ -758,7 +757,7 @@ FusedPrepKernel(
   __syncthreads();
 
   // MMA: batch all 8 K-tiles, single commit
-  tcgen05_fence();
+  tcgen05_fence_after_thread_sync();
   if (warp_id == 0 && elect_sync()) {
     for (int ki = 0; ki < BK / MMA_K; ki++) {
       uint32_t a_base = A_smem_base + ki * 2 * (BM * 16);
@@ -772,12 +771,13 @@ FusedPrepKernel(
   }
   mbarrier_wait(mbar_mma, 0);
   if (warp_id == 0 && elect_sync()) mbarrier_init(mbar_mma, 1);
-  tcgen05_fence();
+  tcgen05_fence_after_thread_sync();
 
   // Read TMEM → s_result [64,64] (padded), only first 64 rows of 128x64 output
   for (int n = 0; n < BN / 8; n++) {
     float tmp[8];
-    tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+    tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+    tcgen05_wait_ld();
     int my_row = warp_id * 32 + (tid % 32);
     if (my_row < kBT) {
       for (int c = 0; c < 8; c++)
@@ -1197,7 +1197,7 @@ FusedPrepKernel(
     // 4 K-tiles (BK_inner=64, MMA_K=16)
     int phase = 0;
     for (int ki = 0; ki < BK_inner / MMA_K; ki++) {
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
       if (warp_id == 0 && elect_sync()) {
         uint32_t a_base = Ainv_smem + ki * 2 * (BM * 16);
         uint32_t b_base = input_smem + ki * 2 * (BN * 16);
@@ -1209,12 +1209,13 @@ FusedPrepKernel(
       mbarrier_wait(mbar_mma, phase);
       phase ^= 1;
     }
-    tcgen05_fence();
+    tcgen05_fence_after_thread_sync();
 
     // Read TMEM → write to global w_out or u_out
     for (int n = 0; n < BN / 8; n++) {
       float tmp[8];
-      tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+      tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+      tcgen05_wait_ld();
       int my_row = warp_id * 32 + (tid % 32);
       if (my_row < clen) {
         if (is_w) {
@@ -1293,15 +1294,15 @@ FusedRecurrenceOutput(
   __nv_bfloat16 *s_tile_b = reinterpret_cast<__nv_bfloat16 *>(dyn + TC_BM * TC_BK * 2);  // [64,128] = 16KB
   char *after_tiles = dyn + TC_BM * TC_BK * 2 + TC_BN * TC_BK * 2;
   uint64_t *mbars = reinterpret_cast<uint64_t *>(after_tiles);  // 2 mbarriers: [0]=TMA, [1]=MMA
-  int *tmem_buf = reinterpret_cast<int *>(mbars + 2);
+  uint32_t *tmem_buf = reinterpret_cast<uint32_t *>(mbars + 2);
   float *s_gc = reinterpret_cast<float *>(tmem_buf + 1);                          // [64]
   float *s_wh = s_gc + kBT;                                                       // [64*64] = 16KB
   __nv_bfloat16 *s_vnew = reinterpret_cast<__nv_bfloat16 *>(s_wh + kBT * TC_BN); // [64*32] = 4KB
 
-  const uint32_t tileA_smem = cvt_smem_ptr(s_tile_a);
-  const uint32_t tileB_smem = cvt_smem_ptr(s_tile_b);
-  const uint32_t mbar_tma = cvt_smem_ptr(&mbars[0]);
-  const uint32_t mbar_mma = cvt_smem_ptr(&mbars[1]);
+  const uint32_t tileA_smem = __cvta_generic_to_shared(s_tile_a);
+  const uint32_t tileB_smem = __cvta_generic_to_shared(s_tile_b);
+  const uint32_t mbar_tma = __cvta_generic_to_shared(&mbars[0]);
+  const uint32_t mbar_mma = __cvta_generic_to_shared(&mbars[1]);
 
   // Initialize state h
   if (state0) {
@@ -1320,13 +1321,13 @@ FusedRecurrenceOutput(
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
-    tcgen05_alloc(cvt_smem_ptr(tmem_buf), TC_BN);
+    tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), TC_BN);
   }
   __syncthreads();
-  const int taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<TC_BM, TC_BN>();
+  const uint32_t taddr = tmem_buf[0];
+  constexpr uint32_t idesc = make_tcgen05_idesc(TC_BM, TC_BN);
 
   // TMA mbarrier phase tracking (persists across chunks)
   int tma_phase = 0;
@@ -1360,7 +1361,7 @@ FusedRecurrenceOutput(
 
     // MMA: issue ALL 8 K-tiles, single commit at end
     {
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
       if (warp_id == 0 && elect_sync()) {
         for (int ki = 0; ki < TC_BK / MMA_K; ki++) {
           uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1377,13 +1378,14 @@ FusedRecurrenceOutput(
       if (warp_id == 0 && elect_sync())
         mbarrier_init(mbar_mma, 1);
       __syncthreads();
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
     }
 
     // Read w@h^T TMEM → s_wh; overlap with g_cumsum load
     for (int n = 0; n < TC_BN / 8; n++) {
       float tmp[8];
-      tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+      tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+      tcgen05_wait_ld();
       int my_row = warp_id * 32 + (tid % 32);
       if (my_row < kBT)
         for (int c = 0; c < 8; c++)
@@ -1420,7 +1422,7 @@ FusedRecurrenceOutput(
     // Step 3: q@h^T via tcgen05 (h STILL in tile_b, q just loaded into tile_a)
     // ════════════════════════════════════════════════
     {
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
       if (warp_id == 0 && elect_sync()) {
         for (int ki = 0; ki < TC_BK / MMA_K; ki++) {
           uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1433,13 +1435,14 @@ FusedRecurrenceOutput(
       mbarrier_wait(mbar_mma, 0);
       if (warp_id == 0 && elect_sync()) mbarrier_init(mbar_mma, 1);
       __syncthreads();
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
     }
 
     // Read q@h^T TMEM → s_wh (first kBV cols = q@h^T result for output)
     for (int n = 0; n < TC_BN / 8; n++) {
       float tmp[8];
-      tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+      tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+      tcgen05_wait_ld();
       int my_row = warp_id * 32 + (tid % 32);
       if (my_row < kBT)
         for (int c = 0; c < 8; c++)
@@ -1467,7 +1470,7 @@ FusedRecurrenceOutput(
 
     // MMA q@k^T — batch all K-tiles, single commit
     {
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
       if (warp_id == 0 && elect_sync()) {
         for (int ki = 0; ki < TC_BK / MMA_K; ki++) {
           uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1480,13 +1483,14 @@ FusedRecurrenceOutput(
       mbarrier_wait(mbar_mma, 0);
       if (warp_id == 0 && elect_sync()) mbarrier_init(mbar_mma, 1);
       __syncthreads();
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
     }
 
     // Read q@k^T → s_wh [64,64]
     for (int n = 0; n < TC_BN / 8; n++) {
       float tmp[8];
-      tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+      tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+      tcgen05_wait_ld();
       int my_row = warp_id * 32 + (tid % 32);
       if (my_row < kBT)
         for (int c = 0; c < 8; c++)
@@ -1554,7 +1558,7 @@ FusedRecurrenceOutput(
       __syncthreads();
 
       // MMA: attn[128,64] @ vnew_T[64,64]^T → C[128,64]
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
       if (warp_id == 0 && elect_sync()) {
         for (int ki = 0; ki < ATTN_BK / MMA_K; ki++) {
           uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1573,12 +1577,13 @@ FusedRecurrenceOutput(
                        mbar_tma, cp_tileB, warp_id);
 
       if (warp_id == 0 && elect_sync()) mbarrier_init(mbar_mma, 1);
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
 
       // Read TMEM → scale and add to output
       for (int n = 0; n < kBV / 8; n++) {
         float tmp[8];
-        tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+        tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+        tcgen05_wait_ld();
         int my_row = warp_id * 32 + (tid % 32);
         if (my_row < clen) {
           #pragma unroll
@@ -1668,7 +1673,7 @@ FusedRecurrenceOutput(
 
       // MMA: k^T @ vnew_gated → TMEM [128,64], 4 K-tiles
       {
-        tcgen05_fence();
+        tcgen05_fence_after_thread_sync();
         if (warp_id == 0 && elect_sync()) {
           for (int ki = 0; ki < BK_kv / MMA_K; ki++) {
             uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1684,13 +1689,14 @@ FusedRecurrenceOutput(
         if (warp_id == 0 && elect_sync())
           mbarrier_init(mbar_mma, 1);
         __syncthreads();
-        tcgen05_fence();
+        tcgen05_fence_after_thread_sync();
       }
 
       // Read TMEM → add to s_h[bv][col_k]
       for (int n = 0; n < TC_BN / 8; n++) {
         float tmp[8];
-        tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+        tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+        tcgen05_wait_ld();
         int col_k = warp_id * 32 + (tid % 32);
         for (int c = 0; c < 8; c++) {
           int bv = n * 8 + c;
@@ -1770,15 +1776,15 @@ HRecurrenceKernel(
   __nv_bfloat16 *s_tile_b = reinterpret_cast<__nv_bfloat16 *>(dyn + TC_BM * TC_BK * 2);  // [64,128] = 16KB
   char *after_tiles = dyn + TC_BM * TC_BK * 2 + TC_BN * TC_BK * 2;
   uint64_t *mbars = reinterpret_cast<uint64_t *>(after_tiles);  // 2 mbarriers: [0]=TMA, [1]=MMA
-  int *tmem_buf = reinterpret_cast<int *>(mbars + 2);
+  uint32_t *tmem_buf = reinterpret_cast<uint32_t *>(mbars + 2);
   float *s_gc = reinterpret_cast<float *>(tmem_buf + 1);                          // [64]
   float *s_wh = s_gc + kBT;                                                       // [64*64] = 16KB
   __nv_bfloat16 *s_vnew = reinterpret_cast<__nv_bfloat16 *>(s_wh + kBT * TC_BN); // [64*32] = 4KB
 
-  const uint32_t tileA_smem = cvt_smem_ptr(s_tile_a);
-  const uint32_t tileB_smem = cvt_smem_ptr(s_tile_b);
-  const uint32_t mbar_tma = cvt_smem_ptr(&mbars[0]);
-  const uint32_t mbar_mma = cvt_smem_ptr(&mbars[1]);
+  const uint32_t tileA_smem = __cvta_generic_to_shared(s_tile_a);
+  const uint32_t tileB_smem = __cvta_generic_to_shared(s_tile_b);
+  const uint32_t mbar_tma = __cvta_generic_to_shared(&mbars[0]);
+  const uint32_t mbar_mma = __cvta_generic_to_shared(&mbars[1]);
 
   // Initialize state h
   if (state0) {
@@ -1797,13 +1803,13 @@ HRecurrenceKernel(
   if (warp_id == 0 && elect_sync()) {
     mbarrier_init(mbar_tma, 1);
     mbarrier_init(mbar_mma, 1);
-    asm volatile("fence.mbarrier_init.release.cluster;");
+    fence_mbarrier_init();
   } else if (warp_id == 1) {
-    tcgen05_alloc(cvt_smem_ptr(tmem_buf), TC_BN);
+    tcgen05_alloc(__cvta_generic_to_shared(tmem_buf), TC_BN);
   }
   __syncthreads();
-  const int taddr = tmem_buf[0];
-  constexpr uint32_t idesc = make_tcgen05_idesc<TC_BM, TC_BN>();
+  const uint32_t taddr = tmem_buf[0];
+  constexpr uint32_t idesc = make_tcgen05_idesc(TC_BM, TC_BN);
 
   // TMA mbarrier phase tracking
   int tma_phase = 0;
@@ -1846,7 +1852,7 @@ HRecurrenceKernel(
 
     // MMA: w @ h^T
     {
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
       if (warp_id == 0 && elect_sync()) {
         for (int ki = 0; ki < TC_BK / MMA_K; ki++) {
           uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1862,13 +1868,14 @@ HRecurrenceKernel(
       if (warp_id == 0 && elect_sync())
         mbarrier_init(mbar_mma, 1);
       __syncthreads();
-      tcgen05_fence();
+      tcgen05_fence_after_thread_sync();
     }
 
     // Read w@h^T TMEM -> s_wh; overlap with g_cumsum load
     for (int n = 0; n < TC_BN / 8; n++) {
       float tmp[8];
-      tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+      tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+      tcgen05_wait_ld();
       int my_row = warp_id * 32 + (tid % 32);
       if (my_row < kBT)
         for (int c = 0; c < 8; c++)
@@ -1964,7 +1971,7 @@ HRecurrenceKernel(
 
       // MMA: k^T @ vnew_gated -> TMEM [128,64], 4 K-tiles
       {
-        tcgen05_fence();
+        tcgen05_fence_after_thread_sync();
         if (warp_id == 0 && elect_sync()) {
           for (int ki = 0; ki < BK_kv / MMA_K; ki++) {
             uint32_t a_base = tileA_smem + ki * 2 * (TC_BM * 16);
@@ -1980,7 +1987,7 @@ HRecurrenceKernel(
         if (warp_id == 0 && elect_sync())
           mbarrier_init(mbar_mma, 1);
         __syncthreads();
-        tcgen05_fence();
+        tcgen05_fence_after_thread_sync();
       }
 
       // Prefetch w for NEXT chunk (overlapped with TMEM read)
@@ -1993,7 +2000,8 @@ HRecurrenceKernel(
       // Read TMEM -> add to s_h[bv][col_k]
       for (int n = 0; n < TC_BN / 8; n++) {
         float tmp[8];
-        tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+        tcgen05_ld<SHAPE::_32x32b, 8>(tmp, warp_id * 32, n * 8);
+        tcgen05_wait_ld();
         int col_k = warp_id * 32 + (tid % 32);
         for (int c = 0; c < 8; c++) {
           int bv = n * 8 + c;
