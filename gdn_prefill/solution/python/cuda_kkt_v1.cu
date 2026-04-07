@@ -132,6 +132,7 @@ void kkt_v1_kernel_cutlass(
         constexpr uint64_t desc_base = (desc_encode(8 * 128) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
         const uint32_t K_smem = smem + stage_id * K_size;
 
+        static_assert(BT * NUM_STAGES <= 512);
         const uint32_t acc_tmem = BT * stage_id;
 
         mbarrier_wait(tma_mbar_addr + stage_id * 8, tma_parity);  // wait for TMA data to arrive
@@ -204,7 +205,7 @@ void kkt_v1_kernel_cutlass(
 
         // parallel scan among half warp (16)
         // illustrating for 4 lanes
-        // lane  | lane0 | lane1 | lane2    | lane4
+        // lane  | lane0 | lane1 | lane2    | lane3
         // iter0 | a0    |    a1 |       a2 |          a3
         // iter1 | a0    | a0+a1 |    a1+a2 |       a2+a3
         // iter2 | a0    | a0+a1 | a0+a1+a2 | a0+a1+a2+a3
@@ -218,11 +219,11 @@ void kkt_v1_kernel_cutlass(
           g_warp_sum_ptr[warp_id * 2 + (lane_id / 16)] = g;
         bar_sync<1>(128);
 
-        // add warp sum from other warps
+        // add warp sum from lower warps
         // we finish doing g cumsum in registers
-        if (warp_id >= 1) g += g_warp_sum_ptr[0 + (lane_id / 16)];
-        if (warp_id >= 2) g += g_warp_sum_ptr[1 + (lane_id / 16)];
-        if (warp_id >= 3) g += g_warp_sum_ptr[2 + (lane_id / 16)];
+        if (warp_id >= 1) g += g_warp_sum_ptr[0 * 2 + (lane_id / 16)];
+        if (warp_id >= 2) g += g_warp_sum_ptr[1 * 2 + (lane_id / 16)];
+        if (warp_id >= 3) g += g_warp_sum_ptr[2 * 2 + (lane_id / 16)];
 
         // store to gmem for future use
         if (off_t < eos)
@@ -250,8 +251,8 @@ void kkt_v1_kernel_cutlass(
         for (int col = 0; col < BT; col++) {
           kkt[col] = __shfl_up_sync(0xFFFF'FFFF, kkt[col], 16);  // broadcast from lower half to upper half
 
-          // strict lower mask
-          if (row > col) {
+          // strict lower mask + time mask
+          if (row > col && bos + chunk_id * BT + col < eos) {
             kkt[col] *= beta * __expf(g - g_cu_smem_ptr[(lane_id / 16) * BT + col]);
           } else {
             kkt[col] = 0;
@@ -268,11 +269,11 @@ void kkt_v1_kernel_cutlass(
         if (stage_id == 0)
           mma_parity ^= 1;
     }
-
-    bar_sync<1>(128);
-    if (warp_id == 0)
-      tcgen05_dealloc(0, 512);
   }
+
+  __syncthreads();
+  if (warp_id == 0)
+    tcgen05_dealloc(0, 512);
 }
 
 static
@@ -307,11 +308,11 @@ void kkt_v1(
   TensorView beta,
   TensorView A,
   TensorView cu_seqlens,
-  TensorView chunk_indices
+  TensorView chunk_indices,
+  int total_num_chunks
 ) {
   const int T = K.size(0);
   const int Hg = K.size(1);
-  const int total_num_chunks = chunk_indices.size(0);
 
   auto K_tmap = encode_tma(K.data_ptr(), T, Hg, K_dim);
 
@@ -325,7 +326,7 @@ void kkt_v1(
   auto *cu_seqlens_ptr    = reinterpret_cast<const int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_indices_ptr = reinterpret_cast<const int32_t *>(chunk_indices.data_ptr());
 
-  constexpr int NUM_STAGES = 3;
+  constexpr int NUM_STAGES = 4;
   constexpr int smem_size = K_size * NUM_STAGES
                           + (4 + BT) * 2 * sizeof(float)  // scratchpad for g_cu
                           + 3 * NUM_STAGES * 8            // tma, mma, epi mbar for each stage

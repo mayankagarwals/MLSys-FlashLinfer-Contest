@@ -5,7 +5,6 @@ import triton
 import triton.language as tl
 from torch import Tensor
 from triton.language.extra import libdevice
-from .cuda_kernels import mod
 
 
 def alloc_fn(size: int, alignment: int, stream: int | None):
@@ -626,7 +625,7 @@ def run(
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    mod.kkt_v1(
+    chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, Hg)](
         k,
         A_log,
         a,
@@ -637,24 +636,12 @@ def run(
         A,
         cu_seqlens,
         chunk_indices,
+        H=H,
+        Hg=Hg,
+        K_dim=K_dim,
+        BT=BT,
+        num_warps=4,
     )
-    # chunk_scaled_dot_kkt_fwd_kernel[(total_num_chunks, Hg)](
-    #     k,
-    #     A_log,
-    #     a,
-    #     dt_bias,
-    #     b,
-    #     g_cu,
-    #     beta,
-    #     A,
-    #     cu_seqlens,
-    #     chunk_indices,
-    #     H=H,
-    #     Hg=Hg,
-    #     K_dim=K_dim,
-    #     BT=BT,
-    #     num_warps=4,
-    # )
 
     # - compute Ai = inverse(I + strictTriu(A))
     # - obtain WY representation: U = Ai @ V and W = (Ai * g_cu) @ K
