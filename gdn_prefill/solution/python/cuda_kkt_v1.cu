@@ -2,20 +2,27 @@
 //   seq_id, chunk_id = chunk_indices[global_chunk_id]
 //
 //   # TMA warp
-//   load k
+//   wait MMA to release buffer
+//   load k from gmem->smem
+//   arrive TMA
 //
 //   # MMA warp
+//   wait TMA to arrive
+//   wait epilogue to release buffer
 //   kkt = k @ k.T  - [BT, BT] = [64, 64]
+//   arrive MMA
 //
 //   # CUDA warp
-//   load b, a, A_log, dt_bias
+//   load b, a, A_log, dt_bias from gmem->rmem
 //   compute beta, g
 //   compute g_cu
 //   store beta, g_cu to gmem
 //
-//   compute Gamma = exp(g_cu - g_cu.T)
-//
-//   wait kkt MMA
+//   wait MMA to arrive
+//   load kkt from tmem->rmem
+//   arrive epilogue
+//   A = kkt * beta * exp(g_cu - g_cu.T)
+//   store A to gmem
 
 #include "cuda_utils.h"
 

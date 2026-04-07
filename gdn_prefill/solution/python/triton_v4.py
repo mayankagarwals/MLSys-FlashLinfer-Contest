@@ -467,7 +467,7 @@ def chunk_gated_delta_rule_fwd_kernel_h(
         tl.store(
             v_new_ptr + (offs_t * stride_v + offs_v_block),
             v_new,
-            mask=mask_t,
+            mask=offs_t < seqlen,
         )
 
         # apply g
