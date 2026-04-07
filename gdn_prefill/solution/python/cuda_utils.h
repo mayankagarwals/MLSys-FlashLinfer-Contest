@@ -180,7 +180,8 @@ void prefetch_tensormap(const void *tmap_ptr) {
 // TMA device-side loads
 __device__ __forceinline__
 void tma_load_2d(uint32_t smem_addr, const void *tmap_ptr,
-                 int x, int y, uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
+                 int x, int y,
+                 uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
   asm volatile(
     "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
     "[%0], [%1, {%2, %3}], [%4], %5;"
@@ -190,12 +191,69 @@ void tma_load_2d(uint32_t smem_addr, const void *tmap_ptr,
 
 __device__ __forceinline__
 void tma_load_3d(uint32_t smem_addr, const void *tmap_ptr,
-                 int x, int y, int z, uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
+                 int x, int y, int z,
+                 uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
   asm volatile(
     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
     "[%0], [%1, {%2, %3, %4}], [%5], %6;"
     :: "r"(smem_addr), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
        "r"(mbar_addr), "l"(cache_policy) : "memory");
+}
+
+__device__ __forceinline__
+void tma_load_4d(uint32_t smem_addr, const void *tmap_ptr,
+                 int x, int y, int z, int w,
+                 uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
+  asm volatile(
+    "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+    "[%0], [%1, {%2, %3, %4, %5}], [%6], %7;"
+    :: "r"(smem_addr), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
+       "r"(mbar_addr), "l"(cache_policy) : "memory");
+}
+
+// TMA device-side stores
+__device__ __forceinline__
+void tma_store_2d(const void *tmap_ptr, uint32_t smem_addr, 
+                 int x, int y,
+                 uint64_t cache_policy = EVICT_NORMAL) {
+  asm volatile(
+    "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group.L2::cache_hint "
+    "[%0, {%1, %2}], [%3], %4;"
+    :: "l"(tmap_ptr), "r"(x), "r"(y),
+       "r"(smem_addr), "l"(cache_policy) : "memory");
+}
+
+__device__ __forceinline__
+void tma_store_3d(const void *tmap_ptr, uint32_t smem_addr, 
+                 int x, int y, int z,
+                 uint64_t cache_policy = EVICT_NORMAL) {
+  asm volatile(
+    "cp.async.bulk.tensor.3d.global.shared::cta.bulk_group.L2::cache_hint "
+    "[%0, {%1, %2, %3}], [%4], %5;"
+    :: "l"(tmap_ptr), "r"(x), "r"(y), "r"(z),
+       "r"(smem_addr), "l"(cache_policy) : "memory");
+}
+
+__device__ __forceinline__
+void tma_store_4d(const void *tmap_ptr, uint32_t smem_addr, 
+                 int x, int y, int z, int w,
+                 uint64_t cache_policy = EVICT_NORMAL) {
+  asm volatile(
+    "cp.async.bulk.tensor.4d.global.shared::cta.bulk_group.L2::cache_hint "
+    "[%0, {%1, %2, %3, %4}], [%5], %6;"
+    :: "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
+       "r"(smem_addr), "l"(cache_policy) : "memory");
+}
+
+__device__ __forceinline__
+void cp_async_bulk_commit_group() {
+  asm volatile("cp.async.bulk.commit_group;");
+}
+
+template <int N>
+__device__ __forceinline__
+void cp_async_bulk_wait_group_read() {
+  asm volatile("cp.async.bulk.wait_group.read %0;" :: "n"(N));
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -263,9 +321,7 @@ void mbarrier_wait(uint32_t mbar_addr, int phase) {
 
 __device__ __forceinline__
 void mbarrier_arrive(uint32_t mbar_addr) {
-  asm volatile(
-    "mbarrier.arrive.relaxed.cta.shared::cta.b64 _, [%0], %1;"
-    :: "r"(mbar_addr) : "memory");
+  asm volatile("mbarrier.arrive.relaxed.cta.shared::cta.b64 _, [%0];" :: "r"(mbar_addr) : "memory");
 }
 
 __device__ __forceinline__
@@ -347,19 +403,22 @@ void tcgen05_commit(uint32_t mbar_addr) {
 
 template <auto> struct ptx_str{};
 
-enum class SHAPE { _32x32b, _16x256b };
+enum class SHAPE { _32x32b, _16x128b, _16x256b };
 template<> struct ptx_str<SHAPE::_32x32b>  { static constexpr char value[] = ".32x32b"; };
+template<> struct ptx_str<SHAPE::_16x128b> { static constexpr char value[] = ".16x128b"; };
 template<> struct ptx_str<SHAPE::_16x256b> { static constexpr char value[] = ".16x256b"; };
 
 // each 32x32b tile uses 1 register per thread
 // each 16x256b tile uses 4 registers per thread
 template <SHAPE shape> struct _regs_per_tile{};
 template<> struct _regs_per_tile<SHAPE::_32x32b>  { static constexpr int value = 1; };
+template<> struct _regs_per_tile<SHAPE::_16x128b> { static constexpr int value = 2; };
 template<> struct _regs_per_tile<SHAPE::_16x256b> { static constexpr int value = 4; };
 
 template <SHAPE shape, int NUM>
 __device__ inline
-void tcgen05_ld(float *tmp, uint32_t row, uint32_t col) {
+void tcgen05_ld(void *tmp_, uint32_t row, uint32_t col) {
+  float *tmp = reinterpret_cast<float *>(tmp_);
   uint32_t addr = (row << 16u) | col;
 
   constexpr int NUM_REGS = _regs_per_tile<shape>::value * NUM;
@@ -459,7 +518,8 @@ void tcgen05_ld(float *tmp, uint32_t row, uint32_t col) {
 
 template <SHAPE shape, int NUM>
 __device__ inline
-void tcgen05_st(uint32_t row, uint32_t col, float *tmp) {
+void tcgen05_st(uint32_t row, uint32_t col, const void *tmp_) {
+  const float *tmp = reinterpret_cast<const float *>(tmp_);
   uint32_t addr = (row << 16u) | col;
 
   constexpr int NUM_REGS = _regs_per_tile<shape>::value * NUM;
@@ -610,8 +670,38 @@ void ldmatrix_trans(uint32_t *data, uint32_t addr) {
                 : "r"(addr));
 }
 
+template <int num>
+__device__ __forceinline__
+void stmatrix(uint32_t addr, uint32_t *data) {
+  static_assert(num == 1 || num == 2 || num == 4);
+  if constexpr (num == 1)
+    asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%1], {%0};"
+                :: "r"(data[0]), "r"(addr));
+  else if constexpr (num == 2)
+    asm volatile("stmatrix.sync.aligned.m8n8.x2.shared.b16 [%2], {%0, %1};"
+                :: "r"(data[0]), "r"(data[1]), "r"(addr));
+  else if constexpr (num == 4)
+    asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%4], {%0, %1, %2, %3};"
+                :: "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]), "r"(addr));
+}
+
+template <int num>
+__device__ __forceinline__
+void stmatrix_trans(uint32_t addr, uint32_t *data) {
+  static_assert(num == 1 || num == 2 || num == 4);
+  if constexpr (num == 1)
+    asm volatile("stmatrix.sync.aligned.m8n8.x1.trans.shared.b16 [%1], {%0};"
+                :: "r"(data[0]), "r"(addr));
+  else if constexpr (num == 2)
+    asm volatile("stmatrix.sync.aligned.m8n8.x2.trans.shared.b16 [%2], {%0, %1};"
+                :: "r"(data[0]), "r"(data[1]), "r"(addr));
+  else if constexpr (num == 4)
+    asm volatile("stmatrix.sync.aligned.m8n8.x4.trans.shared.b16 [%4], {%0, %1, %2, %3};"
+                :: "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]), "r"(addr));
+}
+
 __device__ inline
-void ldg_u32x8(void *data_, void *ptr) {
+void ldg_u32x8(void *data_, const void *ptr) {
   uint32_t *data = reinterpret_cast<uint32_t *>(data_);
   asm volatile(
     "ld.global.v8.f32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
@@ -621,11 +711,11 @@ void ldg_u32x8(void *data_, void *ptr) {
 }
 
 __device__ inline
-void stg_u32x8(void *ptr, void *data_) {
-  uint32_t *data = reinterpret_cast<uint32_t *>(data_);
+void stg_u32x8(void *ptr, const void *data_) {
+  const uint32_t *data = reinterpret_cast<const uint32_t *>(data_);
   asm volatile(
     "st.global.v8.u32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
     :: "l"(ptr),
-      "f"(data[0]), "f"(data[1]), "f"(data[2]), "f"(data[3]),
-      "f"(data[4]), "f"(data[5]), "f"(data[6]), "f"(data[7]));
+      "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]),
+      "r"(data[4]), "r"(data[5]), "r"(data[6]), "r"(data[7]));
 }
