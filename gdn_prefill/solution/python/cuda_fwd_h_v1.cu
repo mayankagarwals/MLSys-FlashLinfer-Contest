@@ -42,12 +42,6 @@
 #include <cstdint>
 #include "cuda_utils.h"
 
-constexpr int WARP_SIZE = 32;
-
-template <typename T>
-__device__ inline
-T warp_uniform(T x) { return __shfl_sync(0xFFFF'FFFF, x, 0); }
-
 __device__ inline
 int cdiv(int a, int b) { return (a + b - 1) / b; }
 
@@ -80,7 +74,7 @@ void sts_f32(uint32_t addr, float x) {
 
 constexpr int H = 8;
 constexpr int Hg = 4;
-constexpr int BT = 16;
+constexpr int BT = 64;
 constexpr int K_dim = 128;
 constexpr int V_dim = 128;
 
@@ -90,6 +84,7 @@ constexpr uint32_t K_size = BT * K_dim * sizeof(nv_bfloat16);
 constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
 
 constexpr int NUM_WARPS = 4 + 4 + 2;
+constexpr int WARP_SIZE = 32;
 constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
 template <int NUM_STAGES>

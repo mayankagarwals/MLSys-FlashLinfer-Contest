@@ -719,3 +719,7 @@ void stg_u32x8(void *ptr, const void *data_) {
       "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]),
       "r"(data[4]), "r"(data[5]), "r"(data[6]), "r"(data[7]));
 }
+
+template <typename T>
+__device__ inline
+T warp_uniform(T x) { return __shfl_sync(0xFFFF'FFFF, x, 0); }

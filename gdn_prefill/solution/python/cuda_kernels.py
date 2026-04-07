@@ -9,7 +9,10 @@ CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
     name="gdn_prefill_cuda_v2",
-    cuda_files=[str(CURRENT_DIR / "cuda_fwd_h_v1.cu")],
+    cuda_files=[
+        str(CURRENT_DIR / "cuda_fwd_h_v1.cu"),
+        str(CURRENT_DIR / "cuda_kkt_v1.cu"),
+    ],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
         "-O3",
