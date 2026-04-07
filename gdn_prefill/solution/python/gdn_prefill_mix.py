@@ -1,9 +1,13 @@
+import ctypes
+
+# get weird errors without this
+ctypes.CDLL("libcudart.so", mode=ctypes.RTLD_GLOBAL)
+
 import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .triton_v2b import run as triton_v2
-from .triton_v4 import run as triton_v4
+from .chunk_v5 import run as chunk_v5
 
 
 def run(
@@ -21,10 +25,8 @@ def run(
     T = q.shape[0]
 
     # chunk impl
-    if T >= 4096:
-        return triton_v4(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
-    if T >= 256:
-        return triton_v2(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+    if T >= 128:
+        return chunk_v5(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # recurrent impl
     o = torch.empty_like(v)
