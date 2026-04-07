@@ -1,10 +1,13 @@
 # from triton_v4, but replace kkt kernel with CUDA version
 
+import os
+from pathlib import Path
+
 import torch
 import triton
+import tvm_ffi
 from torch import Tensor
 
-from .cuda_kernels import mod
 from .triton_v4 import (
     chunk_fwd_kernel_o,
     chunk_gated_delta_rule_fwd_kernel_h,
@@ -12,12 +15,25 @@ from .triton_v4 import (
     merge_16x16_to_64x64_inverse_kernel,
 )
 
+os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 
-def alloc_fn(size: int, alignment: int, stream: int | None):
-    return torch.empty(size, device="cuda", dtype=torch.int8)
+CURRENT_DIR = Path(__file__).parent
 
+lib_path = tvm_ffi.cpp.build(
+    name="gdn_prefill_cuda",
+    cuda_files=[
+        str(CURRENT_DIR / "cuda_kkt_v1.cu"),
+    ],
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "-lineinfo",
+    ],
+    extra_ldflags=["-lcuda"],
+)
 
-triton.set_allocator(alloc_fn)
+mod = tvm_ffi.load_module(lib_path)
 
 
 _FLAG = None
