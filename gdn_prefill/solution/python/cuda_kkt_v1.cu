@@ -78,7 +78,7 @@ void kkt_v1_kernel_cutlass(
       for (int i = 0; i < NUM_STAGES; i++) {
         mbarrier_init(tma_mbar_addr + i * 8, 1);
         mbarrier_init(mma_mbar_addr + i * 8, 1);
-        mbarrier_init(epi_mbar_addr + i * 8, 1);
+        mbarrier_init(epi_mbar_addr + i * 8, 128);
       }
       fence_mbarrier_init();
     }
@@ -120,7 +120,7 @@ void kkt_v1_kernel_cutlass(
     // MMA warp
     tcgen05_alloc(taddr, 512);
 
-    if (warp_id == 0) {
+    if (elect_sync()) {
       int stage_id = 0;
       int tma_parity = 0;
       int epi_parity = 1;
@@ -131,23 +131,28 @@ void kkt_v1_kernel_cutlass(
         // 128B swizzling
         constexpr uint64_t desc_base = (desc_encode(8 * 128) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
         const uint32_t K_smem = smem + stage_id * K_size;
-        const uint64_t k_desc_base = desc_base | (K_smem >> 4);
 
         const uint32_t acc_tmem = BT * stage_id;
 
         mbarrier_wait(tma_mbar_addr + stage_id * 8, tma_parity);  // wait for TMA data to arrive
-        mbarrier_wait(epi_parity + stage_id * 8, epi_parity);     // wait for epilogue to release acc buffer
+        mbarrier_wait(epi_mbar_addr + stage_id * 8, epi_parity);  // wait for epilogue to release acc buffer
         tcgen05_fence_after_thread_sync();
 
         // i selects the [BT, 64] tile (increment by BT x 128B)
         // j selects the [BT, 16] tile (increment by 32B due to swizzling)
         for (int i = 0; i < K_dim / 64; i++)
           for (int j = 0; j < 64 / 16; j++) {
-            const uint64_t k_desc = k_desc_base + (j * BT * 128 + i * 32) >> 4;
-            const int enable_input_id = (i == 0) && (j == 0);
+            const uint64_t k_desc = desc_base | ((K_smem + i * BT * 128 + j * 32) >> 4);
+            const int enable_input_id = (i > 0) || (j > 0);
             tcgen05_mma(acc_tmem, k_desc, k_desc, idesc, enable_input_id);
           }
         tcgen05_commit(mma_mbar_addr + stage_id * 8);
+
+        stage_id = (stage_id + 1) % NUM_STAGES;
+        if (stage_id == 0) {
+          tma_parity ^= 1;
+          epi_parity ^= 1;
+        }
       }
     }
   }
@@ -194,7 +199,8 @@ void kkt_v1_kernel_cutlass(
         float g = A * __logf(1.0f + __expf(a + dt_bias));
 
         // store to gmem for future use
-        beta_ptr[off_t * H + head_id] = beta;
+        if (off_t < eos)
+          beta_ptr[off_t * H + head_id] = beta;
 
         // parallel scan among half warp (16)
         // illustrating for 4 lanes
@@ -219,7 +225,8 @@ void kkt_v1_kernel_cutlass(
         if (warp_id >= 3) g += g_warp_sum_ptr[2 + (lane_id / 16)];
 
         // store to gmem for future use
-        g_cu_ptr[off_t * H + head_id] = g;
+        if (off_t < eos)
+          g_cu_ptr[off_t * H + head_id] = g;
 
         // store to smem for computing Gamma. layout [2, BT]
         g_cu_smem_ptr[(lane_id / 16) * BT + (warp_id * 16 + (lane_id % 16))] = g;
@@ -261,6 +268,10 @@ void kkt_v1_kernel_cutlass(
         if (stage_id == 0)
           mma_parity ^= 1;
     }
+
+    bar_sync<1>(128);
+    if (warp_id == 0)
+      tcgen05_dealloc(0, 512);
   }
 }
 
@@ -272,7 +283,7 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   // permuted shape: [H, dim/64, T, 64]
   constexpr uint32_t rank = 4;
   uint64_t globalDim[rank] = {64, T, dim / 64, H};
-  uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16), 128, dim};
+  uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16), 128, dim * sizeof(nv_bfloat16)};
   uint32_t boxDim[rank] = {64, BT, dim / 64, 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
@@ -322,8 +333,9 @@ void kkt_v1(
 
   auto kernel = kkt_v1_kernel_cutlass<NUM_STAGES>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-  dim3 grid(148 / Hg * Hg, Hg);
-  kernel<<<grid, smem_size>>>(
+
+  dim3 grid(148 / Hg, Hg);
+  kernel<<<grid, TB_SIZE, smem_size>>>(
     K_tmap, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
     g_cu_ptr, beta_ptr, A_ptr,
     cu_seqlens_ptr, chunk_indices_ptr, total_num_chunks);
