@@ -286,6 +286,42 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
 _FLAG = None
 
 
+def _pack_o_inputs(
+    q: Tensor,
+    k: Tensor,
+    v_new: Tensor,
+    g_cu: Tensor,
+    chunk_indices: Tensor,
+    cu_seqlens: Tensor,
+    BT: int,
+):
+    total_num_chunks = chunk_indices.shape[0]
+    chunk_seq = chunk_indices[:, 0].to(torch.long)
+    chunk_id = chunk_indices[:, 1].to(torch.long)
+    chunk_starts = cu_seqlens[chunk_seq] + chunk_id * BT
+    chunk_ends = cu_seqlens[chunk_seq + 1]
+
+    token_offsets = torch.arange(BT, device=q.device, dtype=chunk_starts.dtype)
+    token_ids = chunk_starts[:, None] + token_offsets[None, :]
+    valid = token_ids < chunk_ends[:, None]
+    safe_token_ids = torch.where(valid, token_ids, torch.zeros_like(token_ids))
+
+    q_chunks = q[safe_token_ids].permute(0, 2, 1, 3).contiguous()
+    q_chunks.masked_fill_(~valid[:, None, :, None], 0)
+
+    k_chunks = k[safe_token_ids].permute(0, 2, 1, 3).contiguous()
+    k_chunks.masked_fill_(~valid[:, None, :, None], 0)
+
+    g_chunks = g_cu[safe_token_ids].permute(0, 2, 1).contiguous()
+    g_chunks.masked_fill_(~valid[:, None, :], 0)
+
+    v_new_chunks = v_new[safe_token_ids].permute(0, 2, 3, 1).contiguous()
+    v_new_chunks.masked_fill_(~valid[:, None, None, :], 0)
+    v_new_t = v_new_chunks.view(total_num_chunks, v_new.shape[1], 2, 64, BT).contiguous()
+
+    return q_chunks, k_chunks, v_new_t, g_chunks
+
+
 def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
     k: Tensor,  # (total_seqlen, num_k_heads, head_dim)
