@@ -19,8 +19,6 @@
  * 3. OOutputKernel (256 threads, tcgen05 swizzled BM=64/BN=64):
  *    q@k^T → gating → q@h^T → exp(g) scaling → attn@vnew → output
  *
- * Used in gdn_prefill_mix.py for 64 <= T < 1024 (2x faster than chunk_v5).
- * For T >= 1024, chunk_v5 is faster due to Triton's SASS scheduling.
  */
 
  #include "cuda_utils.h"
@@ -31,84 +29,16 @@
  #include <vector>
 
 
- // Compatibility wrappers for functions removed/changed in new cuda_utils.h
+ namespace {
 
- template <int BLOCK_M, int BLOCK_N>
- __device__ __forceinline__
- constexpr uint32_t make_tcgen05_idesc() {
-   return (1U << 4U) | (1U << 7U) | (1U << 10U)
-        | ((uint32_t)(BLOCK_N >> 3U) << 17U)
-        | ((uint32_t)(BLOCK_M >> 4U) << 24U);
- }
+ // ═══════════════════════════════════════════════════════════════════
+ // Inline PTX helpers (not available in cuda_utils.h)
+ // ═══════════════════════════════════════════════════════════════════
 
  __device__ __forceinline__ uint32_t cvt_smem_ptr(const void *ptr) {
-   uint32_t addr;
-   asm volatile("{ .reg .u64 u64addr;\n\t"
-                "  cvta.to.shared.u64 u64addr, %1;\n\t"
-                "  cvt.u32.u64 %0, u64addr;\n\t"
-                "}" : "=r"(addr) : "l"(ptr));
-   return addr;
+   return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
  }
 
- // Old API: tcgen05_ld_32x8(out, taddr, row, col) where addr = taddr + (row<<16) + col
- // New API: tcgen05_ld<shape,N>(out, row, col) where addr = (row<<16) | col
- __device__ __forceinline__
- void tcgen05_ld_32x8(float (&out)[8], int taddr, int row, int col) {
-   // Old: addr = taddr + (row << 16) + col. New expects row,col separately.
-   // taddr is the base TMEM address. row/col are offsets.
-   // Compose: new_row = taddr + row (since new does new_row << 16 | col, but taddr already has bits)
-   // Actually old addr = taddr + (row<<16) + col, new addr = (row<<16) | col
-   // So we need: new_row such that (new_row<<16)|col = taddr + (row<<16) + col
-   // This only works if taddr is already encoded. Pass raw addr:
-   uint32_t addr = taddr + (row << 16) + col;
-   float *tmp = out;
-   asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-     : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
-       "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7])
-     : "r"(addr));
-   asm volatile("tcgen05.wait::ld.sync.aligned;");
- }
- __device__ __forceinline__
- void tcgen05_ld_16x2_16(uint32_t (&out)[16], int taddr) {
-   asm volatile(
-     "tcgen05.ld.sync.aligned.16x32bx2.x16.b32 "
-     "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16 + 0], 16;"
-     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
-       "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7]),
-       "=r"(out[8]), "=r"(out[9]), "=r"(out[10]), "=r"(out[11]),
-       "=r"(out[12]), "=r"(out[13]), "=r"(out[14]), "=r"(out[15])
-     : "r"(taddr));
-   asm volatile("tcgen05.wait::ld.sync.aligned;");
- }
- __device__ __forceinline__
- void tcgen05_st_16x2_16(int taddr, const uint32_t (&in)[16]) {
-   asm volatile(
-     "{\n\t.reg .pred p;\n\tmov.pred p, -1;\n\t"
-     "@p tcgen05.st.sync.aligned.16x32bx2.x16.b32 [%0 + 0], 16, "
-     "{%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};\n\t}"
-     :: "r"(taddr),
-        "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3]),
-        "r"(in[4]), "r"(in[5]), "r"(in[6]), "r"(in[7]),
-        "r"(in[8]), "r"(in[9]), "r"(in[10]), "r"(in[11]),
-        "r"(in[12]), "r"(in[13]), "r"(in[14]), "r"(in[15])
-     : "memory");
-   asm volatile("tcgen05.wait::st.sync.aligned;");
- }
- __device__ __forceinline__
- void tcgen05_fence() {
-   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
- }
-
- __device__ __forceinline__
- void ldmatrix_x4(uint32_t &r0, uint32_t &r1, uint32_t &r2, uint32_t &r3, uint32_t smem_addr) {
-   asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
-     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_addr));
- }
- __device__ __forceinline__
- void ldmatrix_x2_trans(uint32_t &r0, uint32_t &r1, uint32_t smem_addr) {
-   asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];"
-     : "=r"(r0), "=r"(r1) : "r"(smem_addr));
- }
  __device__ __forceinline__
  void mma_m16n8k16_bf16(
      float &d0, float &d1, float &d2, float &d3,
@@ -122,22 +52,43 @@
      : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
        "f"(c0), "f"(c1), "f"(c2), "f"(c3));
  }
+
  __device__ __forceinline__
- void cp_async_cg_128_pred(uint32_t smem_addr, const void *gmem_ptr, bool pred) {
+ void cp_async_cg_128(uint32_t smem_addr, const void *gmem_ptr, bool pred) {
    uint32_t p = pred ? 16 : 0;
    asm volatile("cp.async.cg.shared.global [%0], [%1], 0x10, %2;"
      :: "r"(smem_addr), "l"(gmem_ptr), "r"(p) : "memory");
  }
+
+ // tcgen05 TMEM ld/st for 16x32bx2 tile shape (O-kernel TMEM access)
+ // addr = pre-composed TMEM address: taddr + tmem_offset
  __device__ __forceinline__
- void cp_async_commit_group() { asm volatile("cp.async.commit_group;"); }
- __device__ __forceinline__
- void cp_async_wait_group(int n) {
-   if (n == 0) asm volatile("cp.async.wait_group 0;");
-   else if (n == 1) asm volatile("cp.async.wait_group 1;");
-   else asm volatile("cp.async.wait_group 2;");
+ void tcgen05_ld_16x32bx2(uint32_t (&out)[16], int addr) {
+   asm volatile(
+     "tcgen05.ld.sync.aligned.16x32bx2.x16.b32 "
+     "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16 + 0], 16;"
+     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
+       "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7]),
+       "=r"(out[8]), "=r"(out[9]), "=r"(out[10]), "=r"(out[11]),
+       "=r"(out[12]), "=r"(out[13]), "=r"(out[14]), "=r"(out[15])
+     : "r"(addr));
+   asm volatile("tcgen05.wait::ld.sync.aligned;");
  }
- 
- namespace {
+
+ __device__ __forceinline__
+ void tcgen05_st_16x32bx2(int addr, const uint32_t (&in)[16]) {
+   asm volatile(
+     "{\n\t.reg .pred p;\n\tmov.pred p, -1;\n\t"
+     "@p tcgen05.st.sync.aligned.16x32bx2.x16.b32 [%0 + 0], 16, "
+     "{%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};\n\t}"
+     :: "r"(addr),
+        "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3]),
+        "r"(in[4]), "r"(in[5]), "r"(in[6]), "r"(in[7]),
+        "r"(in[8]), "r"(in[9]), "r"(in[10]), "r"(in[11]),
+        "r"(in[12]), "r"(in[13]), "r"(in[14]), "r"(in[15])
+     : "memory");
+   asm volatile("tcgen05.wait::st.sync.aligned;");
+ }
  
  constexpr int kK = 128, kV = 128;
  constexpr int64_t kHq = 4, kHk = 4, kHv = 8;
@@ -382,7 +333,7 @@
    }
    __syncthreads();
    const int taddr = tmem_buf[0];
-   constexpr uint32_t idesc = make_tcgen05_idesc<BM, BN>();
+   constexpr uint32_t idesc = make_tcgen05_idesc(BM, BN);
  
    // ════════════════════════════════════════════════════════════
    // Phase 1: Compute A_mat (same as ComputeAKernel_TC)
@@ -403,7 +354,7 @@
    mbarrier_wait(mbar_tma, 0);
  
    // MMA: batch all 8 K-tiles, single commit
-   tcgen05_fence();
+   tcgen05_fence_after_thread_sync();
    if (warp_id == 0 && elect_sync()) {
      for (int ki = 0; ki < BK / MMA_K; ki++) {
        uint32_t a_base = A_smem_base + ki * 2 * (BM * 16);
@@ -417,7 +368,7 @@
    }
    mbarrier_wait(mbar_mma, 0);
    if (warp_id == 0 && elect_sync()) mbarrier_init(mbar_mma, 1);
-   tcgen05_fence();
+   tcgen05_fence_after_thread_sync();
  
    // Overlap: compute g/beta from global memory WHILE reading TMEM → s_result
    // g/beta writes to s_g/s_beta (independent of s_result)
@@ -438,7 +389,14 @@
    // Read TMEM → s_result [64,64] (padded), only first 64 rows of 128x64 output
    for (int n = 0; n < BN / 8; n++) {
      float tmp[8];
-     tcgen05_ld_32x8(tmp, taddr, warp_id * 32, n * 8);
+     {
+      uint32_t addr = taddr + ((warp_id * 32) << 16) + n * 8;
+      asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+        : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+          "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7])
+        : "r"(addr));
+      tcgen05_wait_ld();
+    }
      int my_row = warp_id * 32 + (tid % 32);
      if (my_row < kBT) {
        for (int c = 0; c < 8; c++)
@@ -834,7 +792,7 @@
      for (int i = tid; i < kBT * kK / 8; i += 128) {
        int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
        uint32_t dst = stage_base + (row * kK + col8) * 2;
-       cp_async_cg_128_pred(dst, &k_ptr[row * kHk * kK + col8], row < clen);
+       cp_async_cg_128(dst, &k_ptr[row * kHk * kK + col8], row < clen);
      }
      asm volatile("cp.async.commit_group;");
    }
@@ -879,7 +837,7 @@
        for (int i = tid; i < kBT * kK / 8; i += 128) {
          int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
          uint32_t dst = stage_base + (row * kK + col8) * 2;
-         cp_async_cg_128_pred(dst, &v_ptr[row * kHv * kV + col8], row < clen);
+         cp_async_cg_128(dst, &v_ptr[row * kHv * kV + col8], row < clen);
        }
        asm volatile("cp.async.commit_group;");
      }
@@ -889,23 +847,21 @@
      // v cp.async loading in background into s_stage
      float p3_acc[16][4] = {};
      for (int kt = 0; kt < kBT / 16; kt++) {
-       uint32_t a0, a1, a2, a3;
+       uint32_t a[4];
        {
          int r = (lane_p3 % 8) + ((lane_p3 & 8) ? 8 : 0) + m_base_p3;
          int c = (lane_p3 >= 16) ? 8 : 0;
-         ldmatrix_x4(a0, a1, a2, a3,
-             cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
+         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
        }
        for (int nt = 0; nt < 16; nt++) {
-         uint32_t b0, b1;
+         uint32_t b[2];
          {
            int kr = lane_p3 % 16;
-           ldmatrix_x2_trans(b0, b1,
-               cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
+           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
          }
          mma_m16n8k16_bf16(
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3],
-             a0, a1, a2, a3, b0, b1,
+             a[0], a[1], a[2], a[3], b[0], b[1],
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3]);
        }
      }
@@ -955,23 +911,21 @@
  
      float p3_acc[16][4] = {};
      for (int kt = 0; kt < kBT / 16; kt++) {
-       uint32_t a0, a1, a2, a3;
+       uint32_t a[4];
        {
          int r = (lane_p3 % 8) + ((lane_p3 & 8) ? 8 : 0) + m_base_p3;
          int c = (lane_p3 >= 16) ? 8 : 0;
-         ldmatrix_x4(a0, a1, a2, a3,
-             cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
+         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
        }
        for (int nt = 0; nt < 16; nt++) {
-         uint32_t b0, b1;
+         uint32_t b[2];
          {
            int kr = lane_p3 % 16;
-           ldmatrix_x2_trans(b0, b1,
-               cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
+           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
          }
          mma_m16n8k16_bf16(
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3],
-             a0, a1, a2, a3, b0, b1,
+             a[0], a[1], a[2], a[3], b[0], b[1],
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3]);
        }
      }
@@ -1088,7 +1042,7 @@
        int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
        uint32_t dst = cvt_smem_ptr(&s_w[row * kK + col8]);
        if (row < clen0) {
-         cp_async_cg_128_pred(dst, &w_ptr[row * kHv * kK + col8], true);
+         cp_async_cg_128(dst, &w_ptr[row * kHv * kK + col8], true);
        } else {
          *reinterpret_cast<int4 *>(&s_w[row * kK + col8]) = make_int4(0,0,0,0);
        }
@@ -1140,7 +1094,7 @@
          int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
          uint32_t dst = cvt_smem_ptr(&s_k[row * kK + col8]);
          if (row < clen) {
-           cp_async_cg_128_pred(dst, &k_src[row * kHk * kK + col8], true);
+           cp_async_cg_128(dst, &k_src[row * kHk * kK + col8], true);
          } else {
            *reinterpret_cast<int4 *>(&s_k[row * kK + col8]) = make_int4(0,0,0,0);
          }
@@ -1154,24 +1108,22 @@
        float wh_acc[2][4] = {};
        #pragma unroll
        for (int kt = 0; kt < 8; kt++) {
-         // A: w[warp_id*16:+16, kt*16:+16] via ldmatrix.x4
-         uint32_t a0, a1, a2, a3;
+         uint32_t a[4];
          {
            int r = (lane_id % 8) + ((lane_id & 8) ? 8 : 0) + warp_id * 16;
            int c = (lane_id >= 16) ? 8 : 0;
-           ldmatrix_x4(a0, a1, a2, a3, cvt_smem_ptr(&s_w[r * kK + kt * 16 + c]));
+           ldmatrix<4>(a, cvt_smem_ptr(&s_w[r * kK + kt * 16 + c]));
          }
          #pragma unroll
          for (int nt = 0; nt < 2; nt++) {
-           // B: h_T[kt*16:+16, nt*8:+8] via ldmatrix.x2.trans, stride kBV_H=16
-           uint32_t b0, b1;
+           uint32_t b[2];
            {
-             int k_row = lane_id % 16;  // 16 unique rows for x2
-             ldmatrix_x2_trans(b0, b1, cvt_smem_ptr(&s_h_T[(kt * 16 + k_row) * kBV_H + nt * 8]));
+             int k_row = lane_id % 16;
+             ldmatrix_trans<2>(b, cvt_smem_ptr(&s_h_T[(kt * 16 + k_row) * kBV_H + nt * 8]));
            }
            mma_m16n8k16_bf16(
                wh_acc[nt][0], wh_acc[nt][1], wh_acc[nt][2], wh_acc[nt][3],
-               a0, a1, a2, a3, b0, b1,
+               a[0], a[1], a[2], a[3], b[0], b[1],
                wh_acc[nt][0], wh_acc[nt][1], wh_acc[nt][2], wh_acc[nt][3]);
          }
        }
@@ -1201,7 +1153,7 @@
            int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
            uint32_t dst = cvt_smem_ptr(&s_w_next[row * kK + col8]);
            if (row < next_clen) {
-             cp_async_cg_128_pred(dst, &w_ptr[row * kHv * kK + col8], true);
+             cp_async_cg_128(dst, &w_ptr[row * kHv * kK + col8], true);
            } else {
              *reinterpret_cast<int4 *>(&s_w_next[row * kK + col8]) = make_int4(0,0,0,0);
            }
@@ -1257,22 +1209,22 @@
        const int wn = warp_id * 32;
        #pragma unroll
        for (int kt = 0; kt < 4; kt++) {
-         uint32_t a0, a1, a2, a3;
+         uint32_t a[4];
          {
            int r = (lane_id % 8) + ((lane_id & 8) ? 8 : 0);
            int c = (lane_id >= 16) ? 8 : 0;
-           ldmatrix_x4(a0, a1, a2, a3, cvt_smem_ptr(&s_vnew_T[r * kBT + kt * 16 + c]));
+           ldmatrix<4>(a, cvt_smem_ptr(&s_vnew_T[r * kBT + kt * 16 + c]));
          }
          #pragma unroll
          for (int nt = 0; nt < 4; nt++) {
-           uint32_t b0, b1;
+           uint32_t b[2];
            {
              int kr = lane_id % 16;
-             ldmatrix_x2_trans(b0, b1, cvt_smem_ptr(&s_k[(kt * 16 + kr) * kK + wn + nt * 8]));
+             ldmatrix_trans<2>(b, cvt_smem_ptr(&s_k[(kt * 16 + kr) * kK + wn + nt * 8]));
            }
            mma_m16n8k16_bf16(
                h_reg[nt][0], h_reg[nt][1], h_reg[nt][2], h_reg[nt][3],
-               a0, a1, a2, a3, b0, b1,
+               a[0], a[1], a[2], a[3], b[0], b[1],
                h_reg[nt][0], h_reg[nt][1], h_reg[nt][2], h_reg[nt][3]);
          }
        }
@@ -1515,10 +1467,10 @@
 
      for (int batch = 0; batch < 4; batch++) {
        int row = row_base + batch * 16;
-       cp_async_cg_128_pred(q_smem_base + base_off + batch * 2048,
+       cp_async_cg_128(q_smem_base + base_off + batch * 2048,
            &q_ptr[row * kHq * kK + col_start], row < clen);
      }
-     cp_async_commit_group();
+     asm volatile("cp.async.commit_group;");
    }
 
    // k loading via cp.async into s_h_tile (reusing h's buffer for k first)
@@ -1532,14 +1484,14 @@
 
      for (int batch = 0; batch < 4; batch++) {
        int row = row_base + batch * 16;
-       cp_async_cg_128_pred(k_smem_base + base_off + batch * 2048,
+       cp_async_cg_128(k_smem_base + base_off + batch * 2048,
            &k_ptr[row * kHk * kK + col_start], row < clen);
      }
-     cp_async_commit_group();
+     asm volatile("cp.async.commit_group;");
    }
 
    // Wait for both q and k cp.async
-   cp_async_wait_group(0);
+   asm volatile("cp.async.wait_group 0;");
    __syncthreads();
    asm volatile("fence.proxy.async.shared::cta;");
 
@@ -1573,7 +1525,7 @@
      int my_taddr = tmem_off + taddr;
 
      uint32_t vals[16];
-     tcgen05_ld_16x2_16(vals, my_taddr);
+     tcgen05_ld_16x32bx2(vals, my_taddr);
 
      int row = (shfl_warp % 4) * 16 + (lane_id % 16);
      int col_base = (shfl_warp >= 4 ? 32 : 0) + (lane_id >= 16 ? 16 : 0);
@@ -1619,10 +1571,10 @@
 
      for (int batch = 0; batch < 4; batch++) {
        int row = h_row_base + batch * 16;
-       cp_async_cg_128_pred(h_smem_base + h_base_off + batch * 2048,
+       cp_async_cg_128(h_smem_base + h_base_off + batch * 2048,
            &h_src[row * kK + h_col_start], row < kBV_O);
      }
-     cp_async_commit_group();
+     asm volatile("cp.async.commit_group;");
    }
 
    // Scatter-transpose vnew (global → smem, can't use cp.async easily)
@@ -1632,7 +1584,7 @@
    }
 
    // Wait for h cp.async
-   cp_async_wait_group(0);
+   asm volatile("cp.async.wait_group 0;");
    __syncthreads();
    asm volatile("fence.proxy.async.shared::cta;");
 
@@ -1671,7 +1623,7 @@
      int my_taddr = tmem_off + taddr;
 
      uint32_t vals[16];
-     tcgen05_ld_16x2_16(vals, my_taddr);
+     tcgen05_ld_16x32bx2(vals, my_taddr);
 
      int row = (shfl_warp % 4) * 16 + (lane_id % 16);
      float eg = (row < clen) ? __expf(s_gc[row]) : 0.0f;
@@ -1683,7 +1635,7 @@
      }
 
      // Write scaled values back to TMEM
-     tcgen05_st_16x2_16(my_taddr, scaled);
+     tcgen05_st_16x32bx2(my_taddr, scaled);
    }
 
    // s_attn_tile and s_vnew_tile are already ready (written in steps 3+4)
@@ -1721,7 +1673,7 @@
      int my_taddr = tmem_off + taddr;
 
      uint32_t vals[16];
-     tcgen05_ld_16x2_16(vals, my_taddr);
+     tcgen05_ld_16x32bx2(vals, my_taddr);
 
      // TMEM layout: row = (warp_id%4)*16 + (lane_id%16)
      //   col_base = (warp_id>=4 ? 32 : 0) + (lane_id>=16 ? 16 : 0)
