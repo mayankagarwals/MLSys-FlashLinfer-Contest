@@ -171,6 +171,27 @@ __device__ __forceinline__ void mma_noswizzle_64x64(uint32_t output_tmem,
   }
 }
 
+__device__ __forceinline__ void store_attn_column(
+    nv_bfloat16 *attn_smem_ptr, const float *g_smem_ptr, const float *reg,
+    uint32_t row_base, uint32_t row_hi, uint32_t row_base_limit,
+    uint32_t row_hi_limit, uint32_t reg_row0, uint32_t reg_row1,
+    uint32_t col) {
+  float value_row0 = 0.0f;
+  if (col < row_base_limit) {
+    value_row0 = reg[reg_row0] * __expf(g_smem_ptr[row_base] - g_smem_ptr[col]);
+  }
+
+  float value_row1 = 0.0f;
+  if (col < row_hi_limit) {
+    value_row1 = reg[reg_row1] * __expf(g_smem_ptr[row_hi] - g_smem_ptr[col]);
+  }
+
+  attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_base, col)] =
+      __float2bfloat16_rn(value_row0);
+  attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_hi, col)] =
+      __float2bfloat16_rn(value_row1);
+}
+
 __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     const __grid_constant__ CUtensorMap q_tmap,
     const __grid_constant__ CUtensorMap k_tmap,
@@ -309,35 +330,12 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       const uint32_t reg_row0 = (step / 2U) * 4U + (step % 2U);
       const uint32_t reg_row1 = reg_row0 + 2U;
 
-      float value_row0 = 0.0f;
-      float value_row1 = 0.0f;
-      if (col_lo < row_base_limit) {
-        value_row0 = reg_lo[reg_row0] *
-                     __expf(g_smem_ptr[row_base] - g_smem_ptr[col_lo]);
-      }
-      if (col_lo < row_hi_limit) {
-        value_row1 =
-            reg_lo[reg_row1] * __expf(g_smem_ptr[row_hi] - g_smem_ptr[col_lo]);
-      }
-      attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_base, col_lo)] =
-          __float2bfloat16_rn(value_row0);
-      attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_hi, col_lo)] =
-          __float2bfloat16_rn(value_row1);
-
-      value_row0 = 0.0f;
-      value_row1 = 0.0f;
-      if (col_hi < row_base_limit) {
-        value_row0 = reg_hi[reg_row0] *
-                     __expf(g_smem_ptr[row_base] - g_smem_ptr[col_hi]);
-      }
-      if (col_hi < row_hi_limit) {
-        value_row1 =
-            reg_hi[reg_row1] * __expf(g_smem_ptr[row_hi] - g_smem_ptr[col_hi]);
-      }
-      attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_base, col_hi)] =
-          __float2bfloat16_rn(value_row0);
-      attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_hi, col_hi)] =
-          __float2bfloat16_rn(value_row1);
+      store_attn_column(attn_smem_ptr, g_smem_ptr, reg_lo, row_base, row_hi,
+                        row_base_limit, row_hi_limit, reg_row0, reg_row1,
+                        col_lo);
+      store_attn_column(attn_smem_ptr, g_smem_ptr, reg_hi, row_base, row_hi,
+                        row_base_limit, row_hi_limit, reg_row0, reg_row1,
+                        col_hi);
     }
   }
   tcgen05_fence_before_thread_sync();
