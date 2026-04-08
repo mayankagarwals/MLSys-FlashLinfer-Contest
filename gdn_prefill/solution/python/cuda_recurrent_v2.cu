@@ -22,31 +22,38 @@
  * scheduling on 192 SMs, wall time ≈ total_work / 192 — same for both.
  * So in theory v2 should break even, not be slower.
  *
- * The actual cause is REGISTER PRESSURE → LOWER OCCUPANCY:
+ * Multiple factors compound to cause the 1.5-2.5x regression:
  *
- *   cuobjdump shows:
- *     v1: 32 regs/thread → 4096 regs/block → 16 blocks/SM → 64 warps/SM
- *     v2: 48 regs/thread → 6144 regs/block → 10 blocks/SM → 40 warps/SM
+ * 1. Register pressure → reduced occupancy
+ *    cuobjdump shows:
+ *      v1: 32 regs/thread → 16 blocks/SM max → 64 warps/SM
+ *      v2: 48 regs/thread → 10 blocks/SM max → 40 warps/SM
+ *    Carrying 4 float4 state vectors (vs 1 in v1) uses 50% more registers,
+ *    cutting max concurrent warps by 37.5%. Alone this accounts for ~1.6x
+ *    slowdown (64/40) from reduced latency hiding.
  *
- *   v2 carries 4 float4 state vectors in registers (vs 1 in v1), consuming
- *   50% more registers per thread. This cuts max concurrent warps per SM by
- *   37.5% (40 vs 64), severely reducing latency hiding for memory accesses.
+ * 2. SM under-utilization (low N)
+ *    With N=1, H=8: v1 launches 256 blocks (all 192 SMs busy), v2 launches
+ *    64 blocks (128 SMs idle). Fewer blocks can't fill the GPU.
  *
- *   With fewer warps to switch between, memory stalls that v1 hides by
- *   executing other warps become exposed in v2. Each v2 block takes MORE
- *   than 4x the time of a v1 block — not because of more compute, but
- *   because memory latencies are no longer hidden. The 4x fewer blocks
- *   cannot compensate because each block's wall-clock time is inflated.
+ * 3. Reduced scheduling flexibility (variable-length sequences)
+ *    With variable seqlens (14 to 2300 in one batch), short-seq blocks
+ *    finish early and their SMs pick up new blocks. v1's 8192 fine-grained
+ *    blocks give the scheduler 4x more work units to fill these gaps vs
+ *    v2's 2048 coarser blocks. Coarser blocks = more idle SM time between
+ *    short and long sequences.
  *
- * Additionally, for low N (N=1, H=8):
- *   v1: 256 blocks → all 192 SMs busy
- *   v2:  64 blocks → only 64 SMs busy, 128 completely idle
+ * 4. Likely ILP loss from the unrolled 4-V-row inner loop
+ *    Higher register pressure may prevent the compiler from interleaving
+ *    independent V-row computations. Each WarpAllReduceSum (5 dependent
+ *    shuffles) is a serial chain; with 8 such chains per token (vs 2 in v1),
+ *    the compiler may not effectively overlap them despite independence.
+ *    (Would need ncu profiling to confirm the exact contribution.)
  *
  * Why it works for DECODE:
- *   Decode processes 1 token — each block runs a tiny amount of compute
- *   that doesn't stress register counts or occupancy the same way. The
- *   benefit of fewer blocks (less L2 contention for state data, cp.async
- *   pipelining) outweighs the occupancy cost.
+ *   Decode processes 1 token — block duration is tiny so occupancy matters
+ *   less. The benefit of fewer blocks (less L2 contention for state data
+ *   across many batches, cp.async pipelining) outweighs the cost.
  * ---------------------------------------------------------------------------
  */
 
