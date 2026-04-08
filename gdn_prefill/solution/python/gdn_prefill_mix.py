@@ -25,9 +25,18 @@ def run(
 ):
     T = q.shape[0]
 
-    # chunk impl for large workloads
-    if T >= 4096:
+    # chunk_v5 (CUDA kkt + Triton) for large workloads
+    if T >= 256:
         return chunk_v5(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA v3 for small/medium workloads (2x faster than Triton for T<256)
-    return cuda_v3(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+    # CUDA v3 chunk kernel for medium workloads (faster than chunk_v5 for T<256)
+    if T >= 64:
+        return cuda_v3(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+
+    # CUDA recurrent for tiny workloads
+    o = torch.empty_like(v)
+    new_state = torch.empty_like(state)
+    cuda_recurrent_v1(
+        q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, o, new_state
+    )
+    return o, new_state
