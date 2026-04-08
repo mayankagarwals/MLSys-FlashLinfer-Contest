@@ -52,6 +52,7 @@
  #include <mma.h>
  #include <vector>
 
+
  // Compatibility wrappers for functions removed/changed in new cuda_utils.h
 
  template <int BLOCK_M, int BLOCK_N>
@@ -71,17 +72,49 @@
    return addr;
  }
 
+ // Old API: tcgen05_ld_32x8(out, taddr, row, col) where addr = taddr + (row<<16) + col
+ // New API: tcgen05_ld<shape,N>(out, row, col) where addr = (row<<16) | col
  __device__ __forceinline__
  void tcgen05_ld_32x8(float (&out)[8], int taddr, int row, int col) {
-   tcgen05_ld<SHAPE::_32x32b, 8>(&out, taddr + row, col);
+   // Old: addr = taddr + (row << 16) + col. New expects row,col separately.
+   // taddr is the base TMEM address. row/col are offsets.
+   // Compose: new_row = taddr + row (since new does new_row << 16 | col, but taddr already has bits)
+   // Actually old addr = taddr + (row<<16) + col, new addr = (row<<16) | col
+   // So we need: new_row such that (new_row<<16)|col = taddr + (row<<16) + col
+   // This only works if taddr is already encoded. Pass raw addr:
+   uint32_t addr = taddr + (row << 16) + col;
+   float *tmp = out;
+   asm volatile("tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+     : "=f"(tmp[0]), "=f"(tmp[1]), "=f"(tmp[2]), "=f"(tmp[3]),
+       "=f"(tmp[4]), "=f"(tmp[5]), "=f"(tmp[6]), "=f"(tmp[7])
+     : "r"(addr));
+   asm volatile("tcgen05.wait::ld.sync.aligned;");
  }
  __device__ __forceinline__
  void tcgen05_ld_16x2_16(uint32_t (&out)[16], int taddr) {
-   tcgen05_ld<SHAPE::_16x256b, 16>(&out, taddr, 0);
+   asm volatile(
+     "tcgen05.ld.sync.aligned.16x32bx2.x16.b32 "
+     "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16 + 0], 16;"
+     : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
+       "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7]),
+       "=r"(out[8]), "=r"(out[9]), "=r"(out[10]), "=r"(out[11]),
+       "=r"(out[12]), "=r"(out[13]), "=r"(out[14]), "=r"(out[15])
+     : "r"(taddr));
+   asm volatile("tcgen05.wait::ld.sync.aligned;");
  }
  __device__ __forceinline__
  void tcgen05_st_16x2_16(int taddr, const uint32_t (&in)[16]) {
-   tcgen05_st<SHAPE::_16x256b, 16>(taddr, 0, &in);
+   asm volatile(
+     "{\n\t.reg .pred p;\n\tmov.pred p, -1;\n\t"
+     "@p tcgen05.st.sync.aligned.16x32bx2.x16.b32 [%0 + 0], 16, "
+     "{%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};\n\t}"
+     :: "r"(taddr),
+        "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3]),
+        "r"(in[4]), "r"(in[5]), "r"(in[6]), "r"(in[7]),
+        "r"(in[8]), "r"(in[9]), "r"(in[10]), "r"(in[11]),
+        "r"(in[12]), "r"(in[13]), "r"(in[14]), "r"(in[15])
+     : "memory");
+   asm volatile("tcgen05.wait::st.sync.aligned;");
  }
  __device__ __forceinline__
  void tcgen05_fence() {
