@@ -26,7 +26,7 @@ def run(
     T = q.shape[0]
 
     # chunk_v5 (CUDA kkt + Triton) for large workloads
-    if T >= 256:
+    if T >= 1024:
         return chunk_v5(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA v3 chunk kernel for medium workloads (faster than chunk_v5 for T<256)
