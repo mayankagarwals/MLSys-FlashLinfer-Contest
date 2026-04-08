@@ -734,3 +734,40 @@ void stg_u32x8_fast(void *ptr, const void *data_) {
 template <typename T>
 __device__ inline
 T warp_uniform(T x) { return __shfl_sync(0xFFFF'FFFF, x, 0); }
+
+// ═══════════════════════════════════════════════════════════════════
+// Shared memory address conversion
+// ═══════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__ uint32_t cvt_smem_ptr(const void *ptr) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(ptr));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// mma.sync m16n8k16 (bf16 inputs → fp32 accumulator)
+// ═══════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__
+void mma_m16n8k16_bf16(
+    float &d0, float &d1, float &d2, float &d3,
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    float c0, float c1, float c2, float c3) {
+  asm volatile(
+    "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+    : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+      "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// cp.async (legacy, non-bulk)
+// ═══════════════════════════════════════════════════════════════════
+
+__device__ __forceinline__
+void cp_async_cg_128(uint32_t smem_addr, const void *gmem_ptr, bool pred) {
+  uint32_t p = pred ? 16 : 0;
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 0x10, %2;"
+    :: "r"(smem_addr), "l"(gmem_ptr), "r"(p) : "memory");
+}
