@@ -938,6 +938,7 @@
  // ═══════════════════════════════════════════════════════════════════
  __global__ void __launch_bounds__(128, 1)
  HRecurrenceKernel(
+     const __grid_constant__ CUtensorMap k_tmap_64,
      const __nv_bfloat16 *__restrict__ w_in,
      const __nv_bfloat16 *__restrict__ k_in,
      __nv_bfloat16 *__restrict__ u_inout,
@@ -979,6 +980,14 @@
    __nv_bfloat16 *s_k = reinterpret_cast<__nv_bfloat16 *>(s_gc + kBT);     // [64,128] = 16KB
    __nv_bfloat16 *s_vnew_T = s_k + kBT * kK;                               // [16,64] = 2KB
    __nv_bfloat16 *s_u = s_vnew_T + kBV_H * kBT;                            // [64,16] = 2KB (prefetched u_inout)
+   uint64_t *mbar_k = reinterpret_cast<uint64_t *>(s_u + kBT * kBV_H);    // 1 mbarrier = 8B (for TMA k loading)
+
+   // Init mbarrier for TMA k loading
+   const uint32_t mbar_k_addr = cvt_smem_ptr(mbar_k);
+   if (tid == 0) {
+     mbarrier_init(mbar_k_addr, 1);
+     asm volatile("fence.mbarrier_init.release.cluster;");
+   }
 
    // Persistent h state: h_reg[nt][reg], 4 N-tiles × 4 fp32 = 16 regs/thread
    // row0 = lane_id/4 (groupID, 0..7), row1 = row0+8 (8..15)
@@ -1064,18 +1073,30 @@
      }
      __syncthreads();
  
-     // Issue k + u loads early — both overlap with MMA1, single commit group
+     // Issue k + u loads early — both overlap with MMA1
      {
-       const __nv_bfloat16 *k_src = k_in + cstart * kHk * kK + k_head * kK;
-       const uint32_t k_smem_base = cvt_smem_ptr(s_k);
-       for (int i = tid; i < kBT * kK / 8; i += 128) {
-         int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
-         int byte_off = tile_byte_offset(row, col8, kBT);
-         uint32_t dst = k_smem_base + byte_off;
-         if (row < clen) {
-           cp_async_cg_128(dst, &k_src[row * kHk * kK + col8], true);
-         } else {
-           *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_k) + byte_off) = make_int4(0,0,0,0);
+       const int64_t k_col_group = k_head * kK / 8;
+       if (clen == kBT) {
+         // Full chunk: TMA load k → tile format smem (single instruction)
+         if (warp_id == 0 && elect_sync()) {
+           tma_load_3d(cvt_smem_ptr(s_k), &k_tmap_64, 0, (int)cstart, (int)k_col_group, mbar_k_addr);
+           asm volatile(
+             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+             :: "r"(mbar_k_addr), "r"((int)(kBT * kK * sizeof(__nv_bfloat16))) : "memory");
+         }
+       } else {
+         // Partial chunk: cp.async k → tile format (NaN from TMA OOB poisons mma.sync)
+         const __nv_bfloat16 *k_src = k_in + cstart * kHk * kK + k_head * kK;
+         const uint32_t k_smem_base = cvt_smem_ptr(s_k);
+         for (int i = tid; i < kBT * kK / 8; i += 128) {
+           int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
+           int byte_off = tile_byte_offset(row, col8, kBT);
+           uint32_t dst = k_smem_base + byte_off;
+           if (row < clen) {
+             cp_async_cg_128(dst, &k_src[row * kHk * kK + col8], true);
+           } else {
+             *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_k) + byte_off) = make_int4(0,0,0,0);
+           }
          }
        }
        // Prefetch u_inout into s_u (hides strided global load latency behind MMA1)
@@ -1130,11 +1151,14 @@
          }
        }
      }
-     // Wait for k+u cp.async (issued before MMA1, latency hidden behind MMA1 compute)
+     // Wait for k (TMA or cp.async) and u (cp.async)
      // Must complete before vnew reads s_u and before MMA2 reads s_k
-     asm volatile("cp.async.wait_group 0;");
-     // NO __syncthreads here — v_new is per-warp (reads only own MMA1 rows)
-     // s_u and s_k are filled by cp.async (thread-local, no cross-thread dependency)
+     if (clen == kBT) {
+       // Full chunk: wait for TMA k load, then re-init mbarrier for next iteration
+       mbarrier_wait(mbar_k_addr, 0);
+       if (warp_id == 0 && elect_sync()) mbarrier_init(mbar_k_addr, 1);
+     }
+     asm volatile("cp.async.wait_group 0;");  // Wait for u (and k if partial chunk)
 
      // Step 2: v_new (per-warp), gate, scale h, prefetch w[ct+1] via cp.async
      {
@@ -1806,10 +1830,8 @@
      // FusedPrepKernel: s_A_tiles(32KB) + s_B_tiles(16KB) + mbars(20B) + s_result(16KB) + s_result_inv(16KB) + s_g(256B) + s_beta(256B) + s_bg(256B) ≈ 81KB
      int smem_FP_attr = (128*128*2 + 64*128*2 + 256 + 64*64*4 + 64*64*4 + 64*4 + 64*4 + 64*4 + 1023) & ~1023;
      cudaFuncSetAttribute(FusedPrepKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_FP_attr);
-     // HRecurrenceKernel: force 1 block/SM via 115KB smem pad (228KB/2 = 114KB)
-     // H-kernel: actual ~59KB but pad to 115KB to force 1 block/SM (sequential recurrence
-    // needs max registers; multi-block causes register pressure → 13% slower)
-    int smem_H = 115 * 1024;
+     // HRecurrenceKernel: tile-format smem eliminated bank conflicts, multi-block is now beneficial
+     int smem_H = (2*kBT*kK*2 + kK*kBV_H*2 + kBT*kBV_H*4 + kBT*4 + kBT*kK*2 + kBV_H*kBT*2 + kBT*kBV_H*2 + 8 + 1023) & ~1023;
      cudaFuncSetAttribute(HRecurrenceKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_H);
      // OOutputKernel v9 (tcgen05 swizzled, inline q@k^T): s_q(16KB) + s_h(16KB) + s_attn(8KB) + s_vnew(8KB) + s_gc(256B) + mbars(24B) + tmem(4B) ≈ 49KB
      int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
@@ -1825,8 +1847,8 @@
  
    // Compute smem sizes for launch
    int smem_FP = (128*128*2 + 64*128*2 + 256 + 64*64*4 + 64*64*4 + 64*4 + 64*4 + 64*4 + 1023) & ~1023;
-   // H-kernel smem: 2×w(16KB) + h_T(4KB) + wh(4KB) + gc(256B) + k(16KB) + vnew_T(2KB) + u(2KB)
-   int smem_H = (2*kBT*kK*2 + kK*kBV_H*2 + kBT*kBV_H*4 + kBT*4 + kBT*kK*2 + kBV_H*kBT*2 + kBT*kBV_H*2 + 1023) & ~1023;
+   // H-kernel smem: 2×w(16KB) + h_T(4KB) + wh(4KB) + gc(256B) + k(16KB) + vnew_T(2KB) + u(2KB) + mbar(8B)
+   int smem_H = (2*kBT*kK*2 + kK*kBV_H*2 + kBT*kBV_H*4 + kBT*4 + kBT*kK*2 + kBV_H*kBT*2 + kBT*kBV_H*2 + 8 + 1023) & ~1023;
    int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
 
    // Use upper-bound for grid — excess blocks exit early via inline chunk mapping
@@ -1846,6 +1868,7 @@
    // H/O split path
    {
      HRecurrenceKernel<<<dim3(kNVT_H, num_seqs * kHv), 128, smem_H, stream>>>(
+         k_tmap_64,
          d_w, k_p,
          d_u, d_g, state_ptr, cusl_p,
          d_h, ns_p, num_seqs);
