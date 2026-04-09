@@ -5,8 +5,12 @@ author = "CUDA_ERROR_UNKNOWN"
 
 [build]
 language = "python"
-entry_point = "gdn_decode_mix.py::run"
+entry_point = "gdn_decode_v10.py::run"
 destination_passing_style = false
+
+#language = "python"
+#entry_point = "gdn_decode_mix.py::run"
+#destination_passing_style = false
 
 #language = "cuda"
 #entry_point = "gdn_decode_kernel_8.cu::gdn_decode_v8"
