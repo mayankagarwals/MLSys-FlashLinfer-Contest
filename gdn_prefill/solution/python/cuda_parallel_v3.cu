@@ -978,7 +978,8 @@
    float *s_gc = s_wh + kBT * kBV_H;                                        // [64] = 256B
    __nv_bfloat16 *s_k = reinterpret_cast<__nv_bfloat16 *>(s_gc + kBT);     // [64,128] = 16KB
    __nv_bfloat16 *s_vnew_T = s_k + kBT * kK;                               // [16,64] = 2KB
- 
+   __nv_bfloat16 *s_u = s_vnew_T + kBV_H * kBT;                            // [64,16] = 2KB (prefetched u_inout)
+
    // Persistent h state: h_reg[nt][reg], 4 N-tiles × 4 fp32 = 16 regs/thread
    // row0 = lane_id/4 (groupID, 0..7), row1 = row0+8 (8..15)
    // col = warp_id*32 + nt*8 + (lane_id%4)*2
@@ -1058,7 +1059,7 @@
      }
      __syncthreads();
  
-     // Issue k load early — overlaps with MMA1 (s_k not used until Step 3)
+     // Issue k + u loads early — both overlap with MMA1, single commit group
      {
        const __nv_bfloat16 *k_src = k_in + cstart * kHk * kK + k_head * kK;
        for (int i = tid; i < kBT * kK / 8; i += 128) {
@@ -1068,6 +1069,19 @@
            cp_async_cg_128(dst, &k_src[row * kHk * kK + col8], true);
          } else {
            *reinterpret_cast<int4 *>(&s_k[row * kK + col8]) = make_int4(0,0,0,0);
+         }
+       }
+       // Prefetch u_inout into s_u (hides strided global load latency behind MMA1)
+       {
+         const __nv_bfloat16 *u_base = u_inout + cstart * kHv * kV + hv * kV + v_start;
+         for (int i = tid; i < kBT * kBV_H / 8; i += 128) {
+           int t = i / (kBV_H / 8), bv8 = (i % (kBV_H / 8)) * 8;
+           uint32_t dst = cvt_smem_ptr(&s_u[t * kBV_H + bv8]);
+           if (t < clen) {
+             cp_async_cg_128(dst, &u_base[t * kHv * kV + bv8], true);
+           } else {
+             *reinterpret_cast<int4 *>(&s_u[t * kBV_H + bv8]) = make_int4(0,0,0,0);
+           }
          }
        }
        asm volatile("cp.async.commit_group;");
@@ -1109,10 +1123,13 @@
          }
        }
      }
+     // Wait for k+u cp.async (issued before MMA1, latency hidden behind MMA1 compute)
+     // Must complete before vnew reads s_u and before MMA2 reads s_k
+     asm volatile("cp.async.wait_group 0;");
      // NO __syncthreads here — v_new is per-warp (reads only own MMA1 rows)
- 
+     // s_u and s_k are filled by cp.async (thread-local, no cross-thread dependency)
+
      // Step 2: v_new (per-warp), gate, scale h, prefetch w[ct+1] via cp.async
-     // (k already loading since Step 1)
      {
        // Prefetch w[ct+1] into alternate buffer (all threads)
        if (ct + 1 < NT) {
@@ -1132,19 +1149,15 @@
          asm volatile("cp.async.commit_group;");
        }
  
-       // Per-warp v_new: each warp processes its own 16 rows (warp_id*16..+16)
-       // Only __syncwarp needed (not __syncthreads) since each warp reads its own s_wh rows
+       // Per-warp v_new: read from s_u (prefetched), compute v_new, writeback to global
        __syncwarp();
        float g_last = s_gc[clen - 1];
        {
-         // 32 lanes process 16 rows × 2 bv_halves = 32 items
-         // lane_id < 16: bv8=0, row=warp_id*16 + lane_id
-         // lane_id >= 16: bv8=8, row=warp_id*16 + (lane_id - 16)
          int bv8 = (lane_id < 16) ? 0 : 8;
          int t = warp_id * 16 + (lane_id & 15);
          if (t < clen) {
-           const __nv_bfloat16 *u_base = &u_inout[(cstart + t) * kHv * kV + hv * kV + v_start + bv8];
-           int4 u_vec = *reinterpret_cast<const int4 *>(u_base);
+           // Read from smem (prefetched via cp.async, latency hidden behind MMA1)
+           int4 u_vec = *reinterpret_cast<const int4 *>(&s_u[t * kBV_H + bv8]);
            __nv_bfloat16 *u_arr = reinterpret_cast<__nv_bfloat16 *>(&u_vec);
            float gc_t = s_gc[t];
            float gate = __expf(g_last - gc_t);
@@ -1154,9 +1167,9 @@
              u_arr[j] = __float2bfloat16(vn);
              s_vnew_T[(bv8 + j) * kBT + t] = __float2bfloat16(vn * gate);
            }
+           // Writeback modified u to global
            *reinterpret_cast<int4 *>(&u_inout[(cstart + t) * kHv * kV + hv * kV + v_start + bv8]) = u_vec;
          } else if (t < kBT) {
-           // Zero-fill rows beyond clen
            #pragma unroll
            for (int j = 0; j < 8; j++)
              s_vnew_T[(bv8 + j) * kBT + t] = __float2bfloat16(0.0f);
@@ -1167,10 +1180,9 @@
          h_reg[nt][0] *= g_exp; h_reg[nt][1] *= g_exp;
          h_reg[nt][2] *= g_exp; h_reg[nt][3] *= g_exp;
        }
-       // Wait for k (issued before MMA1). w[ct+1] may be in flight.
-       if (ct + 1 < NT)
-         asm volatile("cp.async.wait_group 1;");
-       else
+       // k+u already waited above. Only w[ct+1] may be in flight.
+       // Next iteration's step0 will wait for it with wait_group(0).
+       if (ct + 1 >= NT)
          asm volatile("cp.async.wait_group 0;");
        __syncthreads();
      }
@@ -1802,7 +1814,8 @@
  
    // Compute smem sizes for launch
    int smem_FP = (128*128*2 + 64*128*2 + 256 + 64*64*4 + 64*64*4 + 64*4 + 64*4 + 64*4 + 1023) & ~1023;
-   int smem_H = (2*kBT*kK*2 + kK*kBV_H*2 + kBT*kBV_H*4 + kBT*4 + kBT*kK*2 + kBV_H*kBT*2 + 1023) & ~1023;
+   // H-kernel smem: 2×w(16KB) + h_T(4KB) + wh(4KB) + gc(256B) + k(16KB) + vnew_T(2KB) + u(2KB)
+   int smem_H = (2*kBT*kK*2 + kK*kBV_H*2 + kBT*kBV_H*4 + kBT*4 + kBT*kK*2 + kBV_H*kBT*2 + kBT*kBV_H*2 + 1023) & ~1023;
    int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
 
    // Use upper-bound for grid — excess blocks exit early via inline chunk mapping
