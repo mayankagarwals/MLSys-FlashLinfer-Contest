@@ -1026,7 +1026,7 @@
      const int clen = min(kBT, (int)(s1 - cstart));
      const int64_t chunk_id = chunk_base + ct;
      __nv_bfloat16 *s_w = s_w_buf[ct & 1];
- 
+
      // Step 0: Store h → d_h (NON-TRANSPOSED: h[bv,k]) + s_h_T, wait for w[ct] cp.async
      {
        __nv_bfloat16 *h_dst = d_h + (chunk_id * kHv + hv) * kV * kK;
@@ -1204,6 +1204,7 @@
      // Next iteration's Step 0 has __syncthreads after h store + w wait.
    }
  
+   // DEBUG: print per-step timing from one representative block
    // Store final state
    {
      float *ns = new_state + ((int64_t)seq_idx * kHv + hv) * kV * kK;
