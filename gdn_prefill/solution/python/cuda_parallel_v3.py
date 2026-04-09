@@ -32,19 +32,6 @@ _ext._get_cuda_target = _orig_get_cuda_target
 mod = tvm_ffi.load_module(lib_path)
 _kernel = mod.gdn_prefill_tcgen05
 
-# Try chunk_v5 (CUDA kkt + Triton), fallback to triton_v4
-import sys
-sys.path.insert(0, str(CURRENT_DIR))
-_fast_chunk_run = None
-try:
-    from chunk_v5 import run as _fast_chunk_run
-except Exception:
-    try:
-        from triton_v4 import run as _fast_chunk_run
-    except Exception:
-        pass
-
-
 def run(
     q: Tensor,
     k: Tensor,
@@ -59,10 +46,6 @@ def run(
 ):
     T, H, V_dim = v.shape
     N = state.shape[0]
-
-    # Use chunk_v5/triton for large workloads where it's faster
-    if _fast_chunk_run is not None and T >= 4096:
-        return _fast_chunk_run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     output = torch.empty(T, H, V_dim, device=v.device, dtype=v.dtype)
     new_state = torch.empty(N, H, V_dim, V_dim, device=state.device, dtype=torch.float32)

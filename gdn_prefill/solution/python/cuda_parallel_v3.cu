@@ -1783,7 +1783,9 @@
      int smem_FP_attr = (128*128*2 + 64*128*2 + 256 + 64*64*4 + 64*64*4 + 64*4 + 64*4 + 64*4 + 1023) & ~1023;
      cudaFuncSetAttribute(FusedPrepKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_FP_attr);
      // HRecurrenceKernel: force 1 block/SM via 115KB smem pad (228KB/2 = 114KB)
-     int smem_H = 115 * 1024;  // Force 1 block/SM (prevents TMEM corruption)
+     // H-kernel: actual ~59KB but pad to 115KB to force 1 block/SM (sequential recurrence
+    // needs max registers; multi-block causes register pressure → 13% slower)
+    int smem_H = 115 * 1024;
      cudaFuncSetAttribute(HRecurrenceKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_H);
      // OOutputKernel v9 (tcgen05 swizzled, inline q@k^T): s_q(16KB) + s_h(16KB) + s_attn(8KB) + s_vnew(8KB) + s_gc(256B) + mbars(24B) + tmem(4B) ≈ 49KB
      int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
@@ -1799,7 +1801,7 @@
  
    // Compute smem sizes for launch
    int smem_FP = (128*128*2 + 64*128*2 + 256 + 64*64*4 + 64*64*4 + 64*4 + 64*4 + 64*4 + 1023) & ~1023;
-   int smem_H = 115 * 1024;
+   int smem_H = (2*kBT*kK*2 + kK*kBV_H*2 + kBT*kBV_H*4 + kBT*4 + kBT*kK*2 + kBV_H*kBT*2 + 1023) & ~1023;
    int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
 
    // Use upper-bound for grid — excess blocks exit early via inline chunk mapping
