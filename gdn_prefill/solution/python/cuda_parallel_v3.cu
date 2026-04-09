@@ -1067,13 +1067,14 @@
              __nv_bfloat162{b0, b1};
          *reinterpret_cast<__nv_bfloat162 *>(&h_dst[(v_start + row1) * kK + col0]) =
              __nv_bfloat162{b2, b3};
-         // s_h_T in tile format [K=128, BV=16] for bank-conflict-free ldmatrix
+         // s_h_T tile format: col0+1 is +16B, row1 is +2048B from base
          {
            char *hT_bytes = reinterpret_cast<char *>(s_h_T);
-           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + tile_byte_offset(col0,     row0, kK)) = b0;
-           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + tile_byte_offset(col0 + 1, row0, kK)) = b1;
-           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + tile_byte_offset(col0,     row1, kK)) = b2;
-           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + tile_byte_offset(col0 + 1, row1, kK)) = b3;
+           int hT_base = tile_byte_offset(col0, row0, kK);
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + hT_base) = b0;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + hT_base + 16) = b1;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + hT_base + kK * 16) = b2;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + hT_base + kK * 16 + 16) = b3;
          }
        }
        // Load g_cumsum early (overlapped with h store)
@@ -1199,26 +1200,28 @@
        {
          int bv8 = (lane_id < 16) ? 0 : 8;
          int t = warp_id * 16 + (lane_id & 15);
+         // s_vnew_T tile base: all 8 writes at stride 16B from same base
+         // tile_byte_offset(bv8, t, kBV_H) = (t/8)*256 + (bv8/8)*128 + (t%8)*2
+         char *vnT_bytes = reinterpret_cast<char *>(s_vnew_T);
+         int vnT_base = tile_byte_offset(bv8, t, kBV_H);
          if (t < clen) {
            // Read from smem (prefetched via cp.async, latency hidden behind MMA1)
            int4 u_vec = *reinterpret_cast<const int4 *>(&s_u[t * kBV_H + bv8]);
            __nv_bfloat16 *u_arr = reinterpret_cast<__nv_bfloat16 *>(&u_vec);
            float gc_t = s_gc[t];
            float gate = __expf(g_last - gc_t);
-           char *vnT_bytes = reinterpret_cast<char *>(s_vnew_T);
            #pragma unroll
            for (int j = 0; j < 8; j++) {
              float vn = __bfloat162float(u_arr[j]) - s_wh[t * kBV_H + bv8 + j];
              u_arr[j] = __float2bfloat16(vn);
-             *reinterpret_cast<__nv_bfloat16 *>(vnT_bytes + tile_byte_offset(bv8 + j, t, kBV_H)) = __float2bfloat16(vn * gate);
+             *reinterpret_cast<__nv_bfloat16 *>(vnT_bytes + vnT_base + j * 16) = __float2bfloat16(vn * gate);
            }
            // Writeback modified u to global
            *reinterpret_cast<int4 *>(&u_inout[(cstart + t) * kHv * kV + hv * kV + v_start + bv8]) = u_vec;
          } else if (t < kBT) {
-           char *vnT_bytes = reinterpret_cast<char *>(s_vnew_T);
            #pragma unroll
            for (int j = 0; j < 8; j++)
-             *reinterpret_cast<__nv_bfloat16 *>(vnT_bytes + tile_byte_offset(bv8 + j, t, kBV_H)) = __float2bfloat16(0.0f);
+             *reinterpret_cast<__nv_bfloat16 *>(vnT_bytes + vnT_base + j * 16) = __float2bfloat16(0.0f);
          }
        }
        float g_exp = __expf(g_last);
