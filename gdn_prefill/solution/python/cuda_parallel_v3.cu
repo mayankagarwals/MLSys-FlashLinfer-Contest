@@ -1004,19 +1004,21 @@
    }
    __syncthreads();
  
-   // Prefetch w[0] before the chunk loop
+   // Prefetch w[0] before the chunk loop (tile format for bank-conflict-free ldmatrix)
    {
      const int64_t cstart0 = s0;
      const int clen0 = min(kBT, (int)(s1 - cstart0));
      const __nv_bfloat16 *w_ptr = w_in + cstart0 * kHv * kK + hv * kK;
      __nv_bfloat16 *s_w = s_w_buf[0];
+     const uint32_t w_smem_base = cvt_smem_ptr(s_w);
      for (int i = tid; i < kBT * kK / 8; i += 128) {
        int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
-       uint32_t dst = cvt_smem_ptr(&s_w[row * kK + col8]);
+       int byte_off = tile_byte_offset(row, col8, kBT);
+       uint32_t dst = w_smem_base + byte_off;
        if (row < clen0) {
          cp_async_cg_128(dst, &w_ptr[row * kHv * kK + col8], true);
        } else {
-         *reinterpret_cast<int4 *>(&s_w[row * kK + col8]) = make_int4(0,0,0,0);
+         *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_w) + byte_off) = make_int4(0,0,0,0);
        }
      }
      asm volatile("cp.async.commit_group;");
@@ -1045,11 +1047,14 @@
              __nv_bfloat162{b0, b1};
          *reinterpret_cast<__nv_bfloat162 *>(&h_dst[(v_start + row1) * kK + col0]) =
              __nv_bfloat162{b2, b3};
-         // s_h_T for MMA1 within H-kernel (unchanged)
-         s_h_T[col0       * kBV_H + row0] = b0;
-         s_h_T[(col0 + 1) * kBV_H + row0] = b1;
-         s_h_T[col0       * kBV_H + row1] = b2;
-         s_h_T[(col0 + 1) * kBV_H + row1] = b3;
+         // s_h_T in tile format [K=128, BV=16] for bank-conflict-free ldmatrix
+         {
+           char *hT_bytes = reinterpret_cast<char *>(s_h_T);
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + tile_byte_offset(col0,     row0, kK)) = b0;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + tile_byte_offset(col0 + 1, row0, kK)) = b1;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + tile_byte_offset(col0,     row1, kK)) = b2;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + tile_byte_offset(col0 + 1, row1, kK)) = b3;
+         }
        }
        // Load g_cumsum early (overlapped with h store)
        if (tid < kBT)
@@ -1062,13 +1067,15 @@
      // Issue k + u loads early — both overlap with MMA1, single commit group
      {
        const __nv_bfloat16 *k_src = k_in + cstart * kHk * kK + k_head * kK;
+       const uint32_t k_smem_base = cvt_smem_ptr(s_k);
        for (int i = tid; i < kBT * kK / 8; i += 128) {
          int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
-         uint32_t dst = cvt_smem_ptr(&s_k[row * kK + col8]);
+         int byte_off = tile_byte_offset(row, col8, kBT);
+         uint32_t dst = k_smem_base + byte_off;
          if (row < clen) {
            cp_async_cg_128(dst, &k_src[row * kHk * kK + col8], true);
          } else {
-           *reinterpret_cast<int4 *>(&s_k[row * kK + col8]) = make_int4(0,0,0,0);
+           *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_k) + byte_off) = make_int4(0,0,0,0);
          }
        }
        // Prefetch u_inout into s_u (hides strided global load latency behind MMA1)
@@ -1097,14 +1104,14 @@
          {
            int r = (lane_id % 8) + ((lane_id & 8) ? 8 : 0) + warp_id * 16;
            int c = (lane_id >= 16) ? 8 : 0;
-           ldmatrix<4>(a, cvt_smem_ptr(&s_w[r * kK + kt * 16 + c]));
+           ldmatrix<4>(a, cvt_smem_ptr(s_w) + tile_byte_offset(r, kt * 16 + c, kBT));
          }
          #pragma unroll
          for (int nt = 0; nt < 2; nt++) {
            uint32_t b[2];
            {
              int k_row = lane_id % 16;
-             ldmatrix_trans<2>(b, cvt_smem_ptr(&s_h_T[(kt * 16 + k_row) * kBV_H + nt * 8]));
+             ldmatrix_trans<2>(b, cvt_smem_ptr(s_h_T) + tile_byte_offset(kt * 16 + k_row, nt * 8, kK));
            }
            mma_m16n8k16_bf16(
                wh_acc[nt][0], wh_acc[nt][1], wh_acc[nt][2], wh_acc[nt][3],
@@ -1137,13 +1144,15 @@
          const int next_clen = min(kBT, (int)(s1 - next_cstart));
          const __nv_bfloat16 *w_ptr = w_in + next_cstart * kHv * kK + hv * kK;
          __nv_bfloat16 *s_w_next = s_w_buf[(ct + 1) & 1];
+         const uint32_t wn_smem_base = cvt_smem_ptr(s_w_next);
          for (int i = tid; i < kBT * kK / 8; i += 128) {
            int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
-           uint32_t dst = cvt_smem_ptr(&s_w_next[row * kK + col8]);
+           int byte_off = tile_byte_offset(row, col8, kBT);
+           uint32_t dst = wn_smem_base + byte_off;
            if (row < next_clen) {
              cp_async_cg_128(dst, &w_ptr[row * kHv * kK + col8], true);
            } else {
-             *reinterpret_cast<int4 *>(&s_w_next[row * kK + col8]) = make_int4(0,0,0,0);
+             *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_w_next) + byte_off) = make_int4(0,0,0,0);
            }
          }
          asm volatile("cp.async.commit_group;");
@@ -1161,18 +1170,20 @@
            __nv_bfloat16 *u_arr = reinterpret_cast<__nv_bfloat16 *>(&u_vec);
            float gc_t = s_gc[t];
            float gate = __expf(g_last - gc_t);
+           char *vnT_bytes = reinterpret_cast<char *>(s_vnew_T);
            #pragma unroll
            for (int j = 0; j < 8; j++) {
              float vn = __bfloat162float(u_arr[j]) - s_wh[t * kBV_H + bv8 + j];
              u_arr[j] = __float2bfloat16(vn);
-             s_vnew_T[(bv8 + j) * kBT + t] = __float2bfloat16(vn * gate);
+             *reinterpret_cast<__nv_bfloat16 *>(vnT_bytes + tile_byte_offset(bv8 + j, t, kBV_H)) = __float2bfloat16(vn * gate);
            }
            // Writeback modified u to global
            *reinterpret_cast<int4 *>(&u_inout[(cstart + t) * kHv * kV + hv * kV + v_start + bv8]) = u_vec;
          } else if (t < kBT) {
+           char *vnT_bytes = reinterpret_cast<char *>(s_vnew_T);
            #pragma unroll
            for (int j = 0; j < 8; j++)
-             s_vnew_T[(bv8 + j) * kBT + t] = __float2bfloat16(0.0f);
+             *reinterpret_cast<__nv_bfloat16 *>(vnT_bytes + tile_byte_offset(bv8 + j, t, kBV_H)) = __float2bfloat16(0.0f);
          }
        }
        float g_exp = __expf(g_last);
@@ -1196,14 +1207,14 @@
          {
            int r = (lane_id % 8) + ((lane_id & 8) ? 8 : 0);
            int c = (lane_id >= 16) ? 8 : 0;
-           ldmatrix<4>(a, cvt_smem_ptr(&s_vnew_T[r * kBT + kt * 16 + c]));
+           ldmatrix<4>(a, cvt_smem_ptr(s_vnew_T) + tile_byte_offset(r, kt * 16 + c, kBV_H));
          }
          #pragma unroll
          for (int nt = 0; nt < 4; nt++) {
            uint32_t b[2];
            {
              int kr = lane_id % 16;
-             ldmatrix_trans<2>(b, cvt_smem_ptr(&s_k[(kt * 16 + kr) * kK + wn + nt * 8]));
+             ldmatrix_trans<2>(b, cvt_smem_ptr(s_k) + tile_byte_offset(kt * 16 + kr, wn + nt * 8, kBT));
            }
            mma_m16n8k16_bf16(
                h_reg[nt][0], h_reg[nt][1], h_reg[nt][2], h_reg[nt][3],
