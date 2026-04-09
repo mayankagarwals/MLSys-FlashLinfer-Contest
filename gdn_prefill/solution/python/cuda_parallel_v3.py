@@ -1,16 +1,14 @@
 import ctypes
+import os
 ctypes.CDLL("libcudart.so", mode=ctypes.RTLD_GLOBAL)
 
 import torch
 from pathlib import Path
 from torch import Tensor
 
-import tvm_ffi
-import tvm_ffi.cpp.extension as _ext
+os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 
-# Monkey-patch to force sm_100a (needed for tcgen05 instructions on Blackwell)
-_orig_get_cuda_target = _ext._get_cuda_target
-_ext._get_cuda_target = lambda: "-gencode=arch=compute_100a,code=sm_100a"
+import tvm_ffi
 
 CURRENT_DIR = Path(__file__).parent
 
@@ -25,9 +23,6 @@ lib_path = tvm_ffi.cpp.build(
     ],
     extra_ldflags=["-lcuda"],
 )
-
-# Restore original
-_ext._get_cuda_target = _orig_get_cuda_target
 
 mod = tvm_ffi.load_module(lib_path)
 _kernel = mod.gdn_prefill_tcgen05
