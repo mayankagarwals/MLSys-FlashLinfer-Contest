@@ -122,10 +122,9 @@ void h_kernel_cutlass(
   const uint32_t taddr = vk_mbar_addr + 8;
 
   // set up tmem
-  // since we issue wh and vk MMA sequentially, we can overlap the acc and input buffer.
-  // separate h_tmem and v_tmem buffers
-  const uint32_t acc_tmem = 0;
-  const uint32_t h_tmem_base = acc_tmem + max(BT, K_dim);
+  const uint32_t wh_tmem = 0;
+  const uint32_t vk_tmem = wh_tmem + BT;
+  const uint32_t h_tmem_base = vk_tmem + K_dim;
   const uint32_t v_tmem_base = h_tmem_base + K_dim / 2;
 
   if (warp_id == 0) {
@@ -211,8 +210,6 @@ void h_kernel_cutlass(
         constexpr uint64_t w_desc_base = (desc_encode(8 * 128) << 32ULL)  // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
 
-        // when h is ready in tmem, it also means H warps have finished using vk in acc tmem buffer
-        // -> we can reuse this buffer for wh MMA
         mbarrier_wait(tma_mbar_addr + tma_stage * 8, tma_parity);  // wait for TMA
         mbarrier_wait(h_mbar_addr, h_parity);                      // wait for h store to tmem
         tcgen05_fence_after_thread_sync();
@@ -224,7 +221,7 @@ void h_kernel_cutlass(
             const int h_tmem = h_tmem_base + i * 32 + j * 8;
             const uint64_t w_desc = w_desc_base | ((W_smem + i * BT * 128 + j * 32) >> 4);
             const int enable_input_d = (i > 0) || (j > 0);
-            tcgen05_mma_tmem(acc_tmem, h_tmem, w_desc, wh_idesc, enable_input_d);
+            tcgen05_mma_tmem(wh_tmem, h_tmem, w_desc, wh_idesc, enable_input_d);
           }
         tcgen05_commit(wh_mbar_addr);
 
@@ -237,11 +234,8 @@ void h_kernel_cutlass(
         constexpr uint64_t k_desc_base = (desc_encode(8 * 128) << 16ULL)                         // LBO
                                        | (desc_encode(K_dim * sizeof(nv_bfloat16) * 8) << 32ULL) // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
-
-        // wait for (scaled) v_new store to tmem
-        // this is also after V warps have finished using wh tmem buffer
-        // -> we can reuse this buffer for vk MMA
-        mbarrier_wait(v_mbar_addr, h_parity);
+        
+        mbarrier_wait(v_mbar_addr, h_parity);  // wait for (scaled) v_new store to tmem
         tcgen05_fence_after_thread_sync();
 
         // k selects [V_dim/K_dim, 16] tile
@@ -249,7 +243,7 @@ void h_kernel_cutlass(
           const int v_tmem = v_tmem_base + k * 8;
           const uint64_t k_desc = k_desc_base | ((K_smem + k * 16 * K_dim * sizeof(nv_bfloat16)) >> 4);
           const int enable_input_d = k > 0;
-          tcgen05_mma_tmem(acc_tmem, v_tmem, k_desc, vk_idesc, enable_input_d);
+          tcgen05_mma_tmem(vk_tmem, v_tmem, k_desc, vk_idesc, enable_input_d);
         }
         tcgen05_commit(vk_mbar_addr);
 
@@ -314,7 +308,7 @@ void h_kernel_cutlass(
       constexpr int WIDTH = 16;  // adjustable
       for (int i = 0; i < K_dim / WIDTH; i++) {
         float vk[WIDTH];
-        tcgen05_ld<SHAPE::_32x32b, WIDTH>(vk, warp_id_ * 32, acc_tmem + i * WIDTH);
+        tcgen05_ld<SHAPE::_32x32b, WIDTH>(vk, warp_id_ * 32, vk_tmem + i * WIDTH);
 
         // TODO: fma.f32x2?
         for (int j = 0; j < WIDTH; j++)
@@ -379,7 +373,7 @@ void h_kernel_cutlass(
         // each 16x256b tile corresponds to 16x8 tile of wh
         float tmp[BT / 2];
         const int t_row = warp_id * 32 + i * 16;
-        tcgen05_ld<SHAPE::_16x256b, BT / 8>(tmp, t_row, acc_tmem);
+        tcgen05_ld<SHAPE::_16x256b, BT / 8>(tmp, t_row, wh_tmem);
 
         // each j iteration processes a [16, 16] tile per warp
         // V smem layout is [2, BT, V_dim/2] with swizzling
