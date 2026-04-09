@@ -327,10 +327,6 @@ void h_kernel_cutlass(
     int tma_stage = 0;
     int wh_parity = 0;
 
-    // set up invariance
-    if (warp_id == 0 && elect_sync())
-      cp_async_bulk_commit_group();
-
     for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
       // load g_cu and compute scaling for v_new
       if (tid < BT) {
@@ -406,7 +402,7 @@ void h_kernel_cutlass(
         }
 
         // store scaled v_new for vk MMA
-        tcgen05_st<SHAPE::_16x128b, BT / 16>(t_row, v_tmem_base, tmp);
+        tcgen05_st<SHAPE::_16x128b, BT / 8>(t_row, v_tmem_base, tmp);
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
