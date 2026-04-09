@@ -107,16 +107,17 @@ void h_kernel_cutlass(
   // set up smem
   extern __shared__ __align__(1024) char smem_ptr[];
   const uint32_t smem = __cvta_generic_to_shared(smem_ptr);
+  const uint32_t V_new_smem = smem + NUM_STAGES * STAGE_SIZE;
 
-  const uint32_t v_scale_smem = smem + NUM_STAGES * STAGE_SIZE;
+  const uint32_t v_scale_smem = V_new_smem + V_size;
   float *v_scale_smem_ptr = reinterpret_cast<float *>(smem_ptr + (v_scale_smem - smem));
 
   const uint32_t tma_mbar_addr = v_scale_smem + v_scale_size;
   const uint32_t mma_mbar_addr = tma_mbar_addr + NUM_STAGES * 8;
-  const uint32_t h_mbar_addr = mma_mbar_addr + NUM_STAGES * 8;
-  const uint32_t v_mbar_addr = h_mbar_addr + 8;
-  const uint32_t wh_mbar_addr = v_mbar_addr + 8;
-  const uint32_t vk_mbar_addr = wh_mbar_addr + 8;
+  const uint32_t h_mbar_addr   = mma_mbar_addr + NUM_STAGES * 8;
+  const uint32_t v_mbar_addr   = h_mbar_addr + 8;
+  const uint32_t wh_mbar_addr  = v_mbar_addr + 8;
+  const uint32_t vk_mbar_addr  = wh_mbar_addr + 8;
 
   const uint32_t taddr = vk_mbar_addr + 8;
 
@@ -170,10 +171,12 @@ void h_kernel_cutlass(
 
         // issue TMA and arrive
         // natural shape: [T, H, dim]
-        // permuted shape: [H, dim/64, T, 64]
+        // permute shape:
+        //   for W and V: [H, dim/64, T, 64]
+        //   for K:       [H, T/8, dim/64, 8, 64]
         tma_load_4d(W_smem, &W_tmap, 0, off_t, 0, head_id, mbar_addr);
         tma_load_4d(V_smem, &V_tmap, 0, off_t, 0, head_id, mbar_addr);
-        tma_load_4d(K_smem, &K_tmap, 0, off_t, 0, k_head_id, mbar_addr);
+        tma_load_5d(K_smem, &K_tmap, 0, 0, 0, off_t / 8, k_head_id, mbar_addr);
         mbarrier_arrive_expect_tx(mbar_addr, STAGE_SIZE);
 
         // increment stage
@@ -190,53 +193,60 @@ void h_kernel_cutlass(
     if (elect_sync()) {
       int tma_stage = 0;
       int tma_parity = 0;
-
       int h_parity = 0;
-
-      constexpr uint32_t wh_idesc = make_tcgen05_idesc(V_dim, BT);
-      constexpr uint32_t vk_idesc = make_tcgen05_idesc(V_dim, K_dim) | (1U << 16U);  // transpose B
 
       for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
         const uint32_t W_smem = smem + tma_stage * STAGE_SIZE;
         const uint32_t V_smem = W_smem + W_size;
         const uint32_t K_smem = V_smem + V_size;
 
-        // 128B swizzling
-        constexpr uint64_t w_desc_base = (desc_encode(8 * 128) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-
         // wh MMA
+        // H in tmem, W in smem. both are K-major
         // [V_dim, K_dim] x [BT, K_dim] -> [V_dim, BT]
+        constexpr uint32_t wh_idesc = make_tcgen05_idesc(V_dim, BT);
+
+        // 128B swizzling
+        constexpr uint64_t w_desc_base = (desc_encode(8 * 128) << 32ULL)  // SBO
+                                       | (1ULL << 46ULL) | (2ULL << 61ULL);
+
         mbarrier_wait(tma_mbar_addr + tma_stage * 8, tma_parity);  // wait for TMA
         mbarrier_wait(h_mbar_addr, h_parity);                      // wait for h store to tmem
         tcgen05_fence_after_thread_sync();
 
-        // i selects the [V_dim, 64] tile (increment by V_dim x 128B)
-        // j selects the [V_dim, 16] tile (increment by 32B due to swizzling)
+        // i selects the [V_dim/BT, 64] tile (increment 32 tmem columns for H, increment by BT x 128B for W)
+        // j selects the [V_dim/BT, 16] tile (increment 8  tmem columns for H, increment by 32B due to swizzling for W)
         for (int i = 0; i < K_dim / 64; i++)
           for (int j = 0; j < 64 / 16; j++) {
-            const int h_tmem = a_tmem + (i * 64 + j * 16) / 2;  // divide by 2 since each column is 4-byte = 2x BF16 elems
-            const uint64_t w_desc = w_desc_base | ((W_smem + i * V_dim * 128 + j * 32) >> 4);
+            const int h_tmem = a_tmem + i * 32 + j * 8;
+            const uint64_t w_desc = w_desc_base | ((W_smem + i * BT * 128 + j * 32) >> 4);
             const int enable_input_id = (i > 0) || (j > 0);
             tcgen05_mma_tmem(acc_tmem, h_tmem, w_desc, wh_idesc, enable_input_id);
           }
         tcgen05_commit(wh_mbar_addr);
 
         // vk MMA
+        // scaled v_new in tmem, K in smem. K is MN-major
         // [V_dim, BT] x [BT, K_dim] -> [V_dim, K_dim]
-        mbarrier_wait(v_mbar_addr, h_parity);  // wait for (scaled) v_new store to tmem
+        constexpr uint32_t vk_idesc = make_tcgen05_idesc(V_dim, K_dim) | (1U << 16U);  // transpose B
+
+        // MN-major, 128B swizzling
+        constexpr uint64_t k_desc_base = (desc_encode(K_dim * sizeof(nv_bfloat16) * 8) << 16ULL)  // LBO
+                                       | (desc_encode(8 * 128) << 32ULL)                          // SBO
+                                       | (1ULL << 46ULL) | (2ULL << 61ULL);
+
+        // wait for (scaled) v_new store to tmem
+        // this is also after V warps have finished using wh tmem buffer
+        // -> we can reuse this buffer for vk MMA
+        mbarrier_wait(v_mbar_addr, h_parity);
         tcgen05_fence_after_thread_sync();
 
-        // 128B swizzling
-        // TODO: fix this, MN-major
-        constexpr uint64_t k_desc_base = (desc_encode(8 * 128) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-
-        for (int i = 0; i < BT / 64; i++)
-          for (int j = 0; j < 64 / 16; j++) {
-            const int v_tmem = a_tmem + (i * 64 + j * 16) / 2;
-            const uint64_t k_desc = k_desc_base | ((K_smem + 0) >> 4);  // TODO: fix this
-            const int enable_input_id = (i > 0) || (j > 0);
-            tcgen05_mma_tmem(acc_tmem, v_tmem, k_desc, vk_idesc, enable_input_id);
-          }
+        // k selects [V_dim/K_dim, 16] tile
+        for (int k = 0; k < BT / 16; k++) {
+          const int v_tmem = a_tmem + k * 8;
+          const uint64_t k_desc = k_desc_base | ((K_smem + k * 16 * K_dim * sizeof(nv_bfloat16)) >> 4);
+          const int enable_input_id = k > 0;
+          tcgen05_mma_tmem(acc_tmem, v_tmem, k_desc, vk_idesc, enable_input_id);
+        }
         tcgen05_commit(vk_mbar_addr);
 
         // done using TMA buffers
@@ -245,7 +255,6 @@ void h_kernel_cutlass(
         tma_stage = (tma_stage + 1) % NUM_STAGES;
         if (tma_stage == 0)
           tma_parity ^= 1;
-
         h_parity ^= 1;
       }
     }
@@ -278,7 +287,7 @@ void h_kernel_cutlass(
           tmp[j] = fp32x2_to_bf16x2(h_f32[i * 16 + j * 2], h_f32[i * 16 + j * 2 + 1]);
 
         stg_u32x8(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);  // for O kernel
-        tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, a_tmem + i * 8, tmp);  // for WH MMA
+        tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, a_tmem + i * 8, tmp);  // for WH MMA
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
@@ -287,7 +296,7 @@ void h_kernel_cutlass(
       // load g_cu_last and compute scaling for H
       float h_scale;
       if (lane_id == 0) {
-        const int last_idx = min(bos + chunk_id * BT + chunk_id - 1, eos);
+        const int last_idx = min(bos + chunk_id * BT + (BT - 1), eos);
         h_scale = __expf(g_cu_ptr[last_idx * H + head_id]);
       }
       h_scale = warp_uniform(h_scale);
@@ -300,7 +309,7 @@ void h_kernel_cutlass(
       constexpr int WIDTH = 16;  // adjustable
       for (int i = 0; i < K_dim / WIDTH; i++) {
         float vk[WIDTH];
-        tcgen05_ld<SHAPE::_32x32b, WIDTH>(vk, warp_id_ * 32, i * WIDTH);
+        tcgen05_ld<SHAPE::_32x32b, WIDTH>(vk, warp_id_ * 32, acc_tmem + i * WIDTH);
 
         // TODO: fma.f32x2?
         for (int j = 0; j < WIDTH; j++)
@@ -320,7 +329,6 @@ void h_kernel_cutlass(
     // V CUDA warps
     int tma_parity = 0;
     int tma_stage = 0;
-
     int wh_parity = 0;
 
     // set up invariance
@@ -330,7 +338,7 @@ void h_kernel_cutlass(
     for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
       // load g_cu and compute scaling for v_new
       if (tid < BT) {
-        const int last_idx = min(bos + chunk_id * BT + chunk_id - 1, eos);
+        const int last_idx = min(bos + chunk_id * BT + (BT - 1), eos);
         float g_cu = g_cu_ptr[(bos + chunk_id * BT + tid) * H + head_id];
         float g_cu_last = g_cu_ptr[last_idx * H + head_id];
 
@@ -342,6 +350,7 @@ void h_kernel_cutlass(
 
       const uint32_t W_smem = smem + tma_stage * STAGE_SIZE;
       const uint32_t V_smem = W_smem + W_size;
+      const uint32_t K_smem = V_smem + V_size;
 
       if (warp_id == 2) {
         // wait for V TMA and wh MMA
@@ -363,7 +372,7 @@ void h_kernel_cutlass(
         // each 16x256b tile corresponds to 16x8 tile of wh
         float tmp[BT / 2];
         const int t_row = warp_id * 32 + i * 16;
-        tcgen05_ld<SHAPE::_16x256b, BT / 8>(tmp, t_row, 0);
+        tcgen05_ld<SHAPE::_16x256b, BT / 8>(tmp, t_row, acc_tmem);
 
         // each j iteration processes a [16, 16] tile per warp
         // V smem layout is [2, BT, V_dim/2] with swizzling
@@ -371,7 +380,7 @@ void h_kernel_cutlass(
           uint32_t v_tmp[4];
           const uint32_t offset = (warp_id / 2) * BT * 128;
           const uint32_t s_row = j * 16 + (lane_id / 16) * 8 + (lane_id % 8);
-          const uint32_t s_col = ((warp_id % 2) * 32 + i * 16 + (lane_id % 16) / 8) ^ (lane_id % 8);
+          const uint32_t s_col = ((warp_id % 2) * 4 + i * 2 + (lane_id % 16) / 8) ^ (lane_id % 8);
           ldmatrix_trans<4>(v_tmp, V_smem + offset + s_row * 128 + s_col * 16);
 
           for (int k = 0; k < 4; k++) {
@@ -387,17 +396,18 @@ void h_kernel_cutlass(
             v_tmp[k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
 
             // scale v_new for vk MMA
-            v_fp32[0] *= v_scale_smem_ptr[0];
-            v_fp32[1] *= v_scale_smem_ptr[0];
-            reinterpret_cast<uint32_t *>(tmp)[j * 4 + k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[0]);
+            v_fp32[0] *= v_scale_smem_ptr[j * 16 + (k / 2) * 8 + (lane_id % 4) * 2 + 0];
+            v_fp32[1] *= v_scale_smem_ptr[j * 16 + (k / 2) * 8 + (lane_id % 4) * 2 + 1];
+            reinterpret_cast<uint32_t *>(tmp)[j * 4 + k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
           }
 
           // store v_new for O kernel to smem
-          stmatrix_trans<4>(V_smem + offset + s_row * 128 + s_col * 16, v_tmp);
+          // this mirrors ldmatrix for V
+          stmatrix_trans<4>(V_new_smem + offset + s_row * 128 + s_col * 16, v_tmp);
         }
 
         // store scaled v_new for vk MMA
-        tcgen05_st<SHAPE::_16x128b, BT / 8>(a_tmem + t_row, 0, tmp);
+        tcgen05_st<SHAPE::_16x128b, BT / 8>(t_row, a_tmem, tmp);
       }
       mbarrier_arrive(v_mbar_addr);
 
@@ -407,9 +417,10 @@ void h_kernel_cutlass(
       // issue V_new store TMA
       if (warp_id == 3 && elect_sync()) {
         // async-proxy fence
+        // NOTE: this doesn't do bounds check
         asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;");
         const int off_t = bos + chunk_id * BT;
-        tma_store_4d(&V_new_tmap, V_smem, 0, off_t, 0, head_id);
+        tma_store_4d(&V_new_tmap, V_new_smem, 0, off_t, 0, head_id);
         cp_async_bulk_commit_group();
       }
 
@@ -430,13 +441,35 @@ static
 CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   CUtensorMap tmap;
 
-  // natural shape: [T, H, dim]
+  // natural shape:  [T, H, dim]
   // permuted shape: [H, dim/64, T, 64]
   constexpr uint32_t rank = 4;
   uint64_t globalDim[rank] = {64, T, dim / 64, H};
   uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16), 128, dim};
   uint32_t boxDim[rank] = {64, BT, dim / 64, 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
+
+  cuTensorMapEncodeTiled(
+    &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr,
+    globalDim, globalStrides, boxDim, elementStrides,
+    CU_TENSOR_MAP_INTERLEAVE_NONE,
+    CU_TENSOR_MAP_SWIZZLE_128B,
+    CU_TENSOR_MAP_L2_PROMOTION_NONE,
+    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return tmap;
+}
+
+static
+CUtensorMap encode_tma_trans(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
+  CUtensorMap tmap;
+
+  // natural shape:  [T, H, dim]
+  // permuted shape: [H, T/8, dim/64, 8, 64]
+  constexpr uint32_t rank = 5;
+  uint64_t globalDim[rank] = {64, 8, dim / 64, T / 8, H};
+  uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16), 128, 8 * H * dim * sizeof(nv_bfloat16), dim};  // in bytes
+  uint32_t boxDim[rank] = {64, 8, dim / 64, BT / 8, 1};
+  uint32_t elementStrides[rank] = {1, 1, 1, 1, 1};
 
   cuTensorMapEncodeTiled(
     &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr,
@@ -463,7 +496,7 @@ void h_v1(
   const int T = K.size(0);
   const int N = h0.size(0);
 
-  auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim);
+  auto K_tmap     = encode_tma_trans(K.data_ptr(), T, Hg, K_dim);
   auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
   auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
   auto V_new_tmap = encode_tma(V_new.data_ptr(), T, H, V_dim);
@@ -477,6 +510,7 @@ void h_v1(
 
   constexpr int NUM_STAGES = 3;
   constexpr int smem_size = STAGE_SIZE * NUM_STAGES
+                          + V_size           // V_new
                           + v_scale_size     // v_scale
                           + 8 * NUM_STAGES   // TMA mbar
                           + 8 * NUM_STAGES   // MMA mbar

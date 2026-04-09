@@ -211,6 +211,17 @@ void tma_load_4d(uint32_t smem_addr, const void *tmap_ptr,
        "r"(mbar_addr), "l"(cache_policy) : "memory");
 }
 
+__device__ __forceinline__
+void tma_load_5d(uint32_t smem_addr, const void *tmap_ptr,
+                 int x, int y, int z, int w, int t,
+                 uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
+  asm volatile(
+    "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+    "[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+    :: "r"(smem_addr), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w), "r"(t),
+       "r"(mbar_addr), "l"(cache_policy) : "memory");
+}
+
 // TMA device-side stores
 __device__ __forceinline__
 void tma_store_2d(const void *tmap_ptr, uint32_t smem_addr, 
