@@ -450,7 +450,9 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   // permuted shape: [H, dim/64, T, 64]
   constexpr uint32_t rank = 4;
   uint64_t globalDim[rank] = {64, T, dim / 64, H};
-  uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16), 128, dim};
+  uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16),
+                                      128,
+                                      dim * sizeof(nv_bfloat16)};  // in bytes
   uint32_t boxDim[rank] = {64, BT, dim / 64, 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
@@ -472,7 +474,10 @@ CUtensorMap encode_tma_trans(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   // permuted shape: [H, T/8, dim/64, 8, 64]
   constexpr uint32_t rank = 5;
   uint64_t globalDim[rank] = {64, 8, dim / 64, T / 8, H};
-  uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16), 128, 8 * H * dim * sizeof(nv_bfloat16), dim};  // in bytes
+  uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16),
+                                      128,
+                                      8 * H * dim * sizeof(nv_bfloat16),
+                                      dim * sizeof(nv_bfloat16)};  // in bytes
   uint32_t boxDim[rank] = {64, 8, dim / 64, BT / 8, 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1, 1};
 
