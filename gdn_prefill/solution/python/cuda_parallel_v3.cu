@@ -744,10 +744,8 @@
    // Convert A_inv fp32 → bf16 row-major in s_A_tiles[64,64] (first 8KB of 32KB buffer)
    // Vectorized: convert 8 fp32 → 4 bf16x2 → 1 int4 store
    __nv_bfloat16 *s_Ainv_bf16 = reinterpret_cast<__nv_bfloat16 *>(s_A_tiles);  // [64,64] bf16
-   // Write in tile format for bank-conflict-free ldmatrix reads in MMA
    for (int i = tid; i < kBT * kBT / 8; i += 128) {
      int idx = i * 8;
-     int row = idx / kBT, col8 = idx % kBT;
      const float *src = &s_result_inv[idx];
      int4 dst;
      __nv_bfloat162 *dp = reinterpret_cast<__nv_bfloat162 *>(&dst);
@@ -755,7 +753,7 @@
      dp[1] = {__float2bfloat16(src[2]), __float2bfloat16(src[3])};
      dp[2] = {__float2bfloat16(src[4]), __float2bfloat16(src[5])};
      dp[3] = {__float2bfloat16(src[6]), __float2bfloat16(src[7])};
-     *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_Ainv_bf16) + tile_byte_offset(row, col8, kBT)) = dst;
+     *reinterpret_cast<int4 *>(&s_Ainv_bf16[idx]) = dst;
    }
  
    // cp.async load k_in → s_stage (overlapped with A_inv conversion)
@@ -784,10 +782,10 @@
  
    // Process W: scale full 128-col k input into s_input_bf16[64,128], single MMA pass with 16 N-tiles
    {
-     // Scale all 128 cols: s_input_bf16[t, j] = s_stage[t, j] * s_bg[t] (tile format)
+     // Scale all 128 cols at once: s_input_bf16[t, j] = s_stage[t, j] * s_bg[t]
+     // Vectorized with bf16x2 multiply (native hw instruction, no float conversion)
      for (int i = tid; i < kBT * kK / 8; i += 128) {
        int t = (i * 8) / kK, j = (i * 8) % kK;
-       int byte_off = tile_byte_offset(t, j, kBT);
        if (t < clen) {
          __nv_bfloat162 bg2 = __float2bfloat162_rn(s_bg[t]);
          int4 src = *reinterpret_cast<const int4 *>(&s_stage[t * kK + j]);
@@ -795,13 +793,13 @@
          #pragma unroll
          for (int p = 0; p < 4; p++)
            sp[p] = __hmul2(sp[p], bg2);
-         *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_input_bf16) + byte_off) = src;
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = src;
        } else {
-         *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_input_bf16) + byte_off) = make_int4(0, 0, 0, 0);
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = make_int4(0, 0, 0, 0);
        }
      }
      __syncthreads();
-
+ 
      // Issue v cp.async EARLY — overlaps with W MMA below
      // s_stage (s_result) is no longer read after scaling above, safe to overwrite
      {
@@ -824,13 +822,13 @@
        {
          int r = (lane_p3 % 8) + ((lane_p3 & 8) ? 8 : 0) + m_base_p3;
          int c = (lane_p3 >= 16) ? 8 : 0;
-         ldmatrix<4>(a, cvt_smem_ptr(s_Ainv_bf16) + tile_byte_offset(r, kt * 16 + c, kBT));
+         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
        }
        for (int nt = 0; nt < 16; nt++) {
          uint32_t b[2];
          {
            int kr = lane_p3 % 16;
-           ldmatrix_trans<2>(b, cvt_smem_ptr(s_input_bf16) + tile_byte_offset(kt * 16 + kr, nt * 8, kBT));
+           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
          }
          mma_m16n8k16_bf16(
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3],
@@ -865,10 +863,9 @@
  
    // Process U: scale full 128-col v input into s_input_bf16[64,128], single MMA pass
    {
-     // Scale v input into tile-format s_input_bf16
+     // Vectorized with bf16x2 multiply
      for (int i = tid; i < kBT * kK / 8; i += 128) {
        int t = (i * 8) / kK, j = (i * 8) % kK;
-       int byte_off = tile_byte_offset(t, j, kBT);
        if (t < clen) {
          __nv_bfloat162 bg2 = __float2bfloat162_rn(s_bg[t]);
          int4 src = *reinterpret_cast<const int4 *>(&s_stage[t * kK + j]);
@@ -876,9 +873,9 @@
          #pragma unroll
          for (int p = 0; p < 4; p++)
            sp[p] = __hmul2(sp[p], bg2);
-         *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_input_bf16) + byte_off) = src;
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = src;
        } else {
-         *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_input_bf16) + byte_off) = make_int4(0, 0, 0, 0);
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = make_int4(0, 0, 0, 0);
        }
      }
      __syncthreads();
@@ -889,13 +886,13 @@
        {
          int r = (lane_p3 % 8) + ((lane_p3 & 8) ? 8 : 0) + m_base_p3;
          int c = (lane_p3 >= 16) ? 8 : 0;
-         ldmatrix<4>(a, cvt_smem_ptr(s_Ainv_bf16) + tile_byte_offset(r, kt * 16 + c, kBT));
+         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
        }
        for (int nt = 0; nt < 16; nt++) {
          uint32_t b[2];
          {
            int kr = lane_p3 % 16;
-           ldmatrix_trans<2>(b, cvt_smem_ptr(s_input_bf16) + tile_byte_offset(kt * 16 + kr, nt * 8, kBT));
+           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
          }
          mma_m16n8k16_bf16(
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3],
