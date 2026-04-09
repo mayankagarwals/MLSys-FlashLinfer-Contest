@@ -15,7 +15,7 @@
 //
 //     # MMA warp
 //     wait w(smem) from TMA
-//     wait h(smem) from CUDA H warp
+//     wait h(tmem) from CUDA H warp
 //     issue hw(tmem) = h @ w.T - [V_dim, BT]
 //
 //     # CUDA V warp
@@ -54,10 +54,9 @@ uint32_t fp32x2_to_bf16x2(float a, float b) {
 
 __device__ inline
 void bf16x2_to_fp32x2(float *out, uint32_t data) {
-  asm volatile(
-    "shl.b32 %0, %2, 16;\n"
-    "and.b32 %1, %2, 0xFFFF;"
-    : "=f"(out[0]), "=f"(out[1]) : "r"(data));
+  asm volatile("shl.b32 %0, %2, 16;\n"        // low 16-bit
+               "and.b32 %1, %2, 0xFFFF0000;"  // high 16-bit
+              : "=f"(out[0]), "=f"(out[1]) : "r"(data));
 }
 
 constexpr int H = 8;
