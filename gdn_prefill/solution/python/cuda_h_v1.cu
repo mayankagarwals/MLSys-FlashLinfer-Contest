@@ -171,12 +171,10 @@ void h_kernel_cutlass(
 
         // issue TMA and arrive
         // natural shape: [T, H, dim]
-        // permute shape:
-        //   for W and V: [H, dim/64, T, 64]
-        //   for K:       [H, T/8, dim/64, 8, 64]
+        // permute shape: [H, dim/64, T, 64]
         tma_load_4d(W_smem, &W_tmap, 0, off_t, 0, head_id, mbar_addr);
         tma_load_4d(V_smem, &V_tmap, 0, off_t, 0, head_id, mbar_addr);
-        tma_load_5d(K_smem, &K_tmap, 0, 0, 0, off_t / 8, k_head_id, mbar_addr);
+        tma_load_4d(K_smem, &K_tmap, 0, off_t, 0, k_head_id, mbar_addr);
         mbarrier_arrive_expect_tx(mbar_addr, STAGE_SIZE);
 
         // increment stage
@@ -230,8 +228,8 @@ void h_kernel_cutlass(
         constexpr uint32_t vk_idesc = make_tcgen05_idesc(V_dim, K_dim) | (1U << 16U);  // transpose B
 
         // MN-major, 128B swizzling
-        constexpr uint64_t k_desc_base = (desc_encode(8 * 128) << 16ULL)                         // LBO
-                                       | (desc_encode(K_dim * sizeof(nv_bfloat16) * 8) << 32ULL) // SBO
+        constexpr uint64_t k_desc_base = (desc_encode(BT * 128) << 16ULL)  // LBO
+                                       | (desc_encode(8 * 128) << 32ULL)   // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
         
         mbarrier_wait(v_mbar_addr, h_parity);  // wait for (scaled) v_new store to tmem
@@ -240,7 +238,7 @@ void h_kernel_cutlass(
         // k selects [V_dim/K_dim, 16] tile
         for (int k = 0; k < BT / 16; k++) {
           const int v_tmem = v_tmem_base + k * 8;
-          const uint64_t k_desc = k_desc_base | ((K_smem + k * 16 * K_dim * sizeof(nv_bfloat16)) >> 4);
+          const uint64_t k_desc = k_desc_base | ((K_smem + k * 16 * 128) >> 4);
           const int enable_input_d = k > 0;
           tcgen05_mma_tmem(vk_tmem, v_tmem, k_desc, vk_idesc, enable_input_d);
         }
@@ -463,31 +461,6 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   return tmap;
 }
 
-static
-CUtensorMap encode_tma_trans(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
-  CUtensorMap tmap;
-
-  // natural shape:  [T, H, dim]
-  // permuted shape: [H, T/8, dim/64, 8, 64]
-  constexpr uint32_t rank = 5;
-  uint64_t globalDim[rank] = {64, 8, dim / 64, T / 8, H};
-  uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16),
-                                      128,
-                                      8 * H * dim * sizeof(nv_bfloat16),
-                                      dim * sizeof(nv_bfloat16)};  // in bytes
-  uint32_t boxDim[rank] = {64, 8, dim / 64, BT / 8, 1};
-  uint32_t elementStrides[rank] = {1, 1, 1, 1, 1};
-
-  cuTensorMapEncodeTiled(
-    &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr,
-    globalDim, globalStrides, boxDim, elementStrides,
-    CU_TENSOR_MAP_INTERLEAVE_NONE,
-    CU_TENSOR_MAP_SWIZZLE_128B,
-    CU_TENSOR_MAP_L2_PROMOTION_NONE,
-    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return tmap;
-}
-
 void h_v1(
   TensorView K,
   TensorView V,
@@ -503,7 +476,7 @@ void h_v1(
   const int T = K.size(0);
   const int N = h0.size(0);
 
-  auto K_tmap     = encode_tma_trans(K.data_ptr(), T, Hg, K_dim);
+  auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim);
   auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
   auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
   auto V_new_tmap = encode_tma(V_new.data_ptr(), T, H, V_dim);
