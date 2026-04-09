@@ -123,8 +123,10 @@ void h_kernel_cutlass(
 
   // set up tmem
   // since we issue wh and vk MMA sequentially, we can overlap the acc and input buffer.
+  // separate h_tmem and v_tmem buffers
   const uint32_t acc_tmem = 0;
-  const uint32_t a_tmem = acc_tmem + max(BT, K_dim);
+  const uint32_t h_tmem_base = acc_tmem + max(BT, K_dim);
+  const uint32_t v_tmem_base = h_tmem_base + K_dim / 2;
 
   if (warp_id == 0) {
     // init mbar
@@ -209,6 +211,8 @@ void h_kernel_cutlass(
         constexpr uint64_t w_desc_base = (desc_encode(8 * 128) << 32ULL)  // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
 
+        // when h is ready in tmem, it also means H warps have finished using vk in acc tmem buffer
+        // -> we can reuse this buffer for wh MMA
         mbarrier_wait(tma_mbar_addr + tma_stage * 8, tma_parity);  // wait for TMA
         mbarrier_wait(h_mbar_addr, h_parity);                      // wait for h store to tmem
         tcgen05_fence_after_thread_sync();
@@ -217,10 +221,10 @@ void h_kernel_cutlass(
         // j selects the [V_dim/BT, 16] tile (increment 8  tmem columns for H, increment by 32B due to swizzling for W)
         for (int i = 0; i < K_dim / 64; i++)
           for (int j = 0; j < 64 / 16; j++) {
-            const int h_tmem = a_tmem + i * 32 + j * 8;
+            const int h_tmem = h_tmem_base + i * 32 + j * 8;
             const uint64_t w_desc = w_desc_base | ((W_smem + i * BT * 128 + j * 32) >> 4);
-            const int enable_input_id = (i > 0) || (j > 0);
-            tcgen05_mma_tmem(acc_tmem, h_tmem, w_desc, wh_idesc, enable_input_id);
+            const int enable_input_d = (i > 0) || (j > 0);
+            tcgen05_mma_tmem(acc_tmem, h_tmem, w_desc, wh_idesc, enable_input_d);
           }
         tcgen05_commit(wh_mbar_addr);
 
@@ -230,8 +234,8 @@ void h_kernel_cutlass(
         constexpr uint32_t vk_idesc = make_tcgen05_idesc(V_dim, K_dim) | (1U << 16U);  // transpose B
 
         // MN-major, 128B swizzling
-        constexpr uint64_t k_desc_base = (desc_encode(K_dim * sizeof(nv_bfloat16) * 8) << 16ULL)  // LBO
-                                       | (desc_encode(8 * 128) << 32ULL)                          // SBO
+        constexpr uint64_t k_desc_base = (desc_encode(8 * 128) << 16ULL)                         // LBO
+                                       | (desc_encode(K_dim * sizeof(nv_bfloat16) * 8) << 32ULL) // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
 
         // wait for (scaled) v_new store to tmem
@@ -242,10 +246,10 @@ void h_kernel_cutlass(
 
         // k selects [V_dim/K_dim, 16] tile
         for (int k = 0; k < BT / 16; k++) {
-          const int v_tmem = a_tmem + k * 8;
+          const int v_tmem = v_tmem_base + k * 8;
           const uint64_t k_desc = k_desc_base | ((K_smem + k * 16 * K_dim * sizeof(nv_bfloat16)) >> 4);
-          const int enable_input_id = k > 0;
-          tcgen05_mma_tmem(acc_tmem, v_tmem, k_desc, vk_idesc, enable_input_id);
+          const int enable_input_d = k > 0;
+          tcgen05_mma_tmem(acc_tmem, v_tmem, k_desc, vk_idesc, enable_input_d);
         }
         tcgen05_commit(vk_mbar_addr);
 
@@ -287,7 +291,7 @@ void h_kernel_cutlass(
           tmp[j] = fp32x2_to_bf16x2(h_f32[i * 16 + j * 2], h_f32[i * 16 + j * 2 + 1]);
 
         stg_u32x8(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);  // for O kernel
-        tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, a_tmem + i * 8, tmp);  // for WH MMA
+        tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, h_tmem_base + i * 8, tmp);  // for WH MMA
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
@@ -407,7 +411,7 @@ void h_kernel_cutlass(
         }
 
         // store scaled v_new for vk MMA
-        tcgen05_st<SHAPE::_16x128b, BT / 8>(t_row, a_tmem, tmp);
+        tcgen05_st<SHAPE::_16x128b, BT / 16>(t_row, v_tmem_base, tmp);
       }
       mbarrier_arrive(v_mbar_addr);
 
@@ -427,7 +431,6 @@ void h_kernel_cutlass(
       tma_stage = (tma_stage + 1) % NUM_STAGES;
       if (tma_stage == 0)
         tma_parity ^= 1;
-
       wh_parity ^= 1;
     }
   }
