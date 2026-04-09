@@ -24,7 +24,7 @@
 //     wait and load hw(tmem) from MMA
 //     v_new.T = v.T - hw - [V_dim, BT]
 //     store bf16(v_new) to gmem (for O kernel)
-//     v_new *= tl.exp(g_cu_last - g_cu)
+//     v_new *= exp(g_cu_last - g_cu)
 //     store v_new to tmem (for MMA)
 //
 //     # MMA warp
@@ -35,7 +35,7 @@
 //     # CUDA H warp
 //     load g_cu_last from gmem->rmem
 //     wait and load vk(tmem) from MMA
-//     h = tl.exp(g_cu_last) * h + vk
+//     h = exp(g_cu_last) * h + vk
 
 #include <cuda_bf16.h>
 #include <cudaTypedefs.h>
@@ -90,7 +90,7 @@ void h_kernel_cutlass(
   const float       *h0_ptr,                       // [N, H, V_dim, K_dim]
         float       *ht_ptr,                       // [N, H, V_dim, K_dim]
   const int64_t     *cu_seqlens_ptr,               // [N+1]
-  const int32_t     *chunk_offsets_ptr             // [total_num_chunks]
+  const int32_t     *chunk_offsets_ptr             // [N]
 ) {
   const int tid = threadIdx.x;
   const int warp_id = warp_uniform(tid / WARP_SIZE);
@@ -300,7 +300,7 @@ void h_kernel_cutlass(
       // load g_cu_last and compute scaling for H
       float h_scale;
       if (lane_id == 0) {
-        const int last_idx = min(bos + chunk_id * BT + (BT - 1), eos);
+        const int last_idx = min(bos + (chunk_id + 1) * BT, eos) - 1;
         h_scale = __expf(g_cu_ptr[last_idx * H + head_id]);
       }
       h_scale = warp_uniform(h_scale);
@@ -342,12 +342,13 @@ void h_kernel_cutlass(
     for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
       // load g_cu and compute scaling for v_new
       if (tid < BT) {
-        const int last_idx = min(bos + chunk_id * BT + (BT - 1), eos);
-        float g_cu = g_cu_ptr[(bos + chunk_id * BT + tid) * H + head_id];
+        const int last_idx = min(bos + (chunk_id + 1) * BT, eos) - 1;
+        const int t = bos + chunk_id * BT + tid;
+        float g_cu = g_cu_ptr[t * H + head_id];
         float g_cu_last = g_cu_ptr[last_idx * H + head_id];
 
         float v_new_scale = 0.0f;
-        if (chunk_id * BT + tid < seqlen)
+        if (t < eos)
           v_new_scale = __expf(g_cu_last - g_cu);
         v_scale_smem_ptr[tid] = v_new_scale;
       }
@@ -400,8 +401,9 @@ void h_kernel_cutlass(
             v_tmp[k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
 
             // scale v_new for vk MMA
-            v_fp32[0] *= v_scale_smem_ptr[j * 16 + (k / 2) * 8 + (lane_id % 4) * 2 + 0];
-            v_fp32[1] *= v_scale_smem_ptr[j * 16 + (k / 2) * 8 + (lane_id % 4) * 2 + 1];
+            float2 v_scale = reinterpret_cast<float2 *>(v_scale_smem_ptr + (j * 16 + (k / 2) * 8 + (lane_id % 4) * 2))[0];
+            v_fp32[0] *= v_scale.x;
+            v_fp32[1] *= v_scale.y;
             reinterpret_cast<uint32_t *>(tmp)[j * 4 + k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
           }
 
