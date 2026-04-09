@@ -309,6 +309,7 @@ void h_kernel_cutlass(
       if (warp_id_ == 0)
         mbarrier_wait(vk_mbar_addr, vk_parity);
       bar_sync<1>(128);
+      tcgen05_fence_after_thread_sync();
 
       constexpr int WIDTH = 16;  // adjustable
       for (int i = 0; i < K_dim / WIDTH; i++) {
@@ -368,6 +369,7 @@ void h_kernel_cutlass(
           cp_async_bulk_wait_group_read<0>();
       }
       bar_sync<2>(128);
+      tcgen05_fence_after_thread_sync();
 
       // compute v_new
       // total tile is [V_dim, BT]
@@ -415,6 +417,8 @@ void h_kernel_cutlass(
         // store scaled v_new for vk MMA
         tcgen05_st<SHAPE::_16x128b, BT / 16>(t_row, v_tmem_base, tmp);
       }
+      tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
       mbarrier_arrive(v_mbar_addr);
 
       // all warps finish storing scaled v_new to smem
