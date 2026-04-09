@@ -173,7 +173,18 @@
  __device__ __forceinline__ float softplus_s(float x) {
    return log1pf(__expf(-fabsf(x))) + fmaxf(x, 0.0f);
  }
- 
+
+ // XOR swizzle: eliminates ldmatrix read bank conflicts in row-major smem
+ // XOR column-group index (col/8) with lower bits of row (masked to num_col_groups)
+ // cg_mask = (num_cols / 8) - 1: ensures swizzled_cg stays in valid range
+ // Usage: s_buf[row * stride + xor_swizzle_col(row, col, cg_mask)]
+ __device__ __forceinline__
+ int xor_swizzle_col(int row, int col, int cg_mask) {
+   int cg = col >> 3;
+   int swizzled_cg = cg ^ (row & cg_mask);
+   return (swizzled_cg << 3) | (col & 7);
+ }
+
  // ═══════════════════════════════════════════════════════════════════
  // TMA helper: issue TMA load + arrive on mbarrier
  // ═══════════════════════════════════════════════════════════════════
@@ -741,11 +752,11 @@
    // Reuse s_result as staging buffer for k/v data (16KB)
    __nv_bfloat16 *s_stage = reinterpret_cast<__nv_bfloat16 *>(s_result);
  
-   // Convert A_inv fp32 → bf16 row-major in s_A_tiles[64,64] (first 8KB of 32KB buffer)
-   // Vectorized: convert 8 fp32 → 4 bf16x2 → 1 int4 store
+   // Convert A_inv fp32 → bf16 with XOR swizzle (bank-conflict-free ldmatrix reads)
    __nv_bfloat16 *s_Ainv_bf16 = reinterpret_cast<__nv_bfloat16 *>(s_A_tiles);  // [64,64] bf16
    for (int i = tid; i < kBT * kBT / 8; i += 128) {
      int idx = i * 8;
+     int row = idx / kBT, col8 = idx % kBT;
      const float *src = &s_result_inv[idx];
      int4 dst;
      __nv_bfloat162 *dp = reinterpret_cast<__nv_bfloat162 *>(&dst);
@@ -753,7 +764,7 @@
      dp[1] = {__float2bfloat16(src[2]), __float2bfloat16(src[3])};
      dp[2] = {__float2bfloat16(src[4]), __float2bfloat16(src[5])};
      dp[3] = {__float2bfloat16(src[6]), __float2bfloat16(src[7])};
-     *reinterpret_cast<int4 *>(&s_Ainv_bf16[idx]) = dst;
+     *reinterpret_cast<int4 *>(&s_Ainv_bf16[row * kBT + xor_swizzle_col(row, col8, kBT / 8 - 1)]) = dst;
    }
  
    // cp.async load k_in → s_stage (overlapped with A_inv conversion)
@@ -793,9 +804,9 @@
          #pragma unroll
          for (int p = 0; p < 4; p++)
            sp[p] = __hmul2(sp[p], bg2);
-         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = src;
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + xor_swizzle_col(t, j, kK / 8 - 1)]) = src;
        } else {
-         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = make_int4(0, 0, 0, 0);
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + xor_swizzle_col(t, j, kK / 8 - 1)]) = make_int4(0, 0, 0, 0);
        }
      }
      __syncthreads();
@@ -822,13 +833,13 @@
        {
          int r = (lane_p3 % 8) + ((lane_p3 & 8) ? 8 : 0) + m_base_p3;
          int c = (lane_p3 >= 16) ? 8 : 0;
-         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
+         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + xor_swizzle_col(r, kt * 16 + c, kBT / 8 - 1)]));
        }
        for (int nt = 0; nt < 16; nt++) {
          uint32_t b[2];
          {
            int kr = lane_p3 % 16;
-           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
+           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + xor_swizzle_col(kt * 16 + kr, nt * 8, kK / 8 - 1)]));
          }
          mma_m16n8k16_bf16(
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3],
@@ -873,9 +884,9 @@
          #pragma unroll
          for (int p = 0; p < 4; p++)
            sp[p] = __hmul2(sp[p], bg2);
-         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = src;
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + xor_swizzle_col(t, j, kK / 8 - 1)]) = src;
        } else {
-         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = make_int4(0, 0, 0, 0);
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + xor_swizzle_col(t, j, kK / 8 - 1)]) = make_int4(0, 0, 0, 0);
        }
      }
      __syncthreads();
@@ -886,13 +897,13 @@
        {
          int r = (lane_p3 % 8) + ((lane_p3 & 8) ? 8 : 0) + m_base_p3;
          int c = (lane_p3 >= 16) ? 8 : 0;
-         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
+         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + xor_swizzle_col(r, kt * 16 + c, kBT / 8 - 1)]));
        }
        for (int nt = 0; nt < 16; nt++) {
          uint32_t b[2];
          {
            int kr = lane_p3 % 16;
-           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
+           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + xor_swizzle_col(kt * 16 + kr, nt * 8, kK / 8 - 1)]));
          }
          mma_m16n8k16_bf16(
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3],
