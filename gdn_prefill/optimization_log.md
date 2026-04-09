@@ -80,9 +80,36 @@ v3 is still significantly slower than chunk_v5 for T>=1024 due to:
 2. SASS-level instruction scheduling (nvcc can't match Triton's MLIR backend)
 3. More smem traffic per MMA (774 LDS vs Triton's 27 for equivalent compute)
 
-### Next steps
-1. Profile per-kernel breakdown with nsys for current code
-2. Optimize H-kernel further: vnew computation, step0, warp specialization
-3. Optimize FP Phase 3 MMA scheduling (pre-load all fragments before MMA)
-4. Consider architectural changes: persistent kernel, kernel fusion
-5. **KEY GOAL**: Close v3 vs chunk_v5 gap for T>=1024
+---
+
+### Optimization 5: Pre-load all MMA2 fragments before MMA (FAILED — no improvement)
+**Hypothesis**: Matching Triton's scheduling pattern (all ldmatrix before any mma.sync) would improve ILP.
+**Result**: T=134: 55.5 vs 55.4 us (no change). T=959: 107.3 vs 108.3 us (-0.9%, noise).
+**Why it failed**: nvcc already optimizes ldmatrix/mma interleaving when bank conflicts are eliminated. The compiler schedules loads and computes optimally without manual pre-loading. Confirmed earlier finding from memory.
+
+---
+
+### Per-kernel breakdown (T=959, N=4, after all optimizations)
+| Kernel | Time (us) | % |
+|--------|-----------|---|
+| H-kernel | 58.1 | 56.6% |
+| FusedPrep | 26.8 | 26.1% |
+| O-kernel | 17.7 | 17.2% |
+| Total | 102.6 | 100% |
+
+H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computation are the main costs now that MMA bank conflicts are eliminated.
+
+### Analysis: s_vnew_T write bank conflicts
+- Tile format has 4-way write conflict (vs 2-way in row-major)
+- XOR swizzle doesn't help because: all threads at a given j have the SAME bv value → XOR with (bv & mask) is the same for all → no redistribution
+- The bank conflicts are inherent to the access pattern (same bv, different t)
+- Read conflicts (0-way with tile format) outweigh the write regression since reads happen 16x more often (in MMA loop)
+
+### Next steps for -10% target (630 us gap remaining)
+1. **Convert s_vnew_T to XOR swizzle** (instead of tile format): would eliminate both read AND write bank conflicts, since MMA2's ldmatrix reads with XOR swizzle are bank-conflict-free
+2. **Fuse kernel launches**: single persistent kernel or CUDA graph to reduce 3 × 5us launch overhead
+3. **Architectural**: The 2.5x v3 vs chunk_v5 gap for T>=1024 is mainly from SASS scheduling — nvcc's code gen can't match Triton's MLIR. Potential solutions:
+   a. Write critical H-kernel inner loop in inline SASS
+   b. Use CuTe/CUTLASS for the matmul portions
+   c. Custom Triton backend generating CUDA code
+4. **KEY GOAL**: v3 must beat chunk_v5 for ALL T>=64 (currently 2.5x slower for T=8192)
