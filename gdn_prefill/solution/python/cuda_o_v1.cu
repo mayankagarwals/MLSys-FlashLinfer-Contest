@@ -71,12 +71,15 @@ constexpr uint32_t OFFSET_V_TMA_BAR = OFFSET_QK_TMA_BAR + 8U;
 constexpr uint32_t OFFSET_H_TMA_BAR = OFFSET_V_TMA_BAR + 8U;
 constexpr uint32_t OFFSET_MMA_BAR = OFFSET_H_TMA_BAR + 8U;
 constexpr uint32_t OFFSET_ATTN_READY_BAR = OFFSET_MMA_BAR + 8U;
-constexpr uint32_t OFFSET_TMEM_ADDR = OFFSET_ATTN_READY_BAR + 8U;
+constexpr uint32_t OFFSET_QH_MMA_BAR = OFFSET_ATTN_READY_BAR + 8U;
+constexpr uint32_t OFFSET_OV_MMA_BAR = OFFSET_QH_MMA_BAR + 8U;
+constexpr uint32_t OFFSET_TMEM_ADDR = OFFSET_OV_MMA_BAR + 8U;
 constexpr uint32_t SMEM_SIZE = (OFFSET_TMEM_ADDR + 4U + 1023U) & ~1023U;
 
 //// Tensor Memory
-constexpr uint32_t MAX_COLUMNS = 128U;
+constexpr uint32_t MAX_COLUMNS = 256U;
 constexpr uint32_t OUTPUT_TMEM_COL = BLOCK_T;
+constexpr uint32_t QH_TMEM_COL = 2U * BLOCK_T;
 
 __device__ __forceinline__ uint32_t make_tile_layout_index(uint32_t tile_rows,
                                                            uint32_t row,
@@ -293,6 +296,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   const uint32_t h_tma_barrier = smem + OFFSET_H_TMA_BAR;
   const uint32_t mma_barrier = smem + OFFSET_MMA_BAR;
   const uint32_t attn_ready_barrier = smem + OFFSET_ATTN_READY_BAR;
+  const uint32_t qh_mma_barrier = smem + OFFSET_QH_MMA_BAR;
+  const uint32_t ov_mma_barrier = smem + OFFSET_OV_MMA_BAR;
   const uint32_t tmem_alloc_smem = smem + OFFSET_TMEM_ADDR;
 
   float *output_smem_ptr =
@@ -306,6 +311,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       mbarrier_init(h_tma_barrier, 1);
       mbarrier_init(mma_barrier, 1);
       mbarrier_init(attn_ready_barrier, NUM_CUDA_WARPS);
+      mbarrier_init(qh_mma_barrier, 1);
+      mbarrier_init(ov_mma_barrier, 1);
       prefetch_tensormap(&q_tmap);
       prefetch_tensormap(&k_tmap);
       prefetch_tensormap(&v_tmap);
@@ -320,7 +327,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
 
   constexpr uint32_t TMA_PHASE = 0U;
   constexpr uint32_t QK_MMA_PHASE = 0U;
-  constexpr uint32_t OV_MMA_PHASE = 1U;
+  constexpr uint32_t OV_MMA_PHASE = 0U;
   constexpr uint32_t QH_MMA_PHASE = 0U;
   constexpr uint32_t ATTN_READY_PHASE = 0U;
   const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
@@ -343,6 +350,15 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     tcgen05_fence_after_thread_sync();
     mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, k_smem);
     tcgen05_commit(mma_barrier);
+    mbarrier_wait(h_tma_barrier, TMA_PHASE);
+    tcgen05_fence_after_thread_sync();
+    mma_swizzled<NUM_SWIZZLE_ATOMS>(QH_TMEM_COL, q_smem, h_smem);
+    tcgen05_commit(qh_mma_barrier);
+    mbarrier_wait(v_tma_barrier, TMA_PHASE);
+    mbarrier_wait(attn_ready_barrier, ATTN_READY_PHASE);
+    tcgen05_fence_after_thread_sync();
+    mma_attn_v_mmajor_64x64(OUTPUT_TMEM_COL, attn_smem, v_smem);
+    tcgen05_commit(ov_mma_barrier);
   }
 
   if (warp_id < NUM_CUDA_WARPS) {
@@ -397,16 +413,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     }
   }
 
-  if (warp_id == MMA_WARP && elect_sync()) {
-    mbarrier_wait(v_tma_barrier, TMA_PHASE);
-    mbarrier_wait(attn_ready_barrier, ATTN_READY_PHASE);
-    tcgen05_fence_after_thread_sync();
-    mma_attn_v_mmajor_64x64(OUTPUT_TMEM_COL, attn_smem, v_smem);
-    tcgen05_commit(mma_barrier);
-  }
-
   if (warp_id < NUM_CUDA_WARPS) {
-    mbarrier_wait(mma_barrier, OV_MMA_PHASE);
+    mbarrier_wait(ov_mma_barrier, OV_MMA_PHASE);
     tcgen05_fence_after_thread_sync();
     float reg_lo[REGS_PER_FRAGMENT];
     float reg_hi[REGS_PER_FRAGMENT];
@@ -438,20 +446,14 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     }
   }
 
-  if (warp_id == MMA_WARP && elect_sync()) {
-    mbarrier_wait(h_tma_barrier, TMA_PHASE);
-    tcgen05_fence_after_thread_sync();
-    mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, h_smem);
-    tcgen05_commit(mma_barrier);
-  }
-
   if (warp_id < NUM_CUDA_WARPS) {
-    mbarrier_wait(mma_barrier, QH_MMA_PHASE);
+    mbarrier_wait(qh_mma_barrier, QH_MMA_PHASE);
     tcgen05_fence_after_thread_sync();
     float reg_lo[REGS_PER_FRAGMENT];
     float reg_hi[REGS_PER_FRAGMENT];
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0, 0);
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_hi, 0, COLS_PER_FRAGMENT);
+    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0, QH_TMEM_COL);
+    tcgen05_ld<SHAPE::_16x256b, 4>(reg_hi, 0,
+                                   QH_TMEM_COL + COLS_PER_FRAGMENT);
     tcgen05_wait_ld();
     const uint32_t row_base =
         warp_id * ROWS_PER_WARP + lane_id / LANES_PER_ROW_GROUP;
