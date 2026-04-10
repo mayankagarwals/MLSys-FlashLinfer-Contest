@@ -286,42 +286,6 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
 _FLAG = None
 
 
-def _pack_v_for_o(
-    v_new: Tensor,
-    chunk_indices: Tensor,
-    cu_seqlens: Tensor,
-    BT: int,
-):
-    total_num_chunks = chunk_indices.shape[0]
-    chunk_seq = chunk_indices[:, 0].to(torch.long)
-    chunk_id = chunk_indices[:, 1].to(torch.long)
-    chunk_starts = cu_seqlens[chunk_seq] + chunk_id * BT
-    chunk_ends = cu_seqlens[chunk_seq + 1]
-
-    token_offsets = torch.arange(BT, device=v_new.device, dtype=chunk_starts.dtype)
-    token_ids = chunk_starts[:, None] + token_offsets[None, :]
-    valid = token_ids < chunk_ends[:, None]
-    safe_token_ids = torch.where(valid, token_ids, torch.zeros_like(token_ids))
-
-    # v_new[safe_token_ids] is [chunk, token, head, value]. For one
-    # (chunk, head, value_tile) slice the natural 64x64 tile is [token, value]
-    # with stride (1024, 1), so value is stride-1.
-    # The current mma_noswizzle_64x64 B operand instead consumes [value, token]
-    # with token stride-1, i.e. K-major in the kernel's logical B view.
-    # permute(0, 2, 3, 1) gives that logical [chunk, head, value, token] order,
-    # but one tile is still stride (1, 1024), so it is still M-major.
-    # contiguous() rematerializes the tile to stride (64, 1), making token
-    # stride-1, and view(..., 2, 64, BT) then just splits value=128 into two
-    # BLOCK_V=64 TMA tiles.
-    # This gather also zero-pads the tail of the last chunk to BT=64. If we
-    # later switch the B operand to consume the natural M-major [token, value]
-    # tile from raw v_new directly, we should be able to drop both this padding
-    # and this expensive materialization step.
-    v_new_chunks = v_new[safe_token_ids].permute(0, 2, 3, 1).contiguous()
-    v_new_chunks.masked_fill_(~valid[:, None, None, :], 0)
-    return v_new_chunks.view(total_num_chunks, v_new.shape[1], 2, 64, BT).contiguous()
-
-
 def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
     k: Tensor,  # (total_seqlen, num_k_heads, head_dim)

@@ -46,6 +46,10 @@ constexpr uint32_t SWIZZLE_WIDTH = 128U / sizeof(nv_bfloat16);
 constexpr uint32_t SWIZZLE_BYTES =
     SWIZZLE_HEIGHT * SWIZZLE_WIDTH * sizeof(nv_bfloat16);
 constexpr uint32_t SWIZZLE_SBO = 8U * 128U;
+constexpr uint32_t V_MMA_SBO = SWIZZLE_WIDTH * 8U * sizeof(nv_bfloat16);
+constexpr uint32_t V_MMA_LBO = (BLOCK_T / 8U) * V_MMA_SBO;
+constexpr uint32_t BYTES_ONE_MMA_MMAJOR =
+    MMA_K * SWIZZLE_WIDTH * sizeof(nv_bfloat16);
 
 //// Shared Memory Offsets in Bytes
 constexpr uint32_t Q_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
@@ -126,6 +130,34 @@ static CUtensorMap encode_qk_tma(void *ptr, uint64_t num_tokens,
   return tmap;
 }
 
+static CUtensorMap encode_v_tma(void *ptr, uint64_t num_tokens) {
+  CUtensorMap tmap;
+  constexpr uint32_t rank = 4;
+  uint64_t globalDim[rank] = {SWIZZLE_WIDTH, num_tokens,
+                              VALUE_DIM / SWIZZLE_WIDTH, NUM_OUTPUT_HEADS};
+  uint64_t globalStrides[rank - 1] = {
+      NUM_OUTPUT_HEADS * VALUE_DIM * sizeof(nv_bfloat16),
+      SWIZZLE_WIDTH * sizeof(nv_bfloat16),
+      VALUE_DIM * sizeof(nv_bfloat16),
+  };
+  uint32_t boxDim[rank] = {SWIZZLE_WIDTH, BLOCK_T, 1U, 1U};
+  uint32_t elementStrides[rank] = {1, 1, 1, 1};
+
+  cuTensorMapEncodeTiled(
+      &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr, globalDim,
+      globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return tmap;
+}
+
+__device__ __forceinline__ uint64_t make_tcgen05_desc_mmajor_v(
+    uint32_t addr) {
+  return desc_encode(addr) | (desc_encode(V_MMA_LBO) << 16ULL) |
+         (desc_encode(V_MMA_SBO) << 32ULL) | (1ULL << 46ULL) |
+         (2ULL << 61ULL);
+}
+
 template <int NUM_ATOMS>
 __device__ __forceinline__ void mma_swizzled(uint32_t output_tmem,
                                              uint32_t matrix_a_smem,
@@ -168,6 +200,22 @@ __device__ __forceinline__ void mma_noswizzle_64x64(uint32_t output_tmem,
                 make_tcgen05_desc_noswizzle(b_base, BLOCK_V,
                                             BLOCK_T * sizeof(nv_bfloat16)),
                 idesc, ki > 0U);
+  }
+}
+
+__device__ __forceinline__ void mma_attn_v_mmajor_64x64(
+    uint32_t output_tmem, uint32_t matrix_a_smem, uint32_t matrix_b_smem) {
+  constexpr uint32_t idesc = make_tcgen05_idesc(MMA_M, MMA_N) | (1U << 16U);
+  constexpr uint32_t matrix_a_k_stride_bytes =
+      BLOCK_T * MMA_K * sizeof(nv_bfloat16);
+#pragma unroll
+  for (uint32_t ki = 0; ki < NUM_MMA_STEPS; ++ki) {
+    const uint32_t a_base = matrix_a_smem + ki * matrix_a_k_stride_bytes;
+    const uint32_t b_base = matrix_b_smem + ki * BYTES_ONE_MMA_MMAJOR;
+    tcgen05_mma(output_tmem,
+                make_tcgen05_desc_noswizzle(a_base, BLOCK_T,
+                                            BLOCK_T * sizeof(nv_bfloat16)),
+                make_tcgen05_desc_mmajor_v(b_base), idesc, ki > 0U);
   }
 }
 
@@ -281,17 +329,14 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   constexpr uint32_t QH_MMA_PHASE = 0U;
   const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
   const int32_t chunk_start_i32 = static_cast<int32_t>(chunk_start);
-  const uint32_t v_row =
-      ((global_chunk_id * NUM_OUTPUT_HEADS + head_id) * (VALUE_DIM / BLOCK_V) +
-       v_tile) *
-      BLOCK_V;
 
   if (warp_id == TMA_WARP && elect_sync()) {
     tma_load_4d(q_smem, &q_tmap, 0, chunk_start_i32, 0, q_head_id,
                 qk_tma_barrier);
     tma_load_4d(k_smem, &k_tmap, 0, chunk_start_i32, 0, k_head_id,
                 qk_tma_barrier);
-    tma_load_3d(v_smem, &v_tmap, 0, v_row, 0, v_tma_barrier);
+    tma_load_4d(v_smem, &v_tmap, 0, chunk_start_i32, v_tile, head_id,
+                v_tma_barrier);
     tma_load_4d(h_smem, &h_tmap, 0, v_start, 0, h_outer, h_tma_barrier);
     mbarrier_arrive_expect_tx(qk_tma_barrier, Q_SMEM_SIZE + K_SMEM_SIZE);
     mbarrier_arrive_expect_tx(v_tma_barrier, V_SMEM_SIZE);
@@ -344,7 +389,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   if (warp_id == MMA_WARP && elect_sync()) {
     mbarrier_wait(v_tma_barrier, TMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    mma_noswizzle_64x64(OUTPUT_TMEM_COL, attn_smem, v_smem);
+    mma_attn_v_mmajor_64x64(OUTPUT_TMEM_COL, attn_smem, v_smem);
     tcgen05_commit(mma_barrier);
   }
 
@@ -478,24 +523,19 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   return;
 }
 
-void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new_t,
+void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
           TensorView h, TensorView g_cu, TensorView o, TensorView cu_seqlens,
           TensorView chunk_indices, int total_num_chunks, double scale) {
   const uint32_t total_num_tokens = static_cast<uint32_t>(q_chunks.size(0));
   const uint32_t total_num_chunks_u = static_cast<uint32_t>(total_num_chunks);
   const uint64_t total_num_output_tiles =
       static_cast<uint64_t>(total_num_chunks_u) * NUM_OUTPUT_HEADS;
-  const uint64_t total_num_v_rows =
-      total_num_output_tiles * (VALUE_DIM / BLOCK_V);
 
   auto q_tmap = encode_qk_tma(q_chunks.data_ptr(), total_num_tokens,
                               NUM_QK_HEADS, HEAD_DIM);
   auto k_tmap = encode_qk_tma(k_chunks.data_ptr(), total_num_tokens,
                               NUM_QK_HEADS, HEAD_DIM);
-  CUtensorMap v_tmap;
-  init_tma_desc_3d(&v_tmap,
-                   reinterpret_cast<const __nv_bfloat16 *>(v_new_t.data_ptr()),
-                   total_num_v_rows * BLOCK_V, BLOCK_T, BLOCK_V, BLOCK_T);
+  auto v_tmap = encode_v_tma(v_new.data_ptr(), total_num_tokens);
   auto h_tmap =
       encode_tma(h.data_ptr(), total_num_output_tiles, VALUE_DIM, HEAD_DIM);
 
