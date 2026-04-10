@@ -292,6 +292,15 @@ Compute W/U directly from register-resident Ai blocks. Also fewer MMA calls (160
 **Why it worked**: After the Ai inverse, all blocks are cast to bf16 (`.to(tl.bfloat16).to(tl.float32)`). This discards mantissa bits beyond bf16's 8-bit significand. The difference between tf32 (11-bit) and tf32x3 (~23-bit) Ai values is entirely lost in the bf16 truncation. So the W/U dot products see identical bf16 inputs regardless of Ai inverse precision.
 **Key insight**: The bf16 roundtrip not only fixes the precision mismatch (Opt 23) but also enables lower precision in the inverse computation. The two optimizations are synergistic.
 
+### Optimization 25: H-kernel num_stages=2 (FAILED — slower)
+**Result**: 10,246 → 10,346 us (+100 us). Pipeline latency hiding with 3 stages outweighs register savings from 2 stages.
+
+### Optimization 25b: H-kernel num_stages=4 (FAILED — crash, from Opt 19)
+Already tried. Register overflow from 4-stage pipeline.
+
+### Optimization 25c: Merge kernel num_warps=4 (FAILED — hangs)
+**Result**: Benchmark hangs on cv5 workloads. Register spilling causes ~10x regression per CTA. num_warps=2 is optimal for this kernel's register pressure.
+
 ### Current Status: 10,246 us (-13.0%), 100/100 correct
 - **TARGET (-10% = 10,599 us) EXCEEDED by 353 us**
 - cv5: 6,597 us (-12.5% from 7,550 baseline)
