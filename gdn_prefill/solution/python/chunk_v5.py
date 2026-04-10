@@ -161,7 +161,7 @@ def run(
         K_dim=K_dim,
         V_dim=V_dim,
         BT=BT,
-        DOT_PRECISION="tf32x3",  # using tf32 may cause NaN
+        DOT_PRECISION="tf32",  # tf32x3 was slower; bf16 roundtrip masks the reduced precision
         num_warps=2,
     )
 
