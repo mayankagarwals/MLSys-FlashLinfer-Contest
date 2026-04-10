@@ -160,3 +160,15 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 ### Optimization 11: H-kernel launch_bounds(128, 2) (NO IMPROVEMENT)
 **Result**: T=134: 55.5 us (unchanged). T=959: 108.6 us (unchanged).
 **Why**: Compiler already generates code compatible with 2 blocks/SM under (128, 1).
+
+### Optimization 12: H-kernel BV_H=32 (FAILED — 22-47% slower)
+**Hypothesis**: Larger BV tile (32 vs 16) gives better MMA data reuse by sharing B fragments across 2 M-subtiles.
+**What changed**: kBV_H=32, kNVT_H=4. h_reg[2][4][4]. MMA2 M-subtiling. 2-pass vnew.
+**Result**: T=134: 55.5→67.8 us (+22%), T=959: 108.3→159.0 us (+47%). MASSIVE regression.
+**Why it failed**: 
+- 2x more MMA calls per block (32 vs 16 in MMA2)
+- 2-pass vnew adds sequential overhead
+- Fewer blocks (4 vs 8 v-tiles) reduces parallelism on 192-SM B200
+- Smem grows from 60KB to 68KB, potentially limiting multi-block scheduling
+- The B fragment reuse (loading B once for 2 MMAs) doesn't compensate for the 2x compute increase
+**Lesson**: BV_H=16 is the sweet spot for B200. Smaller tiles = more parallelism from more blocks.
