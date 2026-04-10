@@ -77,9 +77,16 @@ def run(
     # we allocate more than enough for chunk_indices so that we don't need to know
     # the value of total_num_chunks before calling the kernel.
     upper_bound_chunks = (N - 1) + triton.cdiv(T - (N - 1), BT)
-    num_chunks = q.new_empty(N, dtype=torch.int32)
-    chunk_offsets = q.new_empty(N + 1, dtype=torch.int32)
-    chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
+    meta_key = (N, upper_bound_chunks)
+    if meta_key not in _cv5_cache:
+        _cv5_cache[meta_key] = {
+            'num_chunks': q.new_empty(N, dtype=torch.int32),
+            'chunk_offsets': q.new_empty(N + 1, dtype=torch.int32),
+            'chunk_indices': q.new_empty((upper_bound_chunks, 2), dtype=torch.int32),
+        }
+    num_chunks = _cv5_cache[meta_key]['num_chunks']
+    chunk_offsets = _cv5_cache[meta_key]['chunk_offsets']
+    chunk_indices = _cv5_cache[meta_key]['chunk_indices']
     compute_chunks_kernel[(N,)](
         cu_seqlens,
         num_chunks,
