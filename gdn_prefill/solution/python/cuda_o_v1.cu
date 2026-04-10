@@ -355,6 +355,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     tcgen05_fence_after_thread_sync();
     mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, k_smem);
     tcgen05_commit(mma_barrier);
+    // QH and OV land in disjoint tmem columns, so each gets its own completion
+    // barrier instead of reusing mma_barrier phases.
     mbarrier_wait(h_tma_barrier, TMA_PHASE);
     tcgen05_fence_after_thread_sync();
     mma_swizzled_qh_64x128(QH_TMEM_COL, q_smem, h_smem);
@@ -376,18 +378,15 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       g_smem_ptr[i] = g_value;
     }
     bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
-  }
 
-  nv_bfloat16 *attn_smem_ptr =
-      reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_smem - smem));
-
-  if (warp_id < NUM_CUDA_WARPS) {
+    nv_bfloat16 *attn_smem_ptr =
+        reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_smem - smem));
     mbarrier_wait(mma_barrier, QK_MMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    float reg_lo[REGS_PER_FRAGMENT];
-    float reg_hi[REGS_PER_FRAGMENT];
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0, 0);
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_hi, 0, COLS_PER_FRAGMENT);
+    float qk_reg_lo[REGS_PER_FRAGMENT];
+    float qk_reg_hi[REGS_PER_FRAGMENT];
+    tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_lo, 0, 0);
+    tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_hi, 0, COLS_PER_FRAGMENT);
     tcgen05_wait_ld();
     const uint32_t row_base =
         warp_id * ROWS_PER_WARP + lane_id / LANES_PER_ROW_GROUP;
@@ -404,10 +403,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       const uint32_t reg_row0 = (step / 2U) * 4U + (step % 2U);
       const uint32_t reg_row1 = reg_row0 + 2U;
 
-      store_attn_column(attn_smem_ptr, g_smem_ptr, reg_lo, row_base, row_hi,
+      store_attn_column(attn_smem_ptr, g_smem_ptr, qk_reg_lo, row_base, row_hi,
                         row_base_limit, row_hi_limit, reg_row0, reg_row1,
                         col_lo);
-      store_attn_column(attn_smem_ptr, g_smem_ptr, reg_hi, row_base, row_hi,
+      store_attn_column(attn_smem_ptr, g_smem_ptr, qk_reg_hi, row_base, row_hi,
                         row_base_limit, row_hi_limit, reg_row0, reg_row1,
                         col_hi);
     }
@@ -416,21 +415,17 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     if (elect_sync()) {
       mbarrier_arrive(attn_ready_barrier);
     }
-  }
 
-  if (warp_id < NUM_CUDA_WARPS) {
+    // Stage OV first; the QH/store step below consumes the same cells in this
+    // same worker-lane mapping.
     mbarrier_wait(ov_mma_barrier, OV_MMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    const uint32_t row_base =
-        warp_id * ROWS_PER_WARP + lane_id / LANES_PER_ROW_GROUP;
-    const uint32_t row_hi = row_base + ROW_PAIR_STRIDE;
-    const uint32_t lane_col = lane_id % LANES_PER_ROW_GROUP;
     float *row_base_output_ptr = output_smem_ptr + row_base * BLOCK_V;
     float *row_hi_output_ptr = output_smem_ptr + row_hi * BLOCK_V;
-    float reg_lo[REGS_PER_FRAGMENT];
-    float reg_hi[REGS_PER_FRAGMENT];
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0, OUTPUT_TMEM_COL);
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_hi, 0,
+    float ov_reg_lo[REGS_PER_FRAGMENT];
+    float ov_reg_hi[REGS_PER_FRAGMENT];
+    tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_lo, 0, OUTPUT_TMEM_COL);
+    tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_hi, 0,
                                    OUTPUT_TMEM_COL + COLS_PER_FRAGMENT);
     tcgen05_wait_ld();
 #pragma unroll
@@ -441,18 +436,18 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       const uint32_t reg_row1 = reg_row0 + 2U;
 
       reinterpret_cast<float2 *>(row_base_output_ptr + col_lo)[0] =
-          make_float2(reg_lo[reg_row0], reg_lo[reg_row0 + 1U]);
+          make_float2(ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U]);
       reinterpret_cast<float2 *>(row_hi_output_ptr + col_lo)[0] =
-          make_float2(reg_lo[reg_row1], reg_lo[reg_row1 + 1U]);
+          make_float2(ov_reg_lo[reg_row1], ov_reg_lo[reg_row1 + 1U]);
       reinterpret_cast<float2 *>(row_base_output_ptr + col_hi)[0] =
-          make_float2(reg_hi[reg_row0], reg_hi[reg_row0 + 1U]);
+          make_float2(ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U]);
       reinterpret_cast<float2 *>(row_hi_output_ptr + col_hi)[0] =
-          make_float2(reg_hi[reg_row1], reg_hi[reg_row1 + 1U]);
+          make_float2(ov_reg_hi[reg_row1], ov_reg_hi[reg_row1 + 1U]);
     }
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0,
+    tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_lo, 0,
                                    OUTPUT_TMEM_COL + BLOCK_T);
     tcgen05_ld<SHAPE::_16x256b, 4>(
-        reg_hi, 0, OUTPUT_TMEM_COL + BLOCK_T + COLS_PER_FRAGMENT);
+        ov_reg_hi, 0, OUTPUT_TMEM_COL + BLOCK_T + COLS_PER_FRAGMENT);
     tcgen05_wait_ld();
 #pragma unroll
     for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
@@ -462,28 +457,23 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       const uint32_t reg_row1 = reg_row0 + 2U;
 
       reinterpret_cast<float2 *>(row_base_output_ptr + col_lo)[0] =
-          make_float2(reg_lo[reg_row0], reg_lo[reg_row0 + 1U]);
+          make_float2(ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U]);
       reinterpret_cast<float2 *>(row_hi_output_ptr + col_lo)[0] =
-          make_float2(reg_lo[reg_row1], reg_lo[reg_row1 + 1U]);
+          make_float2(ov_reg_lo[reg_row1], ov_reg_lo[reg_row1 + 1U]);
       reinterpret_cast<float2 *>(row_base_output_ptr + col_hi)[0] =
-          make_float2(reg_hi[reg_row0], reg_hi[reg_row0 + 1U]);
+          make_float2(ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U]);
       reinterpret_cast<float2 *>(row_hi_output_ptr + col_hi)[0] =
-          make_float2(reg_hi[reg_row1], reg_hi[reg_row1 + 1U]);
+          make_float2(ov_reg_hi[reg_row1], ov_reg_hi[reg_row1 + 1U]);
     }
-  }
 
-  if (warp_id < NUM_CUDA_WARPS) {
+    // OV is staged now; QH is the remaining MMA dependency before storing.
     mbarrier_wait(qh_mma_barrier, QH_MMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    const uint32_t row_base =
-        warp_id * ROWS_PER_WARP + lane_id / LANES_PER_ROW_GROUP;
-    const uint32_t row_hi = row_base + ROW_PAIR_STRIDE;
     const bool row_base_active = row_base < chunk_len;
     const bool row_hi_active = row_hi < chunk_len;
     const float g_row_base =
         row_base_active ? __expf(g_smem_ptr[row_base]) : 0.0f;
     const float g_row_hi = row_hi_active ? __expf(g_smem_ptr[row_hi]) : 0.0f;
-    const uint32_t lane_col = lane_id % LANES_PER_ROW_GROUP;
     nv_bfloat16 *row_base_o_ptr = nullptr;
     nv_bfloat16 *row_hi_o_ptr = nullptr;
     if (row_base_active) {
