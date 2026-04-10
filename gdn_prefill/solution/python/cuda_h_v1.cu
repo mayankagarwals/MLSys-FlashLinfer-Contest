@@ -72,14 +72,13 @@ constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
 
 constexpr uint32_t v_scale_size = BT * sizeof(float);
 
-constexpr int NUM_WARPS = 4 + 4 + 4;  // requires multiple of 4 to use setmaxnreg
+constexpr int NUM_WARPS = 4 + 4 + 2;
 constexpr int WARP_SIZE = 32;
 constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
 template <int NUM_STAGES>
 __global__
 __block_size__((TB_SIZE, 1, 1))
-__launch_bounds__(TB_SIZE, 1)
 void h_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,      // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
@@ -156,8 +155,6 @@ void h_kernel_cutlass(
 
   if (warp_id == NUM_WARPS - 1) {
     // TMA warp
-    setmaxnreg_dec<nregs_lo>();
-
     if (elect_sync()) {
       int stage_id = 0;
       int parity = 1;
@@ -178,8 +175,8 @@ void h_kernel_cutlass(
         // issue TMA and arrive
         // natural shape: [T, H, dim]
         // permute shape: [H, dim/64, T, 64]
-        tma_load_4d(W_smem, &W_tmap, 0, off_t, 0, head_id, mbar_addr);
-        tma_load_4d(V_smem, &V_tmap, 0, off_t, 0, head_id, mbar_addr);
+        tma_load_4d(W_smem, &W_tmap, 0, off_t, 0, head_id, mbar_addr, EVICT_FIRST);
+        tma_load_4d(V_smem, &V_tmap, 0, off_t, 0, head_id, mbar_addr, EVICT_FIRST);
         tma_load_4d(K_smem, &K_tmap, 0, off_t, 0, k_head_id, mbar_addr);
         mbarrier_arrive_expect_tx(mbar_addr, STAGE_SIZE);
 
@@ -193,7 +190,6 @@ void h_kernel_cutlass(
   else if (warp_id == NUM_WARPS - 2) {
     // MMA warp
     tcgen05_alloc(taddr, 512);
-    setmaxnreg_dec<nregs_lo>();
 
     if (elect_sync()) {
       int tma_stage = 0;
@@ -246,8 +242,7 @@ void h_kernel_cutlass(
         for (int k = 0; k < BT / 16; k++) {
           const int v_tmem = v_tmem_base + k * 8;
           const uint64_t k_desc = k_desc_base | ((K_smem + k * 16 * 128) >> 4);
-          const int enable_input_d = k > 0;
-          tcgen05_mma_tmem(vk_tmem, v_tmem, k_desc, vk_idesc, enable_input_d);
+          tcgen05_mma_tmem(vk_tmem, v_tmem, k_desc, vk_idesc, 1);  // always enable input d
         }
         tcgen05_commit(vk_mbar_addr);
 
@@ -261,46 +256,54 @@ void h_kernel_cutlass(
       }
     }
   }
-  else if (warp_id >= 8) {
-    // other warps in this warpgroup need to release registers as well
-    setmaxnreg_dec<nregs_lo>();
-  }
   else if (warp_id >= 4) {
     // CUDA H warps
-    setmaxnreg_inc<nregs_hi>();
-
     const int tid_ = tid % 128;
     const int warp_id_ = warp_id % 4;
-
-    // collectively, 4 warps represent H[V_dim, K_dim]
-    // since V_dim=128, each thread holds H[K_dim] elements
-    float h_f32[K_dim];
-
-    int vk_parity = 0;
-
-    // load H0
-    for (int i = 0; i < K_dim / 8; i++) {
-      const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim) + i * 8;
-      ldg_u32x8(h_f32 + i * 8, h0_ptr + offset);
-    }
 
     const int chunk_offset = chunk_offsets_ptr[seq_id];
     h_ptr += (chunk_offset * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
 
-    for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
-      // pack H to BF16 and store to gmem (for O kernel) and tmem (for WH MMA)
-      for (int i = 0; i < K_dim / 16; i++) {
-        uint32_t tmp[8];
-        for (int j = 0; j < 8; j++)
-          tmp[j] = fp32x2_to_bf16x2(h_f32[i * 16 + j * 2], h_f32[i * 16 + j * 2 + 1]);
+    // chunk_id = 0: load H from H0 gmem
+    {
+      // load g_cu_last and compute scaling for H
+      float h_scale;
+      if (lane_id == 0) {
+        const int last_idx = min(bos + BT, eos) - 1;
+        h_scale = __expf(g_cu_ptr[last_idx * H + head_id]);
+      }
+      h_scale = warp_uniform(h_scale);
 
-        stg_u32x8(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);  // for O kernel
-        tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, h_tmem_base + i * 8, tmp);  // for WH MMA
+      // collectively, 4 warps represent H[V_dim, K_dim]
+      // each thread processes 1 row
+      for (int i = 0; i < K_dim / 16; i++) {
+        float h_f32[16];
+        uint32_t tmp[8];
+
+        // load H0 from gmem
+        const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
+        ldg_u32x8_fast(h_f32 + 0, h0_ptr + (offset + i * 16 + 0));
+        ldg_u32x8_fast(h_f32 + 8, h0_ptr + (offset + i * 16 + 8));
+
+        // pack to BF16 for O kernel and wh MMA
+        for (int j = 0; j < 8; j++)
+          tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
+        stg_u32x8_fast(h_ptr + i * 16, tmp);                                          // for O kernel
+        tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, h_tmem_base + i * 8, tmp);  // for wh MMA
+
+        // scaled H for vk MMA
+        for (int j = 0; j < 16; j++)
+          h_f32[j] *= h_scale;
+        tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, vk_tmem + i * 16, h_f32);  // for vk MMA
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
       mbarrier_arrive(h_mbar_addr);
-  
+    }
+
+    // chunk_id >= 1: load H from vk MMA
+    int vk_parity = 0;
+    for (int chunk_id = 1; chunk_id < num_chunks; chunk_id++) {
       // load g_cu_last and compute scaling for H
       float h_scale;
       if (lane_id == 0) {
@@ -315,29 +318,50 @@ void h_kernel_cutlass(
       bar_sync<1>(128);
       tcgen05_fence_after_thread_sync();
 
-      constexpr int WIDTH = 16;  // adjustable
-      for (int i = 0; i < K_dim / WIDTH; i++) {
-        float vk[WIDTH];
-        tcgen05_ld<SHAPE::_32x32b, WIDTH>(vk, warp_id_ * 32, vk_tmem + i * WIDTH);
+      // collectively, 4 warps represent H[V_dim, K_dim]
+      // each thread processes 1 row
+      for (int i = 0; i < K_dim / 16; i++) {
+        float h_f32[16];
+        uint32_t tmp[8];
 
-        // TODO: fma.f32x2?
-        for (int j = 0; j < WIDTH; j++)
-          h_f32[i * WIDTH + j] = h_f32[i * WIDTH + j] * h_scale + vk[j];
+        // load H from vk MMA
+        tcgen05_ld<SHAPE::_32x32b, 16>(h_f32, warp_id_ * 32, vk_tmem + i * 16);
+
+        // pack to BF16 for O kernel and wh MMA
+        for (int j = 0; j < 8; j++)
+          tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
+        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);         // for O kernel
+        tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, h_tmem_base + i * 8, tmp);  // for wh MMA
+
+        // scaled H for vk MMA
+        for (int j = 0; j < 16; j++)
+          h_f32[j] *= h_scale;
+        tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, vk_tmem + i * 16, h_f32);  // for vk MMA
       }
+      tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
+      mbarrier_arrive(h_mbar_addr);
 
       vk_parity ^= 1;
     }
 
     // store final H
+    // wait for vk MMA
+    if (warp_id_ == 0)
+      mbarrier_wait(vk_mbar_addr, vk_parity);
+    bar_sync<1>(128);
+    tcgen05_fence_after_thread_sync();
+
     for (int i = 0; i < K_dim / 8; i++) {
+      float h_f32[8];
+      tcgen05_ld<SHAPE::_32x32b, 8>(h_f32, warp_id_ * 32, vk_tmem + i * 8);
+
       const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim) + i * 8;
-      stg_u32x8(ht_ptr + offset, h_f32 + i * 8);
+      stg_u32x8_fast(ht_ptr + offset, h_f32);
     }
   }
   else {
     // V CUDA warps
-    setmaxnreg_inc<nregs_hi>();
-
     int tma_parity = 0;
     int tma_stage = 0;
     int wh_parity = 0;
@@ -510,7 +534,8 @@ void h_v1(
   auto *cu_seqlens_ptr    = reinterpret_cast<int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_offsets_ptr = reinterpret_cast<int32_t *>(chunk_offsets.data_ptr());
 
-  constexpr int NUM_STAGES = 3;
+  // deeper pipeline is slower?
+  constexpr int NUM_STAGES = 2;
   constexpr int smem_size = STAGE_SIZE * NUM_STAGES
                           + V_size           // V_new
                           + v_scale_size     // v_scale
@@ -518,7 +543,7 @@ void h_v1(
                           + 8 * NUM_STAGES   // MMA mbar
                           + 8 * 4            // h, v, wh, vk mbar
                           + 4;               // tmem addr
-  
+
   auto kernel = h_kernel_cutlass<NUM_STAGES>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
   dim3 grid(H, N);

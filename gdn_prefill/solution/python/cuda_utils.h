@@ -744,6 +744,16 @@ void ldg_u32x8(void *data_, const void *ptr) {
 }
 
 __device__ inline
+void ldg_u32x8_fast(void *data_, const void *ptr) {
+  uint32_t *data = reinterpret_cast<uint32_t *>(data_);
+  asm volatile(
+    "ld.global.relaxed.cta.L1::no_allocate.v8.f32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+    : "=r"(data[0]), "=r"(data[1]), "=r"(data[2]), "=r"(data[3]),
+      "=r"(data[4]), "=r"(data[5]), "=r"(data[6]), "=r"(data[7])
+    : "l"(ptr));
+}
+
+__device__ inline
 void stg_u32x8(void *ptr, const void *data_) {
   const uint32_t *data = reinterpret_cast<const uint32_t *>(data_);
   asm volatile(
