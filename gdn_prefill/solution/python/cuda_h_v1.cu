@@ -83,7 +83,7 @@ void h_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,      // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap W_tmap,      // [total_T, H, K_dim]
-  const __grid_constant__ CUtensorMap V_new_tmap,  // [total_T, H, V_dim]
+        nv_bfloat16 *V_new_ptr,                    // [total_T, H, V_dim]
   const float       *g_cu_ptr,                     // [total_T, H]
         nv_bfloat16 *h_ptr,                        // [total_num_chunks, H, V_dim, K_dim]
   const float       *h0_ptr,                       // [N, H, V_dim, K_dim]
@@ -231,7 +231,7 @@ void h_kernel_cutlass(
         constexpr uint64_t k_desc_base = (desc_encode(BT * 128) << 16ULL)  // LBO
                                        | (desc_encode(8 * 128) << 32ULL)   // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
-        
+
         mbarrier_wait(v_mbar_addr, h_parity);  // wait for (scaled) v_new store to tmem
         tcgen05_fence_after_thread_sync();
 
@@ -350,11 +350,6 @@ void h_kernel_cutlass(
         mbarrier_wait(tma_mbar_addr + tma_stage * 8, tma_parity);
         mbarrier_wait(wh_mbar_addr, wh_parity);
       }
-      else if (warp_id == 3) {
-        // wait for previous V_new TMA store to finish
-        if (elect_sync())
-          cp_async_bulk_wait_group_read<0>();
-      }
       bar_sync<2>(128);
       tcgen05_fence_after_thread_sync();
 
@@ -369,7 +364,7 @@ void h_kernel_cutlass(
         tcgen05_ld<SHAPE::_16x256b, BT / 8>(tmp, t_row, wh_tmem);
 
         // each j iteration processes a [16, 16] tile per warp
-        // V smem layout is [2, BT, V_dim/2] with swizzling
+        // V smem layout is [V_dim/64, BT, 64] with swizzling
         for (int j = 0; j < BT / 16; j++) {
           uint32_t v_tmp[4];
           const uint32_t offset = (warp_id / 2) * BT * 128;
@@ -411,14 +406,30 @@ void h_kernel_cutlass(
       // all warps finish storing scaled v_new to smem
       bar_sync<2>(128);
 
-      // issue V_new store TMA
-      if (warp_id == 3 && elect_sync()) {
-        // async-proxy fence
-        // NOTE: this doesn't do bounds check
-        asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;");
-        const int off_t = bos + chunk_id * BT;
-        tma_store_4d(&V_new_tmap, V_new_smem, 0, off_t, 0, head_id);
-        cp_async_bulk_commit_group();
+      // V layout in smem: [V_dim/64, BT, 128B] with swizzling
+      for (int i = 0; i < V_dim / 64; i++) {
+        // each thread loads 16B -> 8 threads load   1 row
+        //                       -> 1 warp    loads  4 rows
+        //                       -> 4 warps   load  16 rows
+        for (int j = 0; j < BT / 16; j++) {
+          const int row = j * 16 + (tid / 8);
+          const int col = tid % 8;
+          const uint32_t src_addr = V_new_smem + i * BT * 128 + row * 128 + (col ^ (row % 8)) * 16;
+
+          const int t = bos + chunk_id * BT + row;
+          const int v = i * 64 + col * 8;
+          auto *dst_addr = V_new_ptr + ((t * H + head_id) * V_dim + v);
+
+          if (t < eos)
+            asm volatile(
+              "{\n"
+              ".reg .b32 x0, x1, x2, x3;\n"
+              "ld.shared.v4.b32 {x0, x1, x2, x3}, [%1];\n"
+              "st.global.v4.b32 [%0], {x0, x1, x2, x3};\n"
+              "}"
+              :: "l"(dst_addr), "r"(src_addr)
+            );
+        }
       }
 
       tma_stage = (tma_stage + 1) % NUM_STAGES;
@@ -475,8 +486,8 @@ void h_v1(
   auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim);
   auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
   auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
-  auto V_new_tmap = encode_tma(V_new.data_ptr(), T, H, V_dim);
 
+  auto *V_new_ptr         = reinterpret_cast<nv_bfloat16 *>(V_new.data_ptr());
   auto *g_cu_ptr          = reinterpret_cast<const float *>(g_cu.data_ptr());
   auto *h_ptr             = reinterpret_cast<nv_bfloat16 *>(h.data_ptr());
   auto *h0_ptr            = reinterpret_cast<const float *>(h0.data_ptr());
@@ -497,7 +508,7 @@ void h_v1(
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
   dim3 grid(H, N);
   kernel<<<grid, TB_SIZE, smem_size>>>(
-    K_tmap, V_tmap, W_tmap, V_new_tmap,
+    K_tmap, V_tmap, W_tmap, V_new_ptr,
     g_cu_ptr, h_ptr, h0_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr);
 }
 
