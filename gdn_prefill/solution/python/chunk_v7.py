@@ -10,7 +10,6 @@ from torch import Tensor
 
 from .triton_v4 import (
     chunk_fwd_kernel_o,
-    chunk_gated_delta_rule_fwd_kernel_h,
     compute_chunks_kernel,
     merge_16x16_to_64x64_inverse_kernel,
 )
@@ -159,28 +158,6 @@ def run(
         cu_seqlens,
         chunk_offsets,
     )
-    # BV = 16
-    # grid = (triton.cdiv(V_dim, BV), N * H)
-    # chunk_gated_delta_rule_fwd_kernel_h[grid](
-    #     k,
-    #     u,
-    #     w,
-    #     v_new,
-    #     g_cu,
-    #     h,
-    #     state,
-    #     final_state,
-    #     cu_seqlens,
-    #     chunk_offsets,
-    #     H=H,
-    #     Hg=Hg,
-    #     K_dim=K_dim,
-    #     V_dim=V_dim,
-    #     BT=BT,
-    #     BV=BV,
-    #     num_warps=4,
-    #     num_stages=3,
-    # )
 
     o = torch.empty_like(v)
 
