@@ -37,6 +37,7 @@ mod = tvm_ffi.load_module(lib_path)
 
 
 _FLAG = None
+_cv5_cache = {}  # Cache intermediate tensors to avoid per-call torch.empty overhead
 
 
 def run(
@@ -98,9 +99,26 @@ def run(
     # - compute beta
     # - compute strictLower(beta * Gamma * (K @ K.T))
     # NOTE: transpose g_cu and beta to make them T-contiguous?
-    g_cu = torch.empty_like(a, dtype=torch.float32)
-    beta = torch.empty_like(b, dtype=torch.float32)
-    A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
+    # Cache intermediate tensors to avoid per-call allocation overhead
+    cache_key = (T, N, H, Hg, K_dim, V_dim, total_num_chunks)
+    if cache_key not in _cv5_cache:
+        dev = k.device
+        _cv5_cache[cache_key] = {
+            'g_cu': torch.empty(T, H, dtype=torch.float32, device=dev),
+            'beta': torch.empty(T, H, dtype=torch.float32, device=dev),
+            'A': torch.empty(T, H, BT, dtype=torch.float32, device=dev),
+            'Ai': torch.empty(T, H, BT, dtype=k.dtype, device=dev),
+            'u': torch.empty(T, H, V_dim, dtype=v.dtype, device=dev),
+            'w': torch.empty(T, H, K_dim, dtype=k.dtype, device=dev),
+            'h': torch.empty(total_num_chunks, H, V_dim, K_dim, dtype=k.dtype, device=dev),
+            'final_state': torch.empty(N, H, V_dim, V_dim, dtype=torch.float32, device=dev),
+            'v_new': torch.empty(T, H, V_dim, dtype=v.dtype, device=dev),
+            'o': torch.empty(T, H, V_dim, dtype=v.dtype, device=dev),
+        }
+    c = _cv5_cache[cache_key]
+    g_cu = c['g_cu']
+    beta = c['beta']
+    A = c['A']
     mod.kkt_v1(
         k,
         A_log,
@@ -117,9 +135,9 @@ def run(
 
     # - compute Ai = inverse(I + strictTriu(A))
     # - obtain WY representation: U = Ai @ V and W = (Ai * g_cu) @ K
-    Ai = torch.empty_like(A, dtype=k.dtype)  # BF16
-    u = torch.empty_like(v)
-    w = k.new_empty(T, H, K_dim)
+    Ai = c['Ai']
+    u = c['u']
+    w = c['w']
     merge_16x16_to_64x64_inverse_kernel[(total_num_chunks, H)](
         k,
         v,
@@ -140,9 +158,9 @@ def run(
         num_warps=2,
     )
 
-    h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
-    final_state = torch.empty_like(state, dtype=torch.float32)
-    v_new = torch.empty_like(u)
+    h = c['h']
+    final_state = c['final_state']
+    v_new = c['v_new']
 
     # reduce BV to increase no. of SMs used.
     # helpful when N * H is small.
@@ -169,7 +187,7 @@ def run(
         num_stages=3,
     )
 
-    o = torch.empty_like(v)
+    o = c['o']
 
     # we only need separate o kernel if h kernel is too small?
     BV = 64

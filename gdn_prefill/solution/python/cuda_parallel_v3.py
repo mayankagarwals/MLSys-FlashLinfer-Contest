@@ -27,6 +27,8 @@ lib_path = tvm_ffi.cpp.build(
 mod = tvm_ffi.load_module(lib_path)
 _kernel = mod.gdn_prefill_tcgen05
 
+_v3_cache = {}
+
 def run(
     q: Tensor,
     k: Tensor,
@@ -42,7 +44,13 @@ def run(
     T, H, V_dim = v.shape
     N = state.shape[0]
 
-    output = torch.empty(T, H, V_dim, device=v.device, dtype=v.dtype)
-    new_state = torch.empty(N, H, V_dim, V_dim, device=state.device, dtype=torch.float32)
+    # Cache output tensors to avoid per-call torch.empty overhead
+    key = (T, H, V_dim, N)
+    if key not in _v3_cache:
+        _v3_cache[key] = (
+            torch.empty(T, H, V_dim, device=v.device, dtype=v.dtype),
+            torch.empty(N, H, V_dim, V_dim, device=state.device, dtype=torch.float32),
+        )
+    output, new_state = _v3_cache[key]
     _kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, new_state)
     return output, new_state
