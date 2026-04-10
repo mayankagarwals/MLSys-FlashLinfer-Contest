@@ -72,13 +72,14 @@ constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
 
 constexpr uint32_t v_scale_size = BT * sizeof(float);
 
-constexpr int NUM_WARPS = 4 + 4 + 2;
+constexpr int NUM_WARPS = 4 + 4 + 4;  // requires multiple of 4 to use setmaxnreg
 constexpr int WARP_SIZE = 32;
 constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
 template <int NUM_STAGES>
 __global__
 __block_size__((TB_SIZE, 1, 1))
+__launch_bounds__(TB_SIZE, 1)
 void h_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,      // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
@@ -126,6 +127,9 @@ void h_kernel_cutlass(
   const uint32_t h_tmem_base = vk_tmem + K_dim;
   const uint32_t v_tmem_base = h_tmem_base + K_dim / 2;
 
+  constexpr int nregs_lo = 24;
+  constexpr int nregs_hi = 240;
+
   if (warp_id == 0) {
     // init mbar
     if (elect_sync()) {
@@ -152,6 +156,8 @@ void h_kernel_cutlass(
 
   if (warp_id == NUM_WARPS - 1) {
     // TMA warp
+    setmaxnreg_dec<nregs_lo>();
+
     if (elect_sync()) {
       int stage_id = 0;
       int parity = 1;
@@ -187,6 +193,7 @@ void h_kernel_cutlass(
   else if (warp_id == NUM_WARPS - 2) {
     // MMA warp
     tcgen05_alloc(taddr, 512);
+    setmaxnreg_dec<nregs_lo>();
 
     if (elect_sync()) {
       int tma_stage = 0;
@@ -254,8 +261,14 @@ void h_kernel_cutlass(
       }
     }
   }
+  else if (warp_id >= 8) {
+    // other warps in this warpgroup need to release registers as well
+    setmaxnreg_dec<nregs_lo>();
+  }
   else if (warp_id >= 4) {
     // CUDA H warps
+    setmaxnreg_inc<nregs_hi>();
+
     const int tid_ = tid % 128;
     const int warp_id_ = warp_id % 4;
 
@@ -323,6 +336,8 @@ void h_kernel_cutlass(
   }
   else {
     // V CUDA warps
+    setmaxnreg_inc<nregs_hi>();
+
     int tma_parity = 0;
     int tma_stage = 0;
     int wh_parity = 0;

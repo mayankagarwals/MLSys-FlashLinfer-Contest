@@ -819,3 +819,15 @@ void cp_async_cg_128(uint32_t smem_addr, const void *gmem_ptr, bool pred) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 0x10, %2;"
     :: "r"(smem_addr), "l"(gmem_ptr), "r"(p) : "memory");
 }
+
+template <int nregs>
+__device__ __forceinline__
+void setmaxnreg_inc() {
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(nregs));
+}
+
+template <int nregs>
+__device__ __forceinline__
+void setmaxnreg_dec() {
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(nregs));
+}
