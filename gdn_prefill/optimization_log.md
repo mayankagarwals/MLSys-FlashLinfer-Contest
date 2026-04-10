@@ -238,3 +238,14 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 - All Python-level optimizations exhausted (tensor caching, dispatch threshold)
 - All accessible CUDA-level optimizations exhausted (bank conflicts, TMA, XOR swizzle)
 - Remaining gap requires: H+O kernel fusion, CuTe/CUTLASS, or Triton kernel modifications
+
+## Session: April 10, 2026 (continued)
+
+### Optimization 17: Triton H-kernel BV=32 for large N (FAILED — slower)
+**Result**: 10,885 → 10,961 us (+76 us). cv5 top workloads got slower (331 vs 324 us).
+**Why**: Fewer v-tile blocks (4 vs 8) reduces parallelism and occupancy hiding.
+
+### Optimization 18: Overlap .item() sync with kkt_v1 (FAILED — excess work)
+**Hypothesis**: Launch kkt_v1 with upper_bound_chunks before .item() sync to overlap CPU wait with GPU compute.
+**Result**: 10,885 → 11,143 us (+258 us, much worse).
+**Why**: kkt_v1 processes upper_bound_chunks iterations (up to 44% more for N=57) instead of total_num_chunks. Excess work >> sync savings.
