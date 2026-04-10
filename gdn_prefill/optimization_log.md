@@ -249,3 +249,11 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 **Hypothesis**: Launch kkt_v1 with upper_bound_chunks before .item() sync to overlap CPU wait with GPU compute.
 **Result**: 10,885 → 11,143 us (+258 us, much worse).
 **Why**: kkt_v1 processes upper_bound_chunks iterations (up to 44% more for N=57) instead of total_num_chunks. Excess work >> sync savings.
+
+### Optimization 19: Triton H-kernel num_stages=4 (FAILED — crash)
+**Result**: Benchmark crashes (GPU idle, no TSV). Likely register overflow from 4-stage pipeline.
+
+### Optimization 20: Triton H-kernel BV=32 for large N*H (FAILED — slower)  
+**Result**: +76 us overall. Fewer v-tile blocks hurt parallelism.
+
+### Current confirmed best: 10,874 us (-7.7%). Gap: 275 us to -10% target.
