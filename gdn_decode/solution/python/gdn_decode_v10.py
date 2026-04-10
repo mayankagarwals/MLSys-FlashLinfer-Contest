@@ -1,3 +1,9 @@
+import ctypes
+
+# get weird errors without this
+ctypes.CDLL("libcudart.so", mode=ctypes.RTLD_GLOBAL)
+
+
 import torch
 
 from .gdn_decode_baseline import run as baseline_run
