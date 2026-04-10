@@ -24,13 +24,15 @@ def run(
     scale: float,
 ):
     T = q.shape[0]
+    N = cu_seqlens.shape[0] - 1  # num_seqs
 
     # chunk_v5 (CUDA kkt + Triton) for large workloads
     if T >= 1024:
         return chunk_v5(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA v3 chunk kernel for medium workloads (faster than chunk_v5 for T<256)
-    if T >= 64:
+    # CUDA v3 chunk kernel for medium workloads
+    # Also faster than recurrent for single-seq workloads with T>=46
+    if T >= 64 or (N == 1 and T >= 46):
         return cuda_v3(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA recurrent for tiny workloads
