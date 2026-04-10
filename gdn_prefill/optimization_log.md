@@ -172,3 +172,25 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 - Smem grows from 60KB to 68KB, potentially limiting multi-block scheduling
 - The B fragment reuse (loading B once for 2 MMAs) doesn't compensate for the 2x compute increase
 **Lesson**: BV_H=16 is the sweet spot for B200. Smaller tiles = more parallelism from more blocks.
+
+### Research Agent Findings Summary (Apr 10)
+
+**Triton H-kernel analysis:**
+- Uses 3-stage pipeline (num_stages=3): prefetches 3 chunks ahead vs our 1.5
+- Triton loads all K-fragments upfront → all MMAs back-to-back
+- ~450-500 cycles of latency hiding vs our ~200 cycles
+- Serial h_reg dependency prevents cross-chunk overlap regardless
+- Key gap: SASS instruction scheduling (verified)
+
+**Algorithmic optimization analysis:**
+1. H+O kernel fusion: eliminate d_h roundtrip (~268MB/seq) — HIGH IMPACT but complex
+2. Pre-compute exp(g): save ~384 expf/chunk across H+O — MEDIUM
+3. Phase 2 reduce iterations: 3→2 only works for depth<8, but 16x16 block needs all 3
+4. W/U computation sharing: Triton does this, but precision constraints prevent in CUDA
+5. d_h workaround: pass h through smem/L2 instead of global — easier than full fusion
+
+### Remaining viable approaches (by estimated impact):
+1. **H+O fusion**: -200+ us (eliminates kernel launch + d_h traffic). Multi-day effort.
+2. **Pre-compute exp(g)**: -50 us (eliminates redundant expf). 1-2 hour effort.
+3. **Tune dispatch threshold**: Already done, diminishing returns.
+4. **CuTe/CUTLASS for MMA**: Could match Triton SASS. Multi-day effort.
