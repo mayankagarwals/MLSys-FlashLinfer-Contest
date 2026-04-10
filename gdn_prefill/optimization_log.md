@@ -214,3 +214,15 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 - recurrent savings: minimal (only 2 tensors cached)
 **Why it worked**: CUDA memory allocator (via PyTorch caching allocator) has per-allocation overhead of ~3-10us. With 10 allocations per chunk_v5 call × 30 calls = 300 calls eliminated → ~900-3000us savings potential. Actual savings ~288us consistent with ~10us/alloc overhead.
 **Key insight**: Python-level optimization (tensor caching) gave the second-largest improvement after H-kernel bank conflict elimination. Always check for allocation overhead.
+
+### Optimization 15: Compute chunk metadata on CPU (FAILED — CUDA error)
+**Hypothesis**: Replace Triton compute_chunks_kernel + .item() sync with CPU computation of chunk_indices via cu_seqlens.tolist() + torch.tensor transfer.
+**Result**: CUDA_ERROR_UNKNOWN. The CPU-created tensor might have format issues or the transfer races with pending GPU work.
+**Reverted**: Kept tensor caching for metadata but kept Triton kernel for computation.
+
+### Current Status
+- **10,889 us (-7.5%)**, 100/100 correct
+- Gap to target: 290 us
+- Python-level optimizations exhausted (tensor caching applied everywhere)
+- GPU compute is the remaining bottleneck
+- chunk_v5 .item() sync overhead is ~5-10us × 30 = 150-300us but can't be eliminated
