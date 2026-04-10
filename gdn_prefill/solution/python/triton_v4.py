@@ -365,38 +365,31 @@ def merge_16x16_to_64x64_inverse_kernel(
     g2 = tl.load(g_cu_ptr + t2 * H, mask=m2, other=0.0)
     g3 = tl.load(g_cu_ptr + t3 * H, mask=m3, other=0.0)
 
-    # Scale Ai by column-beta: Ab[r,c] = Ai[r,c] * beta[c] (1D broadcast = column-wise)
-    Ab11 = Ai_11 * b0; Ab22 = Ai_22 * b1; Ab33 = Ai_33 * b2; Ab44 = Ai_44 * b3
-    Ab21 = Ai_21 * b0; Ab31 = Ai_31 * b0; Ab32 = Ai_32 * b1
-    Ab41 = Ai_41 * b0; Ab42 = Ai_42 * b1; Ab43 = Ai_43 * b2
+    # Reload full Ai from global (just stored above, in L2 cache — fast)
+    # This ensures W/U computation matches original precision exactly
+    offs_bt = chunk_id * BT + tl.arange(0, BT)
+    mask_bt = offs_bt < seqlen
+    Ai_ptrs = Ai_ptr + (offs_bt[:, None] * H * BT + tl.arange(0, BT))
+    Ai = tl.load(Ai_ptrs, mask=mask_bt[:, None], other=0.0)
 
-    # U = (Ai * beta) @ V — block lower-triangular
-    u1 = tl.dot(Ab11.to(v1.dtype), v1)
-    u2 = tl.dot(Ab21.to(v1.dtype), v1) + tl.dot(Ab22.to(v2.dtype), v2)
-    u3 = tl.dot(Ab31.to(v1.dtype), v1) + tl.dot(Ab32.to(v2.dtype), v2) + tl.dot(Ab33.to(v3.dtype), v3)
-    u4 = tl.dot(Ab41.to(v1.dtype), v1) + tl.dot(Ab42.to(v2.dtype), v2) + tl.dot(Ab43.to(v3.dtype), v3) + tl.dot(Ab44.to(v4.dtype), v4)
+    # Load v, k as full [BT, dim] blocks
+    v_full = tl.load(v_ptr + (offs_bt[:, None] * H * V_dim + tl.arange(0, V_dim)), mask=mask_bt[:, None], other=0.0)
+    k_full = tl.load(k_ptr + (offs_bt[:, None] * Hg * K_dim + tl.arange(0, K_dim)), mask=mask_bt[:, None], other=0.0)
+    beta = tl.load(beta_ptr + offs_bt * H, mask=mask_bt, other=0.0)
+    g_cu = tl.load(g_cu_ptr + offs_bt * H, mask=mask_bt, other=0.0)
 
-    offs_t16 = (t_base + offs_16)[:, None]
-    tl.store(u_ptr + ((offs_t16 + 0) * H * V_dim + offs_v[None, :]), u1, mask=(offs_t16 + 0) < seqlen)
-    tl.store(u_ptr + ((offs_t16 + 16) * H * V_dim + offs_v[None, :]), u2, mask=(offs_t16 + 16) < seqlen)
-    tl.store(u_ptr + ((offs_t16 + 32) * H * V_dim + offs_v[None, :]), u3, mask=(offs_t16 + 32) < seqlen)
-    tl.store(u_ptr + ((offs_t16 + 48) * H * V_dim + offs_v[None, :]), u4, mask=(offs_t16 + 48) < seqlen)
+    # U = (Ai * beta) @ V — single dot, exact same as original
+    Ab = Ai * beta
+    u = tl.dot(Ab.to(v_full.dtype), v_full)
 
-    # W = (Ai * beta * exp(g)) @ K
-    eg0 = tl.exp(g0); eg1 = tl.exp(g1); eg2 = tl.exp(g2); eg3 = tl.exp(g3)
-    Abg11 = Ab11 * eg0; Abg22 = Ab22 * eg1; Abg33 = Ab33 * eg2; Abg44 = Ab44 * eg3
-    Abg21 = Ab21 * eg0; Abg31 = Ab31 * eg0; Abg32 = Ab32 * eg1
-    Abg41 = Ab41 * eg0; Abg42 = Ab42 * eg1; Abg43 = Ab43 * eg2
+    offs_bt2 = chunk_id * BT + tl.arange(0, BT)[:, None]
+    tl.store(u_ptr + (offs_bt2 * H * V_dim + tl.arange(0, V_dim)), u, mask=offs_bt2 < seqlen)
 
-    w1 = tl.dot(Abg11.to(k1.dtype), k1)
-    w2 = tl.dot(Abg21.to(k1.dtype), k1) + tl.dot(Abg22.to(k2.dtype), k2)
-    w3 = tl.dot(Abg31.to(k1.dtype), k1) + tl.dot(Abg32.to(k2.dtype), k2) + tl.dot(Abg33.to(k3.dtype), k3)
-    w4 = tl.dot(Abg41.to(k1.dtype), k1) + tl.dot(Abg42.to(k2.dtype), k2) + tl.dot(Abg43.to(k3.dtype), k3) + tl.dot(Abg44.to(k4.dtype), k4)
+    # W = (Ai * beta * exp(g_cu)) @ K
+    Abg = Ab * tl.exp(g_cu)
+    w = tl.dot(Abg.to(k_full.dtype), k_full)
 
-    tl.store(w_ptr + ((offs_t16 + 0) * H * K_dim + offs_k[None, :]), w1, mask=(offs_t16 + 0) < seqlen)
-    tl.store(w_ptr + ((offs_t16 + 16) * H * K_dim + offs_k[None, :]), w2, mask=(offs_t16 + 16) < seqlen)
-    tl.store(w_ptr + ((offs_t16 + 32) * H * K_dim + offs_k[None, :]), w3, mask=(offs_t16 + 32) < seqlen)
-    tl.store(w_ptr + ((offs_t16 + 48) * H * K_dim + offs_k[None, :]), w4, mask=(offs_t16 + 48) < seqlen)
+    tl.store(w_ptr + (offs_bt2 * H * K_dim + tl.arange(0, K_dim)), w, mask=offs_bt2 < seqlen)
 
 
 @triton.jit
