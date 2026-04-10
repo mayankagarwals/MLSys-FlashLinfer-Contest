@@ -10,6 +10,8 @@ from .cuda_recurrent_v1 import run as cuda_recurrent_v1
 from .chunk_v5 import run as chunk_v5
 from .cuda_parallel_v3 import run as cuda_v3
 
+_rec_cache = {}  # Cache output tensors for recurrent kernel
+
 
 def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
@@ -35,9 +37,11 @@ def run(
     if T >= 64 or (N == 1 and T >= 46):
         return cuda_v3(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA recurrent for tiny workloads
-    o = torch.empty_like(v)
-    new_state = torch.empty_like(state)
+    # CUDA recurrent for tiny workloads (cached output tensors)
+    rec_key = (T, v.shape[1], v.shape[2], state.shape[0])
+    if rec_key not in _rec_cache:
+        _rec_cache[rec_key] = (torch.empty_like(v), torch.empty_like(state))
+    o, new_state = _rec_cache[rec_key]
     cuda_recurrent_v1(
         q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, o, new_state
     )
