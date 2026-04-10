@@ -143,3 +143,11 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 - After fixing both: 6/42 v3 pass, 36/42 fail due to PRECISION differences
 **Root cause**: Different rounding path: old code rounds Ai→bf16 then scales input as bf16×bf16. New code scales Ai in fp32 then rounds→bf16. The intermediate products differ at the bf16 precision boundary, causing ~1e-2 error that exceeds atol tolerance.
 **Lesson**: Can't change the multiplication order in (Ai @ (scale * input)) without changing numerical results at bf16 precision. The tolerance (atol=1e-2) is very tight relative to output magnitudes (~1e-2).
+
+### Optimization 9: Lower v3 dispatch threshold for N=1, T>=46 (SUCCESS)
+**Commit**: 7b5a77f
+**Hypothesis**: v3 is faster than recurrent for single-sequence workloads with T>=46 (1 chunk, ~48us) vs recurrent (T-dependent, ~52-65us for T=46-61).
+**What changed**: Added condition `N == 1 and T >= 46` to route small single-seq workloads to v3 instead of recurrent.
+**Result**: 11,252 → 11,192 us (-0.5%). 100/100 correct.
+**Per-workload savings**: T=61(-16us), T=49×3(-15us), T=48(-6us) = ~37us total.
+**Why it worked**: v3's fixed overhead (~42us from 3 kernel launches) is lower than recurrent's T-proportional cost (~1us/token + 10us base) for T>46 with N=1. Multi-seq workloads stay with recurrent because v3 overhead doesn't scale well with N.
