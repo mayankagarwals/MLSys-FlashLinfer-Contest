@@ -151,3 +151,12 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 **Result**: 11,252 → 11,192 us (-0.5%). 100/100 correct.
 **Per-workload savings**: T=61(-16us), T=49×3(-15us), T=48(-6us) = ~37us total.
 **Why it worked**: v3's fixed overhead (~42us from 3 kernel launches) is lower than recurrent's T-proportional cost (~1us/token + 10us base) for T>46 with N=1. Multi-seq workloads stay with recurrent because v3 overhead doesn't scale well with N.
+
+### Optimization 10: chunk_v5 eliminate CUDA sync (FAILED — slower)
+**Hypothesis**: Replace `chunk_offsets[-1].item()` with CPU-computed total_num_chunks from `cu_seqlens.tolist()` to avoid CUDA sync.
+**Result**: 11,192 → 11,707 us (+515 us, WORSE). chunk_v5 went from 7,557 to 8,052.
+**Why it failed**: `cu_seqlens.tolist()` has Python list creation overhead (~5-10us per call × 30 WLs = 150-300us), while the original `.item()` sync overhead is negligible (compute_chunks_kernel completes in ~1us).
+
+### Optimization 11: H-kernel launch_bounds(128, 2) (NO IMPROVEMENT)
+**Result**: T=134: 55.5 us (unchanged). T=959: 108.6 us (unchanged).
+**Why**: Compiler already generates code compatible with 2 blocks/SM under (128, 1).
