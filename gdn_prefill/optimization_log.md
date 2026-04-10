@@ -226,3 +226,15 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 - Python-level optimizations exhausted (tensor caching applied everywhere)
 - GPU compute is the remaining bottleneck
 - chunk_v5 .item() sync overhead is ~5-10us × 30 = 150-300us but can't be eliminated
+
+### Optimization 16: Recurrent kernel sm_100a + libcuda (FAILED — runtime crash)
+**What changed**: Added `TVM_FFI_CUDA_ARCH_LIST=10.0a` and `-lcuda` to recurrent kernel build.
+**Result**: Compilation succeeds but benchmark crashes (30/100 correct).
+**Root cause**: `-lcuda` likely conflicts with the recurrent kernel's simpler CUDA usage.
+**Reverted**.
+
+### Final Status: 10,885 us (-7.6%), 100/100 correct
+- Gap to -10% target: ~286 us (purely GPU compute)
+- All Python-level optimizations exhausted (tensor caching, dispatch threshold)
+- All accessible CUDA-level optimizations exhausted (bank conflicts, TMA, XOR swizzle)
+- Remaining gap requires: H+O kernel fusion, CuTe/CUTLASS, or Triton kernel modifications
