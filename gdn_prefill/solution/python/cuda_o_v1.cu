@@ -8,7 +8,7 @@
 constexpr uint32_t BLOCK_T = 64U;
 constexpr uint32_t HEAD_DIM = 128U;
 constexpr uint32_t VALUE_DIM = 128U;
-constexpr uint32_t BLOCK_V = 64U;
+constexpr uint32_t BLOCK_V = 128U;
 
 //// Head Config
 constexpr uint32_t NUM_OUTPUT_HEADS = 8U;
@@ -45,6 +45,8 @@ constexpr uint32_t SWIZZLE_HEIGHT = BLOCK_T;
 constexpr uint32_t SWIZZLE_WIDTH = 128U / sizeof(nv_bfloat16);
 constexpr uint32_t SWIZZLE_BYTES =
     SWIZZLE_HEIGHT * SWIZZLE_WIDTH * sizeof(nv_bfloat16);
+constexpr uint32_t H_SWIZZLE_BYTES =
+    BLOCK_V * SWIZZLE_WIDTH * sizeof(nv_bfloat16);
 constexpr uint32_t SWIZZLE_SBO = 8U * 128U;
 constexpr uint32_t V_MMA_SBO = SWIZZLE_WIDTH * 8U * sizeof(nv_bfloat16);
 constexpr uint32_t V_MMA_LBO = (BLOCK_T / 8U) * V_MMA_SBO;
@@ -55,7 +57,7 @@ constexpr uint32_t BYTES_ONE_MMA_MMAJOR =
 constexpr uint32_t Q_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
 constexpr uint32_t K_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
 constexpr uint32_t V_SMEM_SIZE = BLOCK_V * BLOCK_T * sizeof(nv_bfloat16);
-constexpr uint32_t H_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
+constexpr uint32_t H_SMEM_SIZE = BLOCK_V * HEAD_DIM * sizeof(nv_bfloat16);
 constexpr uint32_t ATTN_SMEM_SIZE = BLOCK_T * BLOCK_T * sizeof(nv_bfloat16);
 constexpr uint32_t OUTPUT_SMEM_SIZE = BLOCK_T * BLOCK_V * sizeof(float);
 constexpr uint32_t G_SMEM_SIZE = BLOCK_T * sizeof(float);
@@ -77,9 +79,9 @@ constexpr uint32_t OFFSET_TMEM_ADDR = OFFSET_OV_MMA_BAR + 8U;
 constexpr uint32_t SMEM_SIZE = (OFFSET_TMEM_ADDR + 4U + 1023U) & ~1023U;
 
 //// Tensor Memory
-constexpr uint32_t MAX_COLUMNS = 256U;
+constexpr uint32_t MAX_COLUMNS = 512U;
 constexpr uint32_t OUTPUT_TMEM_COL = BLOCK_T;
-constexpr uint32_t QH_TMEM_COL = 2U * BLOCK_T;
+constexpr uint32_t QH_TMEM_COL = 3U * BLOCK_T;
 
 __device__ __forceinline__ uint32_t make_tile_layout_index(uint32_t tile_rows,
                                                            uint32_t row,
@@ -99,7 +101,7 @@ static CUtensorMap encode_tma(void *ptr, uint64_t outer, uint64_t rows,
       SWIZZLE_WIDTH * sizeof(nv_bfloat16),
       rows * cols * sizeof(nv_bfloat16),
   };
-  uint32_t boxDim[rank] = {SWIZZLE_WIDTH, BLOCK_T,
+  uint32_t boxDim[rank] = {SWIZZLE_WIDTH, BLOCK_V,
                            static_cast<uint32_t>(cols / SWIZZLE_WIDTH), 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
@@ -144,7 +146,8 @@ static CUtensorMap encode_v_tma(void *ptr, uint64_t num_tokens) {
       SWIZZLE_WIDTH * sizeof(nv_bfloat16),
       VALUE_DIM * sizeof(nv_bfloat16),
   };
-  uint32_t boxDim[rank] = {SWIZZLE_WIDTH, BLOCK_T, 1U, 1U};
+  uint32_t boxDim[rank] = {SWIZZLE_WIDTH, BLOCK_T,
+                           BLOCK_V / SWIZZLE_WIDTH, 1U};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
   cuTensorMapEncodeTiled(
@@ -186,30 +189,32 @@ __device__ __forceinline__ void mma_swizzled(uint32_t output_tmem,
   }
 }
 
-__device__ __forceinline__ void mma_noswizzle_64x64(uint32_t output_tmem,
-                                                    uint32_t matrix_a_smem,
-                                                    uint32_t matrix_b_smem) {
-  constexpr uint32_t idesc = make_tcgen05_idesc(MMA_M, MMA_N);
-  constexpr uint32_t matrix_a_k_stride_bytes =
-      BLOCK_T * MMA_K * sizeof(nv_bfloat16);
-  constexpr uint32_t matrix_b_k_stride_bytes =
-      BLOCK_V * MMA_K * sizeof(nv_bfloat16);
+__device__ __forceinline__ void mma_swizzled_qh_64x128(
+    uint32_t output_tmem, uint32_t matrix_a_smem, uint32_t matrix_b_smem) {
+  constexpr uint32_t idesc = make_tcgen05_idesc(MMA_M, BLOCK_V);
+  constexpr uint64_t desc_base =
+      (desc_encode(SWIZZLE_SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
+
 #pragma unroll
-  for (uint32_t ki = 0; ki < NUM_MMA_STEPS; ++ki) {
-    const uint32_t a_base = matrix_a_smem + ki * matrix_a_k_stride_bytes;
-    const uint32_t b_base = matrix_b_smem + ki * matrix_b_k_stride_bytes;
-    tcgen05_mma(output_tmem,
-                make_tcgen05_desc_noswizzle(a_base, BLOCK_T,
-                                            BLOCK_T * sizeof(nv_bfloat16)),
-                make_tcgen05_desc_noswizzle(b_base, BLOCK_V,
-                                            BLOCK_T * sizeof(nv_bfloat16)),
-                idesc, ki > 0U);
+  for (uint32_t atom = 0; atom < static_cast<uint32_t>(NUM_SWIZZLE_ATOMS);
+       ++atom) {
+#pragma unroll
+    for (uint32_t mi = 0; mi < NUM_MMA_STEPS; ++mi) {
+      const uint64_t a_desc =
+          desc_base |
+          ((matrix_a_smem + atom * SWIZZLE_BYTES + mi * BYTES_ONE_MMA) >> 4);
+      const uint64_t b_desc =
+          desc_base |
+          ((matrix_b_smem + atom * H_SWIZZLE_BYTES + mi * BYTES_ONE_MMA) >> 4);
+      const uint32_t accum = (atom > 0U) || (mi > 0U);
+      tcgen05_mma(output_tmem, a_desc, b_desc, idesc, accum);
+    }
   }
 }
 
-__device__ __forceinline__ void mma_attn_v_mmajor_64x64(
+__device__ __forceinline__ void mma_attn_v_mmajor_64x128(
     uint32_t output_tmem, uint32_t matrix_a_smem, uint32_t matrix_b_smem) {
-  constexpr uint32_t idesc = make_tcgen05_idesc(MMA_M, MMA_N) | (1U << 16U);
+  constexpr uint32_t idesc = make_tcgen05_idesc(MMA_M, BLOCK_V) | (1U << 16U);
   constexpr uint32_t matrix_a_k_stride_bytes =
       BLOCK_T * MMA_K * sizeof(nv_bfloat16);
 #pragma unroll
@@ -352,12 +357,12 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     tcgen05_commit(mma_barrier);
     mbarrier_wait(h_tma_barrier, TMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    mma_swizzled<NUM_SWIZZLE_ATOMS>(QH_TMEM_COL, q_smem, h_smem);
+    mma_swizzled_qh_64x128(QH_TMEM_COL, q_smem, h_smem);
     tcgen05_commit(qh_mma_barrier);
     mbarrier_wait(v_tma_barrier, TMA_PHASE);
     mbarrier_wait(attn_ready_barrier, ATTN_READY_PHASE);
     tcgen05_fence_after_thread_sync();
-    mma_attn_v_mmajor_64x64(OUTPUT_TMEM_COL, attn_smem, v_smem);
+    mma_attn_v_mmajor_64x128(OUTPUT_TMEM_COL, attn_smem, v_smem);
     tcgen05_commit(ov_mma_barrier);
   }
 
@@ -416,21 +421,42 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   if (warp_id < NUM_CUDA_WARPS) {
     mbarrier_wait(ov_mma_barrier, OV_MMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    float reg_lo[REGS_PER_FRAGMENT];
-    float reg_hi[REGS_PER_FRAGMENT];
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0, OUTPUT_TMEM_COL);
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_hi, 0,
-                                   OUTPUT_TMEM_COL + COLS_PER_FRAGMENT);
-    tcgen05_wait_ld();
     const uint32_t row_base =
         warp_id * ROWS_PER_WARP + lane_id / LANES_PER_ROW_GROUP;
     const uint32_t row_hi = row_base + ROW_PAIR_STRIDE;
     const uint32_t lane_col = lane_id % LANES_PER_ROW_GROUP;
     float *row_base_output_ptr = output_smem_ptr + row_base * BLOCK_V;
     float *row_hi_output_ptr = output_smem_ptr + row_hi * BLOCK_V;
+    float reg_lo[REGS_PER_FRAGMENT];
+    float reg_hi[REGS_PER_FRAGMENT];
+    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0, OUTPUT_TMEM_COL);
+    tcgen05_ld<SHAPE::_16x256b, 4>(reg_hi, 0,
+                                   OUTPUT_TMEM_COL + COLS_PER_FRAGMENT);
+    tcgen05_wait_ld();
 #pragma unroll
     for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
       const uint32_t col_lo = step_pair * 8U + 2U * lane_col;
+      const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
+      const uint32_t reg_row0 = step_pair * 4U;
+      const uint32_t reg_row1 = reg_row0 + 2U;
+
+      reinterpret_cast<float2 *>(row_base_output_ptr + col_lo)[0] =
+          make_float2(reg_lo[reg_row0], reg_lo[reg_row0 + 1U]);
+      reinterpret_cast<float2 *>(row_hi_output_ptr + col_lo)[0] =
+          make_float2(reg_lo[reg_row1], reg_lo[reg_row1 + 1U]);
+      reinterpret_cast<float2 *>(row_base_output_ptr + col_hi)[0] =
+          make_float2(reg_hi[reg_row0], reg_hi[reg_row0 + 1U]);
+      reinterpret_cast<float2 *>(row_hi_output_ptr + col_hi)[0] =
+          make_float2(reg_hi[reg_row1], reg_hi[reg_row1 + 1U]);
+    }
+    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0,
+                                   OUTPUT_TMEM_COL + BLOCK_T);
+    tcgen05_ld<SHAPE::_16x256b, 4>(
+        reg_hi, 0, OUTPUT_TMEM_COL + BLOCK_T + COLS_PER_FRAGMENT);
+    tcgen05_wait_ld();
+#pragma unroll
+    for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
+      const uint32_t col_lo = BLOCK_T + step_pair * 8U + 2U * lane_col;
       const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
       const uint32_t reg_row0 = step_pair * 4U;
       const uint32_t reg_row1 = reg_row0 + 2U;
@@ -449,12 +475,6 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   if (warp_id < NUM_CUDA_WARPS) {
     mbarrier_wait(qh_mma_barrier, QH_MMA_PHASE);
     tcgen05_fence_after_thread_sync();
-    float reg_lo[REGS_PER_FRAGMENT];
-    float reg_hi[REGS_PER_FRAGMENT];
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0, QH_TMEM_COL);
-    tcgen05_ld<SHAPE::_16x256b, 4>(reg_hi, 0,
-                                   QH_TMEM_COL + COLS_PER_FRAGMENT);
-    tcgen05_wait_ld();
     const uint32_t row_base =
         warp_id * ROWS_PER_WARP + lane_id / LANES_PER_ROW_GROUP;
     const uint32_t row_hi = row_base + ROW_PAIR_STRIDE;
@@ -483,48 +503,61 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
            v_start);
     }
 #pragma unroll
-    for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
-      const uint32_t col_lo = step_pair * 8U + 2U * lane_col;
-      const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
-      const uint32_t reg_row0 = step_pair * 4U;
-      const uint32_t reg_row1 = reg_row0 + 2U;
+    for (uint32_t fragment_pair = 0; fragment_pair < BLOCK_V / BLOCK_T;
+         ++fragment_pair) {
+      const uint32_t col_base = fragment_pair * BLOCK_T;
+      float reg_lo[REGS_PER_FRAGMENT];
+      float reg_hi[REGS_PER_FRAGMENT];
+      tcgen05_ld<SHAPE::_16x256b, 4>(reg_lo, 0, QH_TMEM_COL + col_base);
+      tcgen05_ld<SHAPE::_16x256b, 4>(reg_hi, 0,
+                                     QH_TMEM_COL + col_base +
+                                         COLS_PER_FRAGMENT);
+      tcgen05_wait_ld();
+#pragma unroll
+      for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
+        const uint32_t col_lo =
+            col_base + step_pair * 8U + 2U * lane_col;
+        const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
+        const uint32_t reg_row0 = step_pair * 4U;
+        const uint32_t reg_row1 = reg_row0 + 2U;
 
-      if (row_base_active) {
-        const float value_lo_0 =
-            scale * (output_smem_ptr[row_base * BLOCK_V + col_lo] +
-                     reg_lo[reg_row0] * g_row_base);
-        const float value_lo_1 =
-            scale * (output_smem_ptr[row_base * BLOCK_V + col_lo + 1U] +
-                     reg_lo[reg_row0 + 1U] * g_row_base);
-        const float value_hi_0 =
-            scale * (output_smem_ptr[row_base * BLOCK_V + col_hi] +
-                     reg_hi[reg_row0] * g_row_base);
-        const float value_hi_1 =
-            scale * (output_smem_ptr[row_base * BLOCK_V + col_hi + 1U] +
-                     reg_hi[reg_row0 + 1U] * g_row_base);
-        reinterpret_cast<__nv_bfloat162 *>(row_base_o_ptr + col_lo)[0] =
-            __floats2bfloat162_rn(value_lo_0, value_lo_1);
-        reinterpret_cast<__nv_bfloat162 *>(row_base_o_ptr + col_hi)[0] =
-            __floats2bfloat162_rn(value_hi_0, value_hi_1);
-      }
+        if (row_base_active) {
+          const float value_lo_0 =
+              scale * (output_smem_ptr[row_base * BLOCK_V + col_lo] +
+                       reg_lo[reg_row0] * g_row_base);
+          const float value_lo_1 =
+              scale * (output_smem_ptr[row_base * BLOCK_V + col_lo + 1U] +
+                       reg_lo[reg_row0 + 1U] * g_row_base);
+          const float value_hi_0 =
+              scale * (output_smem_ptr[row_base * BLOCK_V + col_hi] +
+                       reg_hi[reg_row0] * g_row_base);
+          const float value_hi_1 =
+              scale * (output_smem_ptr[row_base * BLOCK_V + col_hi + 1U] +
+                       reg_hi[reg_row0 + 1U] * g_row_base);
+          reinterpret_cast<__nv_bfloat162 *>(row_base_o_ptr + col_lo)[0] =
+              __floats2bfloat162_rn(value_lo_0, value_lo_1);
+          reinterpret_cast<__nv_bfloat162 *>(row_base_o_ptr + col_hi)[0] =
+              __floats2bfloat162_rn(value_hi_0, value_hi_1);
+        }
 
-      if (row_hi_active) {
-        const float value_lo_0 =
-            scale * (output_smem_ptr[row_hi * BLOCK_V + col_lo] +
-                     reg_lo[reg_row1] * g_row_hi);
-        const float value_lo_1 =
-            scale * (output_smem_ptr[row_hi * BLOCK_V + col_lo + 1U] +
-                     reg_lo[reg_row1 + 1U] * g_row_hi);
-        const float value_hi_0 =
-            scale * (output_smem_ptr[row_hi * BLOCK_V + col_hi] +
-                     reg_hi[reg_row1] * g_row_hi);
-        const float value_hi_1 =
-            scale * (output_smem_ptr[row_hi * BLOCK_V + col_hi + 1U] +
-                     reg_hi[reg_row1 + 1U] * g_row_hi);
-        reinterpret_cast<__nv_bfloat162 *>(row_hi_o_ptr + col_lo)[0] =
-            __floats2bfloat162_rn(value_lo_0, value_lo_1);
-        reinterpret_cast<__nv_bfloat162 *>(row_hi_o_ptr + col_hi)[0] =
-            __floats2bfloat162_rn(value_hi_0, value_hi_1);
+        if (row_hi_active) {
+          const float value_lo_0 =
+              scale * (output_smem_ptr[row_hi * BLOCK_V + col_lo] +
+                       reg_lo[reg_row1] * g_row_hi);
+          const float value_lo_1 =
+              scale * (output_smem_ptr[row_hi * BLOCK_V + col_lo + 1U] +
+                       reg_lo[reg_row1 + 1U] * g_row_hi);
+          const float value_hi_0 =
+              scale * (output_smem_ptr[row_hi * BLOCK_V + col_hi] +
+                       reg_hi[reg_row1] * g_row_hi);
+          const float value_hi_1 =
+              scale * (output_smem_ptr[row_hi * BLOCK_V + col_hi + 1U] +
+                       reg_hi[reg_row1 + 1U] * g_row_hi);
+          reinterpret_cast<__nv_bfloat162 *>(row_hi_o_ptr + col_lo)[0] =
+              __floats2bfloat162_rn(value_lo_0, value_lo_1);
+          reinterpret_cast<__nv_bfloat162 *>(row_hi_o_ptr + col_hi)[0] =
+              __floats2bfloat162_rn(value_hi_0, value_hi_1);
+        }
       }
     }
   }

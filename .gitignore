@@ -231,3 +231,10 @@ LOGS.md
 results/*.tsv
 *.ncu-rep
 benchmark.tsv
+
+b200_ptx
+benchmark*
+ANALYZE.md
+PLAN.md
+PTX_FENCE.md
+PTX_TCGEN05.md
