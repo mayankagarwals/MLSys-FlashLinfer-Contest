@@ -273,4 +273,27 @@ Compute W/U directly from register-resident Ai blocks. Also fewer MMA calls (160
 **Key fix**: 1D beta broadcasting (`[16,16] * [16]`) correctly scales columns, not rows. Earlier attempts with `[None,:]` or `[:, None]` failed.
 **Result**: cv5: 7,240 → 6,340 us (-900 us, -12.4%). Total: 10,874 → 10,012 us (-15.0% from baseline).
 **2 failures**: T=8192 N=38 and N=43 fail consistently. Block-wise tf32x3 accumulation rounds differently than single large matmul. Edge cases where rounding crosses atol=1e-2.
-**TODO**: Fix 2 failures by investigating precision for those specific sequence length distributions.
+
+### Optimization 23: Block-wise W/U with bf16 roundtrip (SUCCESS — 100/100, 10,670 us)
+**Commit**: f7dca7b
+**Hypothesis**: The 2 failures come from Ai blocks retaining full float32 precision. The L2 reload approach stores Ai as bf16 then loads back, introducing a roundtrip that changes Ab values. Adding `.to(tl.bfloat16).to(tl.float32)` to each Ai block matches this precision profile. Combined with `acc=` chaining, the MMA accumulation order is identical to the single [64,64] dot.
+**What changed**: After computing 10 Ai blocks in float32, cast each to bf16 and back. Use `acc=` parameter for block-wise tl.dot calls to chain the accumulation (K=16+16+... = same as K=64 in one dot).
+**Result**: 100/100 correct. Total: 10,894 → 10,670 us (-2.1%, cumulative -9.4% from baseline).
+**Why it worked**: The bf16 roundtrip ensures `round_bf16(Ai * beta)` produces identical bf16 values to the L2 approach. The `acc=` chaining feeds the MMA accumulator across dot calls, matching the single-dot accumulation order exactly.
+**Confirmed**: Without bf16 roundtrip (pure acc= chaining), still 98/100 — same 2 failures (T=8192 N=38, N=43). Roundtrip IS needed.
+**Also tried**: num_warps=4 → benchmark hangs (register spilling causes 10x regression).
+
+### Optimization 24: Ai inverse DOT_PRECISION=tf32 (SUCCESS — 100/100, 10,246 us)
+**Commit**: 90c07fd
+**Hypothesis**: The bf16 roundtrip masks reduced Ai precision. tf32 (1 MMA pass) is 3x fewer passes than tf32x3 for the 36 Ai inverse dots per CTA. The bf16 rounding after the inverse discards the extra precision that tf32x3 provides.
+**What changed**: Changed DOT_PRECISION from "tf32x3" to "tf32" for both chunk_v5 and triton_v4 merge kernel calls.
+**Result**: 100/100 correct. Total: 10,670 → 10,246 us (-4.0%, cumulative **-13.0%** from baseline).
+- cv5: 7,021 → 6,597 us (-424 us, -6.1%)
+**Why it worked**: After the Ai inverse, all blocks are cast to bf16 (`.to(tl.bfloat16).to(tl.float32)`). This discards mantissa bits beyond bf16's 8-bit significand. The difference between tf32 (11-bit) and tf32x3 (~23-bit) Ai values is entirely lost in the bf16 truncation. So the W/U dot products see identical bf16 inputs regardless of Ai inverse precision.
+**Key insight**: The bf16 roundtrip not only fixes the precision mismatch (Opt 23) but also enables lower precision in the inverse computation. The two optimizations are synergistic.
+
+### Current Status: 10,246 us (-13.0%), 100/100 correct
+- **TARGET (-10% = 10,599 us) EXCEEDED by 353 us**
+- cv5: 6,597 us (-12.5% from 7,550 baseline)
+- v3: ~3,063 us (-8.9%)
+- recurrent: ~586 us
