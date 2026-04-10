@@ -194,3 +194,9 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 2. **Pre-compute exp(g)**: -50 us (eliminates redundant expf). 1-2 hour effort.
 3. **Tune dispatch threshold**: Already done, diminishing returns.
 4. **CuTe/CUTLASS for MMA**: Could match Triton SASS. Multi-day effort.
+
+### Optimization 13: chunk_v5 use upper_bound_chunks (FAILED — race conditions)
+**Hypothesis**: Use upper_bound_chunks instead of total_num_chunks to avoid CUDA sync. Zero-init chunk_indices so excess blocks safely re-process chunk 0.
+**Result**: 81/100 correct. 19 workloads failed.
+**Why it failed**: Excess blocks write to the same output locations as the real chunk 0 block. Concurrent writes from multiple blocks to the same address create race conditions (non-atomic partial writes). Even though the computation is identical, the timing of writes differs.
+**Lesson**: Can't use upper_bound_chunks with duplicate work — all grid blocks must process UNIQUE chunks.
