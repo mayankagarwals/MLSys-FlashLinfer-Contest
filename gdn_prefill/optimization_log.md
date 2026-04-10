@@ -257,3 +257,12 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 **Result**: +76 us overall. Fewer v-tile blocks hurt parallelism.
 
 ### Current confirmed best: 10,874 us (-7.7%). Gap: 275 us to -10% target.
+
+### Optimization 21: Block-wise W/U in merge kernel (FAILED — incorrect scaling)
+**Hypothesis**: Skip global Ai store+reload+debug_barrier in merge_16x16_to_64x64_inverse_kernel.
+Compute W/U directly from register-resident Ai blocks. Also fewer MMA calls (160 vs 256, skips zero upper-triangular blocks).
+**Result**: First attempt: 70/100 (beta scaled rows instead of columns). Fix attempt: 10/100 (Triton [None, :] indexing issue).
+**Root cause**: `Ai * beta` broadcasts beta along columns (j), not rows (i). The block-wise version needs `Ai_21 * beta[col_range][None, :]` but Triton's `[None, :]` indexing doesn't behave as expected on sliced 1D tensors. Needs `tl.expand_dims` or `reshape` instead.
+**Status**: Reverted. The approach is SOUND but needs correct Triton tensor manipulation.
+**Potential savings**: Eliminates debug_barrier sync + global Ai roundtrip + 37% fewer MMA calls. Could save 50-100+ us on chunk_v5 workloads.
+**TODO for next session**: Fix using tl.expand_dims(beta[0:16], 0) instead of beta[0:16][None, :].
