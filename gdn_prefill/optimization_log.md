@@ -129,3 +129,17 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
    b. Use CuTe/CUTLASS for the matmul portions
    c. Custom Triton backend generating CUDA code
 4. **KEY GOAL**: v3 must beat chunk_v5 for ALL T>=64 (currently 2.5x slower for T=8192)
+
+---
+
+## Session: April 10, 2026
+
+### Optimization 8: FP Phase 3 Triton-style Ai scaling (FAILED — precision issues)
+**Hypothesis**: Scale Ai matrix (64x64) instead of input (64x128): W = (Ai*beta*exp(g)) @ k. Eliminates staging buffer and scaling step. From Triton's merge_16x16_to_64x64_inverse_kernel.
+**What changed**: Rewrote Phase 3 to compute Ai*bg→bf16 before MMA, load k directly to XOR-swizzled smem via cp.async.
+**Bugs found**:
+- Missing __syncthreads between s_bg write and Ai scaling read → race condition → non-deterministic output
+- cp.async with pred=false does NOT zero smem → stale data in rows >= clen
+- After fixing both: 6/42 v3 pass, 36/42 fail due to PRECISION differences
+**Root cause**: Different rounding path: old code rounds Ai→bf16 then scales input as bf16×bf16. New code scales Ai in fp32 then rounds→bf16. The intermediate products differ at the bf16 precision boundary, causing ~1e-2 error that exceeds atol tolerance.
+**Lesson**: Can't change the multiplication order in (Ai @ (scale * input)) without changing numerical results at bf16 precision. The tolerance (atol=1e-2) is very tight relative to output magnitudes (~1e-2).
