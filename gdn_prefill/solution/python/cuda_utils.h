@@ -672,6 +672,11 @@ void tcgen05_fence_after_thread_sync() {
   asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 }
 
+__device__ __forceinline__
+void fence_proxy_async_shared_cta() {
+  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+}
+
 template <uint32_t barrier>
 __device__ __forceinline__
 void bar_sync(uint32_t count) {

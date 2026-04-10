@@ -70,7 +70,8 @@ constexpr uint32_t OFFSET_QK_TMA_BAR = OFFSET_G + G_SMEM_SIZE;
 constexpr uint32_t OFFSET_V_TMA_BAR = OFFSET_QK_TMA_BAR + 8U;
 constexpr uint32_t OFFSET_H_TMA_BAR = OFFSET_V_TMA_BAR + 8U;
 constexpr uint32_t OFFSET_MMA_BAR = OFFSET_H_TMA_BAR + 8U;
-constexpr uint32_t OFFSET_TMEM_ADDR = OFFSET_MMA_BAR + 8U;
+constexpr uint32_t OFFSET_ATTN_READY_BAR = OFFSET_MMA_BAR + 8U;
+constexpr uint32_t OFFSET_TMEM_ADDR = OFFSET_ATTN_READY_BAR + 8U;
 constexpr uint32_t SMEM_SIZE = (OFFSET_TMEM_ADDR + 4U + 1023U) & ~1023U;
 
 //// Tensor Memory
@@ -291,6 +292,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   const uint32_t v_tma_barrier = smem + OFFSET_V_TMA_BAR;
   const uint32_t h_tma_barrier = smem + OFFSET_H_TMA_BAR;
   const uint32_t mma_barrier = smem + OFFSET_MMA_BAR;
+  const uint32_t attn_ready_barrier = smem + OFFSET_ATTN_READY_BAR;
   const uint32_t tmem_alloc_smem = smem + OFFSET_TMEM_ADDR;
 
   float *output_smem_ptr =
@@ -303,6 +305,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       mbarrier_init(v_tma_barrier, 1);
       mbarrier_init(h_tma_barrier, 1);
       mbarrier_init(mma_barrier, 1);
+      mbarrier_init(attn_ready_barrier, NUM_CUDA_WARPS);
       prefetch_tensormap(&q_tmap);
       prefetch_tensormap(&k_tmap);
       prefetch_tensormap(&v_tmap);
@@ -313,20 +316,13 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     tcgen05_alloc(tmem_alloc_smem, MAX_COLUMNS);
   }
 
-  for (uint32_t i = tid; i < BLOCK_T; i += NUM_THREADS) {
-    float g_value = 0.0f;
-    if (i < chunk_len) {
-      const int64_t token_idx = chunk_start + static_cast<int64_t>(i);
-      g_value = g_cu_ptr[token_idx * NUM_OUTPUT_HEADS + head_id];
-    }
-    g_smem_ptr[i] = g_value;
-  }
   __syncthreads();
 
   constexpr uint32_t TMA_PHASE = 0U;
   constexpr uint32_t QK_MMA_PHASE = 0U;
   constexpr uint32_t OV_MMA_PHASE = 1U;
   constexpr uint32_t QH_MMA_PHASE = 0U;
+  constexpr uint32_t ATTN_READY_PHASE = 0U;
   const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
   const int32_t chunk_start_i32 = static_cast<int32_t>(chunk_start);
 
@@ -347,6 +343,18 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     tcgen05_fence_after_thread_sync();
     mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, k_smem);
     tcgen05_commit(mma_barrier);
+  }
+
+  if (warp_id < NUM_CUDA_WARPS) {
+    for (uint32_t i = tid; i < BLOCK_T; i += NUM_CUDA_WARPS * WARP_SIZE) {
+      float g_value = 0.0f;
+      if (i < chunk_len) {
+        const int64_t token_idx = chunk_start + static_cast<int64_t>(i);
+        g_value = g_cu_ptr[token_idx * NUM_OUTPUT_HEADS + head_id];
+      }
+      g_smem_ptr[i] = g_value;
+    }
+    bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
   }
 
   nv_bfloat16 *attn_smem_ptr =
@@ -382,12 +390,16 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
                         row_base_limit, row_hi_limit, reg_row0, reg_row1,
                         col_hi);
     }
+    fence_proxy_async_shared_cta();
+    __syncwarp();
+    if (elect_sync()) {
+      mbarrier_arrive(attn_ready_barrier);
+    }
   }
-  tcgen05_fence_before_thread_sync();
-  __syncthreads();
 
   if (warp_id == MMA_WARP && elect_sync()) {
     mbarrier_wait(v_tma_barrier, TMA_PHASE);
+    mbarrier_wait(attn_ready_barrier, ATTN_READY_PHASE);
     tcgen05_fence_after_thread_sync();
     mma_attn_v_mmajor_64x64(OUTPUT_TMEM_COL, attn_smem, v_smem);
     tcgen05_commit(mma_barrier);
