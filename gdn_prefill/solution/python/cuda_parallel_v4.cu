@@ -173,7 +173,18 @@
  __device__ __forceinline__ float softplus_s(float x) {
    return log1pf(__expf(-fabsf(x))) + fmaxf(x, 0.0f);
  }
- 
+
+ // XOR swizzle: eliminates ldmatrix read bank conflicts in row-major smem
+ // XOR column-group index (col/8) with lower bits of row (masked to num_col_groups)
+ // cg_mask = (num_cols / 8) - 1: ensures swizzled_cg stays in valid range
+ // Usage: s_buf[row * stride + xor_swizzle_col(row, col, cg_mask)]
+ __device__ __forceinline__
+ int xor_swizzle_col(int row, int col, int cg_mask) {
+   int cg = col >> 3;
+   int swizzled_cg = cg ^ (row & cg_mask);
+   return (swizzled_cg << 3) | (col & 7);
+ }
+
  // ═══════════════════════════════════════════════════════════════════
  // TMA helper: issue TMA load + arrive on mbarrier
  // ═══════════════════════════════════════════════════════════════════
@@ -741,11 +752,11 @@
    // Reuse s_result as staging buffer for k/v data (16KB)
    __nv_bfloat16 *s_stage = reinterpret_cast<__nv_bfloat16 *>(s_result);
  
-   // Convert A_inv fp32 → bf16 row-major in s_A_tiles[64,64] (first 8KB of 32KB buffer)
-   // Vectorized: convert 8 fp32 → 4 bf16x2 → 1 int4 store
+   // Convert A_inv fp32 → bf16 with XOR swizzle (bank-conflict-free ldmatrix reads)
    __nv_bfloat16 *s_Ainv_bf16 = reinterpret_cast<__nv_bfloat16 *>(s_A_tiles);  // [64,64] bf16
    for (int i = tid; i < kBT * kBT / 8; i += 128) {
      int idx = i * 8;
+     int row = idx / kBT, col8 = idx % kBT;
      const float *src = &s_result_inv[idx];
      int4 dst;
      __nv_bfloat162 *dp = reinterpret_cast<__nv_bfloat162 *>(&dst);
@@ -753,7 +764,7 @@
      dp[1] = {__float2bfloat16(src[2]), __float2bfloat16(src[3])};
      dp[2] = {__float2bfloat16(src[4]), __float2bfloat16(src[5])};
      dp[3] = {__float2bfloat16(src[6]), __float2bfloat16(src[7])};
-     *reinterpret_cast<int4 *>(&s_Ainv_bf16[idx]) = dst;
+     *reinterpret_cast<int4 *>(&s_Ainv_bf16[row * kBT + xor_swizzle_col(row, col8, kBT / 8 - 1)]) = dst;
    }
  
    // cp.async load k_in → s_stage (overlapped with A_inv conversion)
@@ -793,9 +804,9 @@
          #pragma unroll
          for (int p = 0; p < 4; p++)
            sp[p] = __hmul2(sp[p], bg2);
-         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = src;
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + xor_swizzle_col(t, j, kK / 8 - 1)]) = src;
        } else {
-         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = make_int4(0, 0, 0, 0);
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + xor_swizzle_col(t, j, kK / 8 - 1)]) = make_int4(0, 0, 0, 0);
        }
      }
      __syncthreads();
@@ -822,13 +833,13 @@
        {
          int r = (lane_p3 % 8) + ((lane_p3 & 8) ? 8 : 0) + m_base_p3;
          int c = (lane_p3 >= 16) ? 8 : 0;
-         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
+         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + xor_swizzle_col(r, kt * 16 + c, kBT / 8 - 1)]));
        }
        for (int nt = 0; nt < 16; nt++) {
          uint32_t b[2];
          {
            int kr = lane_p3 % 16;
-           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
+           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + xor_swizzle_col(kt * 16 + kr, nt * 8, kK / 8 - 1)]));
          }
          mma_m16n8k16_bf16(
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3],
@@ -873,9 +884,9 @@
          #pragma unroll
          for (int p = 0; p < 4; p++)
            sp[p] = __hmul2(sp[p], bg2);
-         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = src;
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + xor_swizzle_col(t, j, kK / 8 - 1)]) = src;
        } else {
-         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + j]) = make_int4(0, 0, 0, 0);
+         *reinterpret_cast<int4 *>(&s_input_bf16[t * kK + xor_swizzle_col(t, j, kK / 8 - 1)]) = make_int4(0, 0, 0, 0);
        }
      }
      __syncthreads();
@@ -886,13 +897,13 @@
        {
          int r = (lane_p3 % 8) + ((lane_p3 & 8) ? 8 : 0) + m_base_p3;
          int c = (lane_p3 >= 16) ? 8 : 0;
-         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + kt * 16 + c]));
+         ldmatrix<4>(a, cvt_smem_ptr(&s_Ainv_bf16[r * kBT + xor_swizzle_col(r, kt * 16 + c, kBT / 8 - 1)]));
        }
        for (int nt = 0; nt < 16; nt++) {
          uint32_t b[2];
          {
            int kr = lane_p3 % 16;
-           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + nt * 8]));
+           ldmatrix_trans<2>(b, cvt_smem_ptr(&s_input_bf16[(kt * 16 + kr) * kK + xor_swizzle_col(kt * 16 + kr, nt * 8, kK / 8 - 1)]));
          }
          mma_m16n8k16_bf16(
              p3_acc[nt][0], p3_acc[nt][1], p3_acc[nt][2], p3_acc[nt][3],
@@ -938,6 +949,7 @@
  // ═══════════════════════════════════════════════════════════════════
  __global__ void __launch_bounds__(128, 1)
  HRecurrenceKernel(
+     const __grid_constant__ CUtensorMap k_tmap_64,
      const __nv_bfloat16 *__restrict__ w_in,
      const __nv_bfloat16 *__restrict__ k_in,
      __nv_bfloat16 *__restrict__ u_inout,
@@ -978,7 +990,16 @@
    float *s_gc = s_wh + kBT * kBV_H;                                        // [64] = 256B
    __nv_bfloat16 *s_k = reinterpret_cast<__nv_bfloat16 *>(s_gc + kBT);     // [64,128] = 16KB
    __nv_bfloat16 *s_vnew_T = s_k + kBT * kK;                               // [16,64] = 2KB
- 
+   __nv_bfloat16 *s_u = s_vnew_T + kBV_H * kBT;                            // [64,16] = 2KB (prefetched u_inout)
+   uint64_t *mbar_k = reinterpret_cast<uint64_t *>(s_u + kBT * kBV_H);    // 1 mbarrier = 8B (for TMA k loading)
+
+   // Init mbarrier for TMA k loading
+   const uint32_t mbar_k_addr = cvt_smem_ptr(mbar_k);
+   if (tid == 0) {
+     mbarrier_init(mbar_k_addr, 1);
+     asm volatile("fence.mbarrier_init.release.cluster;");
+   }
+
    // Persistent h state: h_reg[nt][reg], 4 N-tiles × 4 fp32 = 16 regs/thread
    // row0 = lane_id/4 (groupID, 0..7), row1 = row0+8 (8..15)
    // col = warp_id*32 + nt*8 + (lane_id%4)*2
@@ -1003,19 +1024,21 @@
    }
    __syncthreads();
  
-   // Prefetch w[0] before the chunk loop
+   // Prefetch w[0] before the chunk loop (tile format for bank-conflict-free ldmatrix)
    {
      const int64_t cstart0 = s0;
      const int clen0 = min(kBT, (int)(s1 - cstart0));
      const __nv_bfloat16 *w_ptr = w_in + cstart0 * kHv * kK + hv * kK;
      __nv_bfloat16 *s_w = s_w_buf[0];
+     const uint32_t w_smem_base = cvt_smem_ptr(s_w);
      for (int i = tid; i < kBT * kK / 8; i += 128) {
        int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
-       uint32_t dst = cvt_smem_ptr(&s_w[row * kK + col8]);
+       int byte_off = tile_byte_offset(row, col8, kBT);
+       uint32_t dst = w_smem_base + byte_off;
        if (row < clen0) {
          cp_async_cg_128(dst, &w_ptr[row * kHv * kK + col8], true);
        } else {
-         *reinterpret_cast<int4 *>(&s_w[row * kK + col8]) = make_int4(0,0,0,0);
+         *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_w) + byte_off) = make_int4(0,0,0,0);
        }
      }
      asm volatile("cp.async.commit_group;");
@@ -1026,7 +1049,7 @@
      const int clen = min(kBT, (int)(s1 - cstart));
      const int64_t chunk_id = chunk_base + ct;
      __nv_bfloat16 *s_w = s_w_buf[ct & 1];
- 
+
      // Step 0: Store h → d_h (NON-TRANSPOSED: h[bv,k]) + s_h_T, wait for w[ct] cp.async
      {
        __nv_bfloat16 *h_dst = d_h + (chunk_id * kHv + hv) * kV * kK;
@@ -1044,11 +1067,15 @@
              __nv_bfloat162{b0, b1};
          *reinterpret_cast<__nv_bfloat162 *>(&h_dst[(v_start + row1) * kK + col0]) =
              __nv_bfloat162{b2, b3};
-         // s_h_T for MMA1 within H-kernel (unchanged)
-         s_h_T[col0       * kBV_H + row0] = b0;
-         s_h_T[(col0 + 1) * kBV_H + row0] = b1;
-         s_h_T[col0       * kBV_H + row1] = b2;
-         s_h_T[(col0 + 1) * kBV_H + row1] = b3;
+         // s_h_T tile format: col0+1 is +16B, row1 is +2048B from base
+         {
+           char *hT_bytes = reinterpret_cast<char *>(s_h_T);
+           int hT_base = tile_byte_offset(col0, row0, kK);
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + hT_base) = b0;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + hT_base + 16) = b1;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + hT_base + kK * 16) = b2;
+           *reinterpret_cast<__nv_bfloat16 *>(hT_bytes + hT_base + kK * 16 + 16) = b3;
+         }
        }
        // Load g_cumsum early (overlapped with h store)
        if (tid < kBT)
@@ -1058,16 +1085,43 @@
      }
      __syncthreads();
  
-     // Issue k load early — overlaps with MMA1 (s_k not used until Step 3)
+     // Issue k + u loads early — both overlap with MMA1
      {
-       const __nv_bfloat16 *k_src = k_in + cstart * kHk * kK + k_head * kK;
-       for (int i = tid; i < kBT * kK / 8; i += 128) {
-         int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
-         uint32_t dst = cvt_smem_ptr(&s_k[row * kK + col8]);
-         if (row < clen) {
-           cp_async_cg_128(dst, &k_src[row * kHk * kK + col8], true);
-         } else {
-           *reinterpret_cast<int4 *>(&s_k[row * kK + col8]) = make_int4(0,0,0,0);
+       const int64_t k_col_group = k_head * kK / 8;
+       if (clen == kBT) {
+         // Full chunk: TMA load k → tile format smem (single instruction)
+         if (warp_id == 0 && elect_sync()) {
+           tma_load_3d(cvt_smem_ptr(s_k), &k_tmap_64, 0, (int)cstart, (int)k_col_group, mbar_k_addr);
+           asm volatile(
+             "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
+             :: "r"(mbar_k_addr), "r"((int)(kBT * kK * sizeof(__nv_bfloat16))) : "memory");
+         }
+       } else {
+         // Partial chunk: cp.async k → tile format (NaN from TMA OOB poisons mma.sync)
+         const __nv_bfloat16 *k_src = k_in + cstart * kHk * kK + k_head * kK;
+         const uint32_t k_smem_base = cvt_smem_ptr(s_k);
+         for (int i = tid; i < kBT * kK / 8; i += 128) {
+           int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
+           int byte_off = tile_byte_offset(row, col8, kBT);
+           uint32_t dst = k_smem_base + byte_off;
+           if (row < clen) {
+             cp_async_cg_128(dst, &k_src[row * kHk * kK + col8], true);
+           } else {
+             *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_k) + byte_off) = make_int4(0,0,0,0);
+           }
+         }
+       }
+       // Prefetch u_inout into s_u (hides strided global load latency behind MMA1)
+       {
+         const __nv_bfloat16 *u_base = u_inout + cstart * kHv * kV + hv * kV + v_start;
+         for (int i = tid; i < kBT * kBV_H / 8; i += 128) {
+           int t = i / (kBV_H / 8), bv8 = (i % (kBV_H / 8)) * 8;
+           uint32_t dst = cvt_smem_ptr(&s_u[t * kBV_H + bv8]);
+           if (t < clen) {
+             cp_async_cg_128(dst, &u_base[t * kHv * kV + bv8], true);
+           } else {
+             *reinterpret_cast<int4 *>(&s_u[t * kBV_H + bv8]) = make_int4(0,0,0,0);
+           }
          }
        }
        asm volatile("cp.async.commit_group;");
@@ -1083,14 +1137,14 @@
          {
            int r = (lane_id % 8) + ((lane_id & 8) ? 8 : 0) + warp_id * 16;
            int c = (lane_id >= 16) ? 8 : 0;
-           ldmatrix<4>(a, cvt_smem_ptr(&s_w[r * kK + kt * 16 + c]));
+           ldmatrix<4>(a, cvt_smem_ptr(s_w) + tile_byte_offset(r, kt * 16 + c, kBT));
          }
          #pragma unroll
          for (int nt = 0; nt < 2; nt++) {
            uint32_t b[2];
            {
              int k_row = lane_id % 16;
-             ldmatrix_trans<2>(b, cvt_smem_ptr(&s_h_T[(kt * 16 + k_row) * kBV_H + nt * 8]));
+             ldmatrix_trans<2>(b, cvt_smem_ptr(s_h_T) + tile_byte_offset(kt * 16 + k_row, nt * 8, kK));
            }
            mma_m16n8k16_bf16(
                wh_acc[nt][0], wh_acc[nt][1], wh_acc[nt][2], wh_acc[nt][3],
@@ -1109,10 +1163,16 @@
          }
        }
      }
-     // NO __syncthreads here — v_new is per-warp (reads only own MMA1 rows)
- 
+     // Wait for k (TMA or cp.async) and u (cp.async)
+     // Must complete before vnew reads s_u and before MMA2 reads s_k
+     if (clen == kBT) {
+       // Full chunk: wait for TMA k load, then re-init mbarrier for next iteration
+       mbarrier_wait(mbar_k_addr, 0);
+       if (warp_id == 0 && elect_sync()) mbarrier_init(mbar_k_addr, 1);
+     }
+     asm volatile("cp.async.wait_group 0;");  // Wait for u (and k if partial chunk)
+
      // Step 2: v_new (per-warp), gate, scale h, prefetch w[ct+1] via cp.async
-     // (k already loading since Step 1)
      {
        // Prefetch w[ct+1] into alternate buffer (all threads)
        if (ct + 1 < NT) {
@@ -1120,31 +1180,33 @@
          const int next_clen = min(kBT, (int)(s1 - next_cstart));
          const __nv_bfloat16 *w_ptr = w_in + next_cstart * kHv * kK + hv * kK;
          __nv_bfloat16 *s_w_next = s_w_buf[(ct + 1) & 1];
+         const uint32_t wn_smem_base = cvt_smem_ptr(s_w_next);
          for (int i = tid; i < kBT * kK / 8; i += 128) {
            int row = i / (kK / 8), col8 = (i % (kK / 8)) * 8;
-           uint32_t dst = cvt_smem_ptr(&s_w_next[row * kK + col8]);
+           int byte_off = tile_byte_offset(row, col8, kBT);
+           uint32_t dst = wn_smem_base + byte_off;
            if (row < next_clen) {
              cp_async_cg_128(dst, &w_ptr[row * kHv * kK + col8], true);
            } else {
-             *reinterpret_cast<int4 *>(&s_w_next[row * kK + col8]) = make_int4(0,0,0,0);
+             *reinterpret_cast<int4 *>(reinterpret_cast<char *>(s_w_next) + byte_off) = make_int4(0,0,0,0);
            }
          }
          asm volatile("cp.async.commit_group;");
        }
  
-       // Per-warp v_new: each warp processes its own 16 rows (warp_id*16..+16)
-       // Only __syncwarp needed (not __syncthreads) since each warp reads its own s_wh rows
+       // Per-warp v_new: read from s_u (prefetched), compute v_new, writeback to global
        __syncwarp();
        float g_last = s_gc[clen - 1];
        {
-         // 32 lanes process 16 rows × 2 bv_halves = 32 items
-         // lane_id < 16: bv8=0, row=warp_id*16 + lane_id
-         // lane_id >= 16: bv8=8, row=warp_id*16 + (lane_id - 16)
          int bv8 = (lane_id < 16) ? 0 : 8;
          int t = warp_id * 16 + (lane_id & 15);
+         // s_vnew_T tile base: all 8 writes at stride 16B from same base
+         // tile_byte_offset(bv8, t, kBV_H) = (t/8)*256 + (bv8/8)*128 + (t%8)*2
+         char *vnT_bytes = reinterpret_cast<char *>(s_vnew_T);
+         int vnT_base = tile_byte_offset(bv8, t, kBV_H);
          if (t < clen) {
-           const __nv_bfloat16 *u_base = &u_inout[(cstart + t) * kHv * kV + hv * kV + v_start + bv8];
-           int4 u_vec = *reinterpret_cast<const int4 *>(u_base);
+           // Read from smem (prefetched via cp.async, latency hidden behind MMA1)
+           int4 u_vec = *reinterpret_cast<const int4 *>(&s_u[t * kBV_H + bv8]);
            __nv_bfloat16 *u_arr = reinterpret_cast<__nv_bfloat16 *>(&u_vec);
            float gc_t = s_gc[t];
            float gate = __expf(g_last - gc_t);
@@ -1152,14 +1214,14 @@
            for (int j = 0; j < 8; j++) {
              float vn = __bfloat162float(u_arr[j]) - s_wh[t * kBV_H + bv8 + j];
              u_arr[j] = __float2bfloat16(vn);
-             s_vnew_T[(bv8 + j) * kBT + t] = __float2bfloat16(vn * gate);
+             *reinterpret_cast<__nv_bfloat16 *>(vnT_bytes + vnT_base + j * 16) = __float2bfloat16(vn * gate);
            }
+           // Writeback modified u to global
            *reinterpret_cast<int4 *>(&u_inout[(cstart + t) * kHv * kV + hv * kV + v_start + bv8]) = u_vec;
          } else if (t < kBT) {
-           // Zero-fill rows beyond clen
            #pragma unroll
            for (int j = 0; j < 8; j++)
-             s_vnew_T[(bv8 + j) * kBT + t] = __float2bfloat16(0.0f);
+             *reinterpret_cast<__nv_bfloat16 *>(vnT_bytes + vnT_base + j * 16) = __float2bfloat16(0.0f);
          }
        }
        float g_exp = __expf(g_last);
@@ -1167,10 +1229,9 @@
          h_reg[nt][0] *= g_exp; h_reg[nt][1] *= g_exp;
          h_reg[nt][2] *= g_exp; h_reg[nt][3] *= g_exp;
        }
-       // Wait for k (issued before MMA1). w[ct+1] may be in flight.
-       if (ct + 1 < NT)
-         asm volatile("cp.async.wait_group 1;");
-       else
+       // k+u already waited above. Only w[ct+1] may be in flight.
+       // Next iteration's step0 will wait for it with wait_group(0).
+       if (ct + 1 >= NT)
          asm volatile("cp.async.wait_group 0;");
        __syncthreads();
      }
@@ -1184,14 +1245,14 @@
          {
            int r = (lane_id % 8) + ((lane_id & 8) ? 8 : 0);
            int c = (lane_id >= 16) ? 8 : 0;
-           ldmatrix<4>(a, cvt_smem_ptr(&s_vnew_T[r * kBT + kt * 16 + c]));
+           ldmatrix<4>(a, cvt_smem_ptr(s_vnew_T) + tile_byte_offset(r, kt * 16 + c, kBV_H));
          }
          #pragma unroll
          for (int nt = 0; nt < 4; nt++) {
            uint32_t b[2];
            {
              int kr = lane_id % 16;
-             ldmatrix_trans<2>(b, cvt_smem_ptr(&s_k[(kt * 16 + kr) * kK + wn + nt * 8]));
+             ldmatrix_trans<2>(b, cvt_smem_ptr(s_k) + tile_byte_offset(kt * 16 + kr, wn + nt * 8, kBT));
            }
            mma_m16n8k16_bf16(
                h_reg[nt][0], h_reg[nt][1], h_reg[nt][2], h_reg[nt][3],
@@ -1204,6 +1265,7 @@
      // Next iteration's Step 0 has __syncthreads after h store + w wait.
    }
  
+   // DEBUG: print per-step timing from one representative block
    // Store final state
    {
      float *ns = new_state + ((int64_t)seq_idx * kHv + hv) * kV * kK;
@@ -1782,8 +1844,8 @@
      // FusedPrepKernel: s_A_tiles(32KB) + s_B_tiles(16KB) + mbars(20B) + s_result(16KB) + s_result_inv(16KB) + s_g(256B) + s_beta(256B) + s_bg(256B) ≈ 81KB
      int smem_FP_attr = (128*128*2 + 64*128*2 + 256 + 64*64*4 + 64*64*4 + 64*4 + 64*4 + 64*4 + 1023) & ~1023;
      cudaFuncSetAttribute(FusedPrepKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_FP_attr);
-     // HRecurrenceKernel: force 1 block/SM via 115KB smem pad (228KB/2 = 114KB)
-     int smem_H = 115 * 1024;  // Force 1 block/SM (prevents TMEM corruption)
+     // HRecurrenceKernel: tile-format smem eliminated bank conflicts, multi-block is now beneficial
+     int smem_H = (2*kBT*kK*2 + kK*kBV_H*2 + kBT*kBV_H*4 + kBT*4 + kBT*kK*2 + kBV_H*kBT*2 + kBT*kBV_H*2 + 8 + 1023) & ~1023;
      cudaFuncSetAttribute(HRecurrenceKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_H);
      // OOutputKernel v9 (tcgen05 swizzled, inline q@k^T): s_q(16KB) + s_h(16KB) + s_attn(8KB) + s_vnew(8KB) + s_gc(256B) + mbars(24B) + tmem(4B) ≈ 49KB
      int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
@@ -1799,7 +1861,8 @@
  
    // Compute smem sizes for launch
    int smem_FP = (128*128*2 + 64*128*2 + 256 + 64*64*4 + 64*64*4 + 64*4 + 64*4 + 64*4 + 1023) & ~1023;
-   int smem_H = 115 * 1024;
+   // H-kernel smem: 2×w(16KB) + h_T(4KB) + wh(4KB) + gc(256B) + k(16KB) + vnew_T(2KB) + u(2KB) + mbar(8B)
+   int smem_H = (2*kBT*kK*2 + kK*kBV_H*2 + kBT*kBV_H*4 + kBT*4 + kBT*kK*2 + kBV_H*kBT*2 + kBT*kBV_H*2 + 8 + 1023) & ~1023;
    int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
 
    // Use upper-bound for grid — excess blocks exit early via inline chunk mapping
@@ -1819,6 +1882,7 @@
    // H/O split path
    {
      HRecurrenceKernel<<<dim3(kNVT_H, num_seqs * kHv), 128, smem_H, stream>>>(
+         k_tmap_64,
          d_w, k_p,
          d_u, d_g, state_ptr, cusl_p,
          d_h, ns_p, num_seqs);
