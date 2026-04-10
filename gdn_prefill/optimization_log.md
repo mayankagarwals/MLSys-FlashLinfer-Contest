@@ -105,8 +105,24 @@ H-kernel dominates at 57%. Within H-kernel, Step 0 (h store) and vnew computatio
 - The bank conflicts are inherent to the access pattern (same bv, different t)
 - Read conflicts (0-way with tile format) outweigh the write regression since reads happen 16x more often (in MMA loop)
 
+---
+
+### Optimization 6: TMA w loading in H-kernel (FAILED — GPU hang)
+**Hypothesis**: Replace 128 per-thread cp.async w loads with single TMA instruction. TMA for w is safe even for partial chunks because NaN in wh[t>=clen] is never read by vnew computation.
+**Result**: GPU hang (mbarrier_wait never completes). CUDA_ERROR_UNKNOWN.
+**Root cause**: Unknown — TMA descriptor and mbarrier pattern match the working k TMA implementation. Possible issues: parameter passing order (__grid_constant__ as last param), or init_tma_desc_3d incompatibility with the w scratch buffer layout. Needs deeper investigation.
+**Reverted**: Code reverted to cp.async w loading.
+
+---
+
+### Optimization 7: Pre-compute tile offsets for vnew/h_T writes (NO IMPROVEMENT)
+**What changed**: Pre-compute tile_byte_offset base once, use stride constants (j*16, +LBO) instead of re-calling tile_byte_offset for each write.
+**Result**: T=134: 55.5 us (unchanged). Compiler already optimized this.
+
+---
+
 ### Next steps for -10% target (630 us gap remaining)
-1. **Convert s_vnew_T to XOR swizzle** (instead of tile format): would eliminate both read AND write bank conflicts, since MMA2's ldmatrix reads with XOR swizzle are bank-conflict-free
+1. **Debug TMA w loading**: The hang is unexpected since TMA k works fine with identical pattern. Could be the __grid_constant__ parameter position or some TMA descriptor issue.
 2. **Fuse kernel launches**: single persistent kernel or CUDA graph to reduce 3 × 5us launch overhead
 3. **Architectural**: The 2.5x v3 vs chunk_v5 gap for T>=1024 is mainly from SASS scheduling — nvcc's code gen can't match Triton's MLIR. Potential solutions:
    a. Write critical H-kernel inner loop in inline SASS
