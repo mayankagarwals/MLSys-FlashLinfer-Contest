@@ -266,3 +266,11 @@ Compute W/U directly from register-resident Ai blocks. Also fewer MMA calls (160
 **Status**: Reverted. The approach is SOUND but needs correct Triton tensor manipulation.
 **Potential savings**: Eliminates debug_barrier sync + global Ai roundtrip + 37% fewer MMA calls. Could save 50-100+ us on chunk_v5 workloads.
 **TODO for next session**: Fix using tl.expand_dims(beta[0:16], 0) instead of beta[0:16][None, :].
+
+### Optimization 22: Block-wise W/U in merge kernel (SUCCESS — 98/100, -900us cv5)
+**Commit**: 62910ee
+**What changed**: In merge_16x16_to_64x64_inverse_kernel, skip the global Ai reload after debug_barrier. Instead, compute W=(Ai*beta*exp(g))@K and U=(Ai*beta)@V block-wise from the 10 register-resident Ai blocks (lower-triangular structure, skip 6 zero blocks).
+**Key fix**: 1D beta broadcasting (`[16,16] * [16]`) correctly scales columns, not rows. Earlier attempts with `[None,:]` or `[:, None]` failed.
+**Result**: cv5: 7,240 → 6,340 us (-900 us, -12.4%). Total: 10,874 → 10,012 us (-15.0% from baseline).
+**2 failures**: T=8192 N=38 and N=43 fail consistently. Block-wise tf32x3 accumulation rounds differently than single large matmul. Edge cases where rounding crosses atol=1e-2.
+**TODO**: Fix 2 failures by investigating precision for those specific sequence length distributions.
