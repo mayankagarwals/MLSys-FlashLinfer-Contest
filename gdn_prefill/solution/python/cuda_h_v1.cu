@@ -1,6 +1,3 @@
-// # CUDA H warp
-// load h0 as h - [V_dim, K_dim]
-//
 // for chunk_id in range(num_chunks):
 //     # TMA warp
 //     load w, v, k from gmem->smem
@@ -9,9 +6,11 @@
 //     k - [BT, K_dim]
 //
 //     # CUDA H warp
-//     convert h to h_bf16
-//     store h_bf16 to gmem (for O kernel)
-//     store h_bf16 to tmem (for wh MMA)
+//     if 1st chunk:
+//       load h from h0(gmem)
+//     else:
+//       wait and load h(tmem) from vk MMA
+//     convert h to BF16, store to tmem (input for wh MMA)
 //
 //     # MMA warp
 //     wait w(smem) from TMA
@@ -20,22 +19,29 @@
 //
 //     # CUDA V warp
 //     load g_cu from gmem->rmem
+//     compute v_scale = exp(g_cu_last - g_cu)
+//
 //     wait and load v(smem) from TMA
 //     wait and load hw(tmem) from MMA
-//     v_new.T = v.T - hw - [V_dim, BT]
-//     store bf16(v_new) to gmem (for O kernel)
-//     v_new *= exp(g_cu_last - g_cu)
-//     store v_new to tmem (for MMA)
+//     compute v_new.T = v.T - hw - [V_dim, BT]
+//     compute scaled_v_new = v_new * v_scale, store to tmem (input for vk MMA)
+//     convert v_new to BF16, store to gmem (for O kernel)
 //
 //     # MMA warp
-//     wait and load k(smem) from TMA
-//     wait v_new(tmem) from CUDA V warp
-//     issue vk(tmem) = v_new.T @ k - [V_dim, K_dim]
+//     wait k(smem) from TMA
+//     wait scaled_h(tmem) from CUDA H warp
+//     wait scaled_v_new(tmem) from CUDA V warp
+//     issue vk(tmem) = scaled_h + scaled_v_new.T @ k - [V_dim, K_dim]
 //
 //     # CUDA H warp
 //     load g_cu_last from gmem->rmem
-//     wait and load vk(tmem) from MMA
-//     h = exp(g_cu_last) * h + vk
+//     compute h_scale = exp(g_cu_last)
+//     if 1st chunk:
+//       load h from h0(gmem)
+//     else:
+//       load h(tmem) from vk MMA
+//     convert h to BF16, store to gmem (for O kernel)
+//     compute scaled_h = h * h_scale, store to tmem (acc for vk MMA)
 
 #include <cuda_bf16.h>
 #include <cudaTypedefs.h>
@@ -82,13 +88,15 @@ enum ProfilerTag {
   WAIT_MMA,
   WAIT_TMA,
   WAIT_H,
-  WAIT_V,
+  WAIT_SCALED_H,
+  WAIT_SCALED_V,
   WAIT_WH_MMA,
   WAIT_VK_MMA,
   ISSUE_TMA,
   ISSUE_WH_MMA,
   ISSUE_VK_MMA,
   PROCESS_H,
+  PROCESS_SCALED_H,
   COMPUTE_V_SCALE,
   PROCESS_V,
   STORE_V_NEW,
@@ -177,12 +185,13 @@ void h_kernel_cutlass(
   const uint32_t v_scale_smem = V_new_smem + V_size;
   float *v_scale_smem_ptr = reinterpret_cast<float *>(smem_ptr + (v_scale_smem - smem));
 
-  const uint32_t tma_mbar_addr = v_scale_smem + v_scale_size;
-  const uint32_t mma_mbar_addr = tma_mbar_addr + NUM_STAGES * 8;
-  const uint32_t h_mbar_addr   = mma_mbar_addr + NUM_STAGES * 8;
-  const uint32_t v_mbar_addr   = h_mbar_addr + 8;
-  const uint32_t wh_mbar_addr  = v_mbar_addr + 8;
-  const uint32_t vk_mbar_addr  = wh_mbar_addr + 8;
+  const uint32_t tma_mbar_addr      = v_scale_smem + v_scale_size;
+  const uint32_t mma_mbar_addr      = tma_mbar_addr + NUM_STAGES * 8;
+  const uint32_t h_mbar_addr        = mma_mbar_addr + NUM_STAGES * 8;
+  const uint32_t scaled_h_mbar_addr = h_mbar_addr + 8;
+  const uint32_t scaled_v_mbar_addr = scaled_h_mbar_addr + 8;
+  const uint32_t wh_mbar_addr       = scaled_v_mbar_addr + 8;
+  const uint32_t vk_mbar_addr       = wh_mbar_addr + 8;
 
   const uint32_t taddr = vk_mbar_addr + 8;
 
@@ -203,7 +212,8 @@ void h_kernel_cutlass(
         mbarrier_init(mma_mbar_addr + i * 8, 1);
       }
       mbarrier_init(h_mbar_addr, WARP_SIZE * 4);
-      mbarrier_init(v_mbar_addr, WARP_SIZE * 4);
+      mbarrier_init(scaled_h_mbar_addr, WARP_SIZE * 4);
+      mbarrier_init(scaled_v_mbar_addr, WARP_SIZE * 4);
       mbarrier_init(wh_mbar_addr, 1);
       mbarrier_init(vk_mbar_addr, 1);
       fence_mbarrier_init();
@@ -308,8 +318,10 @@ void h_kernel_cutlass(
                                        | (desc_encode(8 * 128) << 32ULL)   // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
 
-        mbarrier_wait(v_mbar_addr, h_parity);  // wait for (scaled) v_new store to tmem
-        profiler.stamp(WAIT_V);
+        mbarrier_wait(scaled_v_mbar_addr, h_parity);  // wait for (scaled) v_new store to tmem
+        profiler.stamp(WAIT_SCALED_V);
+        mbarrier_wait(scaled_h_mbar_addr, h_parity);
+        profiler.stamp(WAIT_SCALED_H);
         tcgen05_fence_after_thread_sync();
 
         // k selects [V_dim/K_dim, 16] tile
@@ -361,6 +373,7 @@ void h_kernel_cutlass(
         vk_parity ^= 1;
       }
 
+      // prepare H input for wh MMA to unblock it ASAP
       // collectively, 4 warps represent H[V_dim, K_dim]
       // each thread processes 1 row
       for (int i = 0; i < K_dim / 16; i++) {
@@ -381,8 +394,34 @@ void h_kernel_cutlass(
         // pack to BF16 for O kernel and wh MMA
         for (int j = 0; j < 8; j++)
           tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
-        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);    // for O kernel
         tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, h_tmem_base + i * 8, tmp);  // for wh MMA
+      }
+      tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
+      mbarrier_arrive(h_mbar_addr);
+      if (elect_sync()) profiler.stamp(PROCESS_H);
+
+      // slowly prepare for O kernel and store vk MMA acc
+      // TODO: for O kernel, may want to store to smem then TMA store
+      for (int i = 0; i < K_dim / 16; i++) {
+        float h_f32[16];
+        uint32_t tmp[8];
+
+        if (chunk_id == 0) {
+          // load H0 from gmem for 1st chunk
+          const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
+          ldg_u32x8_fast(h_f32 + 0, h0_ptr + (offset + i * 16 + 0));
+          ldg_u32x8_fast(h_f32 + 8, h0_ptr + (offset + i * 16 + 8));
+        }
+        else {
+          // for subsequent chunks, load from tmem
+          tcgen05_ld<SHAPE::_32x32b, 16>(h_f32, warp_id_ * 32, vk_tmem + i * 16);
+        }
+
+        // pack to BF16 for O kernel and wh MMA
+        for (int j = 0; j < 8; j++)
+          tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
+        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);    // for O kernel
 
         // scaled H for vk MMA
         for (int j = 0; j < 16; j++)
@@ -391,8 +430,8 @@ void h_kernel_cutlass(
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
-      mbarrier_arrive(h_mbar_addr);
-      if (elect_sync()) profiler.stamp(PROCESS_H);
+      mbarrier_arrive(scaled_h_mbar_addr);
+      if (elect_sync()) profiler.stamp(PROCESS_SCALED_H);
     };
 
     process(0);
@@ -498,7 +537,7 @@ void h_kernel_cutlass(
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
-      mbarrier_arrive(v_mbar_addr);
+      mbarrier_arrive(scaled_v_mbar_addr);
       if (elect_sync()) profiler.stamp(PROCESS_V);
 
       // all warps finish storing scaled v_new to smem
@@ -603,7 +642,7 @@ void h_v1(
                           + v_scale_size     // v_scale
                           + 8 * NUM_STAGES   // TMA mbar
                           + 8 * NUM_STAGES   // MMA mbar
-                          + 8 * 4            // h, v, wh, vk mbar
+                          + 8 * 5            // h, h_scale, v_scale, wh, vk mbar
                           + 4;               // tmem addr
 
   if (profiler.has_value()) {
