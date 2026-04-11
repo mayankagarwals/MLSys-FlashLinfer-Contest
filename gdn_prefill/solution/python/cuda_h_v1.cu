@@ -252,8 +252,8 @@ void h_kernel_cutlass(
       const int k_head_id = head_id / (H / Hg);
 
       // natural shape:  [N, H, V_dim, K_dim]
-      // permuted shape: [N, H, K_dim/32, V_dim, 32]
-      tma_load_5d(H0_f32_smem, &H0_tmap, 0, 0, 0, head_id, seq_id, h0_mbar_addr, EVICT_FIRST);
+      // permuted shape: [N*H, K_dim/32, V_dim, 32]
+      tma_load_4d(H0_f32_smem, &H0_tmap, 0, 0, 0, seq_id * H + head_id, h0_mbar_addr, EVICT_FIRST);
       mbarrier_arrive_expect_tx(h0_mbar_addr, H_fp32_size);
 
       for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
@@ -642,6 +642,30 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   return tmap;
 }
 
+static
+CUtensorMap encode_h_tma(void *ptr, uint64_t N) {
+  CUtensorMap tmap;
+
+  // natural shape:  [N, H, V_dim, K_dim]
+  // permuted shape: [N*H, K_dim/32, V_dim, 32]
+  constexpr uint32_t rank = 4;
+  uint64_t globalDim[rank] = {32, V_dim, K_dim / 32, N * H};
+  uint64_t globalStrides[rank - 1] = {        K_dim * sizeof(float),
+                                                                128,
+                                      V_dim * K_dim * sizeof(float)};  // in bytes
+  uint32_t boxDim[rank] = {32, V_dim, K_dim / 32, 1};
+  uint32_t elementStrides[rank] = {1, 1, 1, 1};
+
+  cuTensorMapEncodeTiled(
+    &tmap, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, rank, ptr,
+    globalDim, globalStrides, boxDim, elementStrides,
+    CU_TENSOR_MAP_INTERLEAVE_NONE,
+    CU_TENSOR_MAP_SWIZZLE_128B,
+    CU_TENSOR_MAP_L2_PROMOTION_NONE,
+    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  return tmap;
+}
+
 void h_v1(
   TensorView K,
   TensorView V,
@@ -658,31 +682,10 @@ void h_v1(
   const int T = K.size(0);
   const int N = h0.size(0);
 
-  auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim);
-  auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
-  auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
-
-  CUtensorMap H0_tmap;
-  {
-    // natural shape:  [N, H, V_dim, K_dim]
-    // permuted shape: [N, H, K_dim/32, V_dim, 32]
-    constexpr uint32_t rank = 5;
-    uint64_t globalDim[rank] = {32, V_dim, K_dim / 32, H, N};
-    uint64_t globalStrides[rank - 1] = {            K_dim * sizeof(float),
-                                                                      128,
-                                            V_dim * K_dim * sizeof(float),
-                                        H * V_dim * K_dim * sizeof(float)};  // in bytes
-    uint32_t boxDim[rank] = {32, V_dim, K_dim / 32, 1, 1};
-    uint32_t elementStrides[rank] = {1, 1, 1, 1, 1};
-
-    cuTensorMapEncodeTiled(
-      &H0_tmap, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, rank, h0.data_ptr(),
-      globalDim, globalStrides, boxDim, elementStrides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  }
+  auto K_tmap  = encode_tma(K.data_ptr(), T, Hg, K_dim);
+  auto V_tmap  = encode_tma(V.data_ptr(), T, H, V_dim);
+  auto W_tmap  = encode_tma(W.data_ptr(), T, H, K_dim);
+  auto H0_tmap = encode_h_tma(h0.data_ptr(), N);
 
   auto *V_new_ptr         = reinterpret_cast<nv_bfloat16 *>(V_new.data_ptr());
   auto *g_cu_ptr          = reinterpret_cast<const float *>(g_cu.data_ptr());
