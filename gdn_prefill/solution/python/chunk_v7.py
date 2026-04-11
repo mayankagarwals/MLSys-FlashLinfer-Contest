@@ -154,15 +154,14 @@ def export_trace(profiler: Tensor, path: Path):
             if cnt == 0:
                 continue
 
-            # start timestamp
-            tag, ts = data[1:3]
-            assert tag == 0, tag
-            start = ts
-
-            for i in range(1, cnt):
+            start = 0
+            for i in range(cnt):
                 tag, ts = data[1 + i * 2 : 1 + (i + 1) * 2]
-                events.append(
-                    dict(
+
+                # skip START tag
+                # NOTE: there might be more than 1 start tag
+                if tag > 0:
+                    evt = dict(
                         name=TAGS[tag],
                         ph="X",
                         ts=start,
@@ -170,7 +169,8 @@ def export_trace(profiler: Tensor, path: Path):
                         pid=sm_id,
                         tid=sm_id + warp_id,
                     )
-                )
+                    events.append(evt)
+
                 start = ts
 
     offset = min([evt["ts"] for evt in events])

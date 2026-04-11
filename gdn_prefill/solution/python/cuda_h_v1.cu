@@ -141,8 +141,8 @@ struct Profiler {
     int warp_id = threadIdx.x / WARP_SIZE;
 
     data_ptr_ = data_ptr + (sm_id * NUM_WARPS + warp_id) * (1 + num_entries * 2);
-    cnt_ = 0;
-    stamp(ProfilerTag::START);
+    cnt_ = data_ptr_[0];
+    stamp(START);
   }
 
   __device__
@@ -156,7 +156,7 @@ struct Profiler {
   __device__
   void flush() {
     if (!ENABLE) return;
-    stamp(ProfilerTag::END);
+    stamp(END);
     data_ptr_[0] = cnt_;
   }
 };
