@@ -514,6 +514,9 @@ void h_kernel_cutlass(
       const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim) + i * 8;
       stg_u32x8_fast(ht_ptr + offset, h_f32);
     }
+
+    if (warp_id_ == 0)
+      tcgen05_dealloc(0, 512);
   }
   else {
     // V CUDA warps
@@ -637,10 +640,6 @@ void h_kernel_cutlass(
       wh_parity ^= 1;
     }
   }
-
-  __syncthreads();
-  if (warp_id == 0)
-    tcgen05_dealloc(0, 512);
   if (elect_sync()) profiler.flush();
 }
 
