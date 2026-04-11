@@ -41,7 +41,7 @@ constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 template <int NUM_STAGES>
 __global__
 __block_size__((TB_SIZE, 1, 1))
-void kkt_v1_kernel_cutlass(
+void kkt_v1b_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,  // [total_T, Hg, K_dim]
   const float       *A_log_ptr,                // [H]
   const nv_bfloat16 *a_ptr,                    // [total_T, H]
@@ -52,8 +52,9 @@ void kkt_v1_kernel_cutlass(
         float       *A_ptr,                    // [total_T, H, BT]
   const int64_t     *cu_seqlens_ptr,           // [N+1]
   const int32_t     *chunk_indices_ptr,        // [total_num_chunks, 2]
-  int32_t total_num_chunks
+  const int32_t     *total_num_chunks_ptr      // points to chunk_offsets[N] on GPU
 ) {
+  const int32_t total_num_chunks = *total_num_chunks_ptr;
   const int tid = threadIdx.x;
   const int warp_id = warp_uniform(tid / WARP_SIZE);
   const int lane_id = tid % WARP_SIZE;
@@ -101,7 +102,7 @@ void kkt_v1_kernel_cutlass(
     // TMA warp
     if (elect_sync()) {
       int stage_id = 0;
-      int mma_parity = 1; 
+      int mma_parity = 1;
 
       for (int global_chunk_id = bid; global_chunk_id < total_num_chunks; global_chunk_id += gridDim.x) {
         int2 tmp = reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
@@ -284,7 +285,7 @@ void kkt_v1_kernel_cutlass(
 }
 
 static
-CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
+CUtensorMap encode_tma_v1b(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   CUtensorMap tmap;
 
   // natural shape: [T, H, dim]
@@ -305,7 +306,7 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   return tmap;
 }
 
-void kkt_v1(
+void kkt_v1b(
   TensorView K,
   TensorView A_log,
   TensorView a,
@@ -316,37 +317,38 @@ void kkt_v1(
   TensorView A,
   TensorView cu_seqlens,
   TensorView chunk_indices,
-  int total_num_chunks
+  TensorView chunk_offsets_end  // 1-element slice = chunk_offsets[N] = total_num_chunks on GPU
 ) {
   const int T = K.size(0);
   const int Hg = K.size(1);
 
-  auto K_tmap = encode_tma(K.data_ptr(), T, Hg, K_dim);
+  auto K_tmap = encode_tma_v1b(K.data_ptr(), T, Hg, K_dim);
 
-  auto *A_log_ptr         = reinterpret_cast<const float *>(A_log.data_ptr());
-  auto *a_ptr             = reinterpret_cast<const nv_bfloat16 *>(a.data_ptr());
-  auto *dt_bias_ptr       = reinterpret_cast<const float *>(dt_bias.data_ptr());
-  auto *b_ptr             = reinterpret_cast<const nv_bfloat16 *>(b.data_ptr());
-  auto *g_cu_ptr          = reinterpret_cast<float *>(g_cu.data_ptr());
-  auto *beta_ptr          = reinterpret_cast<float *>(beta.data_ptr());
-  auto *A_ptr             = reinterpret_cast<float *>(A.data_ptr());
-  auto *cu_seqlens_ptr    = reinterpret_cast<const int64_t *>(cu_seqlens.data_ptr());
-  auto *chunk_indices_ptr = reinterpret_cast<const int32_t *>(chunk_indices.data_ptr());
+  auto *A_log_ptr              = reinterpret_cast<const float *>(A_log.data_ptr());
+  auto *a_ptr                  = reinterpret_cast<const nv_bfloat16 *>(a.data_ptr());
+  auto *dt_bias_ptr            = reinterpret_cast<const float *>(dt_bias.data_ptr());
+  auto *b_ptr                  = reinterpret_cast<const nv_bfloat16 *>(b.data_ptr());
+  auto *g_cu_ptr               = reinterpret_cast<float *>(g_cu.data_ptr());
+  auto *beta_ptr               = reinterpret_cast<float *>(beta.data_ptr());
+  auto *A_ptr                  = reinterpret_cast<float *>(A.data_ptr());
+  auto *cu_seqlens_ptr         = reinterpret_cast<const int64_t *>(cu_seqlens.data_ptr());
+  auto *chunk_indices_ptr      = reinterpret_cast<const int32_t *>(chunk_indices.data_ptr());
+  auto *total_num_chunks_ptr   = reinterpret_cast<const int32_t *>(chunk_offsets_end.data_ptr());
 
   constexpr int NUM_STAGES = 4;
   constexpr int smem_size = K_size * NUM_STAGES
-                          + (4 + BT) * 2 * sizeof(float)  // scratchpad for g_cu
-                          + 3 * NUM_STAGES * 8            // tma, mma, epi mbar for each stage
-                          + 4;                            // taddr
+                          + (4 + BT) * 2 * sizeof(float)
+                          + 3 * NUM_STAGES * 8
+                          + 4;
 
-  auto kernel = kkt_v1_kernel_cutlass<NUM_STAGES>;
+  auto kernel = kkt_v1b_kernel_cutlass<NUM_STAGES>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
   dim3 grid(148 / Hg, Hg);
   kernel<<<grid, TB_SIZE, smem_size>>>(
     K_tmap, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
     g_cu_ptr, beta_ptr, A_ptr,
-    cu_seqlens_ptr, chunk_indices_ptr, total_num_chunks);
+    cu_seqlens_ptr, chunk_indices_ptr, total_num_chunks_ptr);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(kkt_v1, kkt_v1);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kkt_v1b, kkt_v1b);

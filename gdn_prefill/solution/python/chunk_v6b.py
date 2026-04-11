@@ -1,4 +1,4 @@
-# chunk_v7: chunk_v6 + fused o-kernel + no .item() sync
+# chunk_v6b: chunk_v6 + fused o-kernel + no .item() sync
 
 import os
 from pathlib import Path
@@ -20,9 +20,9 @@ os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
-    name="gdn_prefill_cuda_v6_2",
+    name="gdn_prefill_cuda_v6b",
     cuda_files=[
-        str(CURRENT_DIR / "cuda_kkt_v1.cu"),
+        str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
     ],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
@@ -257,7 +257,7 @@ def run(
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A    = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    mod.kkt_v1(k, A_log, a, dt_bias, b, g_cu, beta, A,
+    mod.kkt_v1b(k, A_log, a, dt_bias, b, g_cu, beta, A,
                cu_seqlens, chunk_indices, total_chunks_ptr)
 
     Ai    = torch.empty_like(A, dtype=k.dtype)
