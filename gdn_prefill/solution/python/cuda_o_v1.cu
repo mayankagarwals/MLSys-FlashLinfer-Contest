@@ -14,6 +14,7 @@ constexpr uint32_t BLOCK_V = 128U;
 constexpr uint32_t NUM_OUTPUT_HEADS = 8U;
 constexpr uint32_t NUM_QK_HEADS = 4U;
 constexpr uint32_t HEADS_PER_QK_HEAD = NUM_OUTPUT_HEADS / NUM_QK_HEADS;
+static_assert(HEADS_PER_QK_HEAD == 2U);
 
 //// MMA Config
 constexpr uint32_t MMA_M = BLOCK_T;
@@ -293,29 +294,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   const uint32_t lane_id = tid % WARP_SIZE;
 
   const uint32_t v_tile = blockIdx.x;
-  const uint32_t global_chunk_id = blockIdx.y;
-  const uint32_t head_id = blockIdx.z;
-  if (global_chunk_id >= static_cast<uint32_t>(total_num_chunks)) {
-    return;
-  }
-
-  const uint32_t q_head_id = head_id / HEADS_PER_QK_HEAD;
-  const uint32_t k_head_id = head_id / HEADS_PER_QK_HEAD;
-
-  const int2 chunk_meta =
-      reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
-  const uint32_t seq_id = static_cast<uint32_t>(chunk_meta.x);
-  const uint32_t chunk_id = static_cast<uint32_t>(chunk_meta.y);
-  const int64_t bos = cu_seqlens_ptr[seq_id];
-  const int64_t eos = cu_seqlens_ptr[seq_id + 1];
-  const int64_t chunk_start = bos + static_cast<int64_t>(chunk_id) * BLOCK_T;
-  const int64_t remaining = eos - chunk_start;
-  const uint32_t chunk_len =
-      remaining <= 0
-          ? 0U
-          : static_cast<uint32_t>(remaining < static_cast<int64_t>(BLOCK_T)
-                                      ? remaining
-                                      : static_cast<int64_t>(BLOCK_T));
+  const uint32_t qk_head_id = blockIdx.z;
+  const uint32_t q_head_id = qk_head_id;
+  const uint32_t k_head_id = qk_head_id;
+  const uint32_t head_id_base = qk_head_id * HEADS_PER_QK_HEAD;
   const uint32_t v_start = v_tile * BLOCK_V;
 
   extern __shared__ __align__(1024) char smem_ptr[];
@@ -363,215 +345,262 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   constexpr uint32_t QK_MMA_PHASE = 0U;
   constexpr uint32_t OV_MMA_PHASE = 0U;
   constexpr uint32_t QH_MMA_PHASE = 0U;
-  constexpr uint32_t ATTN_READY_PHASE = 0U;
-  const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
-  const int32_t chunk_start_i32 = static_cast<int32_t>(chunk_start);
+  const bool cuda_warp = warp_id < NUM_CUDA_WARPS;
+  uint32_t row_base = 0U;
+  uint32_t row_hi = 0U;
+  uint32_t lane_col = 0U;
 
-  if (warp_id == TMA_WARP && elect_sync()) {
-    tma_load_4d(q_smem, &q_tmap, 0, chunk_start_i32, 0, q_head_id,
-                qk_tma_barrier);
-    tma_load_4d(k_smem, &k_tmap, 0, chunk_start_i32, 0, k_head_id,
-                qk_tma_barrier);
-    tma_load_4d(v_smem, &v_tmap, 0, chunk_start_i32, v_tile, head_id,
-                v_tma_barrier);
-    tma_load_4d(h_smem, &h_tmap, 0, v_start, 0, h_outer, h_tma_barrier);
-    mbarrier_arrive_expect_tx(qk_tma_barrier, Q_SMEM_SIZE + K_SMEM_SIZE);
-    mbarrier_arrive_expect_tx(v_tma_barrier, V_SMEM_SIZE);
-    mbarrier_arrive_expect_tx(h_tma_barrier, H_SMEM_SIZE);
-  }
-  if (warp_id == MMA_WARP && elect_sync()) {
-    mbarrier_wait(qk_tma_barrier, TMA_PHASE);
-    tcgen05_fence_after_thread_sync();
-    mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, k_smem);
-    tcgen05_commit(mma_barrier);
-    // QH and OV land in disjoint tmem columns, so each gets its own completion
-    // barrier instead of reusing mma_barrier phases.
-    mbarrier_wait(h_tma_barrier, TMA_PHASE);
-    tcgen05_fence_after_thread_sync();
-    mma_swizzled_qh_64x128(QH_TMEM_COL, q_smem, h_smem);
-    tcgen05_commit(qh_mma_barrier);
-    mbarrier_wait(v_tma_barrier, TMA_PHASE);
-    mbarrier_wait(attn_ready_barrier, ATTN_READY_PHASE);
-    tcgen05_fence_after_thread_sync();
-    mma_attn_v_mmajor_64x128(OUTPUT_TMEM_COL, attn_smem, v_smem);
-    tcgen05_commit(ov_mma_barrier);
+  if (cuda_warp) {
+    row_base = warp_id * ROWS_PER_WARP + lane_id / LANES_PER_ROW_GROUP;
+    row_hi = row_base + ROW_PAIR_STRIDE;
+    lane_col = lane_id % LANES_PER_ROW_GROUP;
   }
 
-  if (warp_id < NUM_CUDA_WARPS) {
-    for (uint32_t i = tid; i < BLOCK_T; i += NUM_CUDA_WARPS * WARP_SIZE) {
-      float g_value = 0.0f;
-      if (i < chunk_len) {
-        const int64_t token_idx = chunk_start + static_cast<int64_t>(i);
-        g_value = g_cu_ptr[token_idx * NUM_OUTPUT_HEADS + head_id];
-      }
-      g_smem_ptr[i] = g_value;
-    }
-    bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
-
-    nv_bfloat16 *attn_smem_ptr =
-        reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_smem - smem));
-    mbarrier_wait(mma_barrier, QK_MMA_PHASE);
-    tcgen05_fence_after_thread_sync();
-    float qk_reg_lo[REGS_PER_FRAGMENT];
-    float qk_reg_hi[REGS_PER_FRAGMENT];
-    tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_lo, 0, 0);
-    tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_hi, 0, COLS_PER_FRAGMENT);
-    tcgen05_wait_ld();
-    const uint32_t row_base =
-        warp_id * ROWS_PER_WARP + lane_id / LANES_PER_ROW_GROUP;
-    const uint32_t row_hi = row_base + ROW_PAIR_STRIDE;
+  for (uint32_t global_chunk_id = blockIdx.y;
+       global_chunk_id < static_cast<uint32_t>(total_num_chunks);
+       global_chunk_id += gridDim.y) {
+    const int2 chunk_meta =
+        reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
+    const uint32_t seq_id = static_cast<uint32_t>(chunk_meta.x);
+    const uint32_t chunk_id = static_cast<uint32_t>(chunk_meta.y);
+    const int64_t bos = cu_seqlens_ptr[seq_id];
+    const int64_t eos = cu_seqlens_ptr[seq_id + 1];
+    const int64_t chunk_start = bos + static_cast<int64_t>(chunk_id) * BLOCK_T;
+    const int64_t remaining = eos - chunk_start;
+    const uint32_t chunk_len =
+        remaining <= 0
+            ? 0U
+            : static_cast<uint32_t>(remaining < static_cast<int64_t>(BLOCK_T)
+                                        ? remaining
+                                        : static_cast<int64_t>(BLOCK_T));
+    const int32_t chunk_start_i32 = static_cast<int32_t>(chunk_start);
+    const bool full_chunk = chunk_len == BLOCK_T;
     const uint32_t row_base_limit = row_base < chunk_len ? row_base + 1U : 0U;
     const uint32_t row_hi_limit = row_hi < chunk_len ? row_hi + 1U : 0U;
-    const uint32_t lane_col = lane_id % LANES_PER_ROW_GROUP;
-#pragma unroll
-    for (uint32_t step = 0; step < FRAGMENT_STEPS; ++step) {
-      const uint32_t col_in_fragment =
-          (step / 2U) * 8U + 2U * lane_col + (step % 2U);
-      const uint32_t col_lo = col_in_fragment;
-      const uint32_t col_hi = col_in_fragment + COLS_PER_FRAGMENT;
-      const uint32_t reg_row0 = (step / 2U) * 4U + (step % 2U);
-      const uint32_t reg_row1 = reg_row0 + 2U;
+    const uint32_t qk_phase =
+        ((global_chunk_id - blockIdx.y) / gridDim.y) & 1U;
 
-      store_attn_column(attn_smem_ptr, g_smem_ptr, qk_reg_lo, row_base, row_hi,
-                        row_base_limit, row_hi_limit, reg_row0, reg_row1,
-                        col_lo);
-      store_attn_column(attn_smem_ptr, g_smem_ptr, qk_reg_hi, row_base, row_hi,
-                        row_base_limit, row_hi_limit, reg_row0, reg_row1,
-                        col_hi);
+    if (warp_id == TMA_WARP && elect_sync()) {
+      tma_load_4d(q_smem, &q_tmap, 0, chunk_start_i32, 0, q_head_id,
+                  qk_tma_barrier);
+      tma_load_4d(k_smem, &k_tmap, 0, chunk_start_i32, 0, k_head_id,
+                  qk_tma_barrier);
+      mbarrier_arrive_expect_tx(qk_tma_barrier, Q_SMEM_SIZE + K_SMEM_SIZE);
     }
-    fence_proxy_async_shared_cta();
-    __syncwarp();
-    if (elect_sync()) {
-      mbarrier_arrive(attn_ready_barrier);
+    if (warp_id == MMA_WARP && elect_sync()) {
+      mbarrier_wait(qk_tma_barrier, TMA_PHASE ^ qk_phase);
+      tcgen05_fence_after_thread_sync();
+      mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, k_smem);
+      tcgen05_commit(mma_barrier);
     }
 
-    mbarrier_wait(ov_mma_barrier, OV_MMA_PHASE);
-    mbarrier_wait(qh_mma_barrier, QH_MMA_PHASE);
-    tcgen05_fence_after_thread_sync();
+    if (cuda_warp) {
+      mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
+      tcgen05_fence_after_thread_sync();
+    }
 
-    const bool full_chunk = chunk_len == BLOCK_T;
-    if (full_chunk) {
-      const float g_row_base = __expf(g_smem_ptr[row_base]);
-      const float g_row_hi = __expf(g_smem_ptr[row_hi]);
-      nv_bfloat16 *row_base_o_ptr =
-          o_ptr + (((chunk_start + static_cast<int64_t>(row_base)) *
-                        NUM_OUTPUT_HEADS +
-                    head_id) *
-                       VALUE_DIM +
-                   v_start);
-      nv_bfloat16 *row_hi_o_ptr = row_base_o_ptr + ROW_PAIR_OUTPUT_STRIDE;
 #pragma unroll
-      for (uint32_t fragment_pair = 0; fragment_pair < BLOCK_V / BLOCK_T;
-           ++fragment_pair) {
-        const uint32_t col_base = fragment_pair * BLOCK_T;
-        float ov_reg_lo[REGS_PER_FRAGMENT];
-        float ov_reg_hi[REGS_PER_FRAGMENT];
-        float qh_reg_lo[REGS_PER_FRAGMENT];
-        float qh_reg_hi[REGS_PER_FRAGMENT];
-        tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_lo, 0,
-                                       OUTPUT_TMEM_COL + col_base);
-        tcgen05_ld<SHAPE::_16x256b, 4>(
-            ov_reg_hi, 0, OUTPUT_TMEM_COL + col_base + COLS_PER_FRAGMENT);
-        tcgen05_ld<SHAPE::_16x256b, 4>(qh_reg_lo, 0, QH_TMEM_COL + col_base);
-        tcgen05_ld<SHAPE::_16x256b, 4>(
-            qh_reg_hi, 0, QH_TMEM_COL + col_base + COLS_PER_FRAGMENT);
+    for (uint32_t head_offset = 0; head_offset < HEADS_PER_QK_HEAD;
+         ++head_offset) {
+      const uint32_t head_phase = head_offset & 1U;
+      const uint32_t head_id = head_id_base + head_offset;
+      const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
+
+      if (warp_id == TMA_WARP && elect_sync()) {
+        tma_load_4d(v_smem, &v_tmap, 0, chunk_start_i32, v_tile, head_id,
+                    v_tma_barrier);
+        tma_load_4d(h_smem, &h_tmap, 0, v_start, 0, h_outer, h_tma_barrier);
+        mbarrier_arrive_expect_tx(v_tma_barrier, V_SMEM_SIZE);
+        mbarrier_arrive_expect_tx(h_tma_barrier, H_SMEM_SIZE);
+      }
+
+      if (warp_id == MMA_WARP && elect_sync()) {
+        mbarrier_wait(h_tma_barrier, head_phase);
+        tcgen05_fence_after_thread_sync();
+        mma_swizzled_qh_64x128(QH_TMEM_COL, q_smem, h_smem);
+        tcgen05_commit(qh_mma_barrier);
+        mbarrier_wait(v_tma_barrier, head_phase);
+        mbarrier_wait(attn_ready_barrier, head_phase);
+        tcgen05_fence_after_thread_sync();
+        mma_attn_v_mmajor_64x128(OUTPUT_TMEM_COL, attn_smem, v_smem);
+        tcgen05_commit(ov_mma_barrier);
+      }
+
+      if (cuda_warp) {
+        for (uint32_t i = tid; i < BLOCK_T; i += NUM_CUDA_WARPS * WARP_SIZE) {
+          float g_value = 0.0f;
+          if (i < chunk_len) {
+            const int64_t token_idx = chunk_start + static_cast<int64_t>(i);
+            g_value = g_cu_ptr[token_idx * NUM_OUTPUT_HEADS + head_id];
+          }
+          g_smem_ptr[i] = g_value;
+        }
+        bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
+
+        nv_bfloat16 *attn_smem_ptr =
+            reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_smem - smem));
+        float qk_reg_lo[REGS_PER_FRAGMENT];
+        float qk_reg_hi[REGS_PER_FRAGMENT];
+        tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_lo, 0, 0);
+        tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_hi, 0, COLS_PER_FRAGMENT);
         tcgen05_wait_ld();
 #pragma unroll
-        for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
-          const uint32_t col_lo =
-              col_base + step_pair * 8U + 2U * lane_col;
-          const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
-          const uint32_t reg_row0 = step_pair * 4U;
+        for (uint32_t step = 0; step < FRAGMENT_STEPS; ++step) {
+          const uint32_t col_in_fragment =
+              (step / 2U) * 8U + 2U * lane_col + (step % 2U);
+          const uint32_t col_lo = col_in_fragment;
+          const uint32_t col_hi = col_in_fragment + COLS_PER_FRAGMENT;
+          const uint32_t reg_row0 = (step / 2U) * 4U + (step % 2U);
           const uint32_t reg_row1 = reg_row0 + 2U;
 
-          store_bf162_no_allocate(
-              row_base_o_ptr + col_lo,
-              combine_output_pair(ov_reg_lo[reg_row0],
-                                  ov_reg_lo[reg_row0 + 1U],
-                                  qh_reg_lo[reg_row0],
-                                  qh_reg_lo[reg_row0 + 1U], g_row_base, scale));
-          store_bf162_no_allocate(
-              row_base_o_ptr + col_hi,
-              combine_output_pair(ov_reg_hi[reg_row0],
-                                  ov_reg_hi[reg_row0 + 1U],
-                                  qh_reg_hi[reg_row0],
-                                  qh_reg_hi[reg_row0 + 1U], g_row_base, scale));
-          store_bf162_no_allocate(
-              row_hi_o_ptr + col_lo,
-              combine_output_pair(ov_reg_lo[reg_row1],
-                                  ov_reg_lo[reg_row1 + 1U],
-                                  qh_reg_lo[reg_row1],
-                                  qh_reg_lo[reg_row1 + 1U], g_row_hi, scale));
-          store_bf162_no_allocate(
-              row_hi_o_ptr + col_hi,
-              combine_output_pair(ov_reg_hi[reg_row1],
-                                  ov_reg_hi[reg_row1 + 1U],
-                                  qh_reg_hi[reg_row1],
-                                  qh_reg_hi[reg_row1 + 1U], g_row_hi, scale));
+          store_attn_column(attn_smem_ptr, g_smem_ptr, qk_reg_lo, row_base,
+                            row_hi, row_base_limit, row_hi_limit, reg_row0,
+                            reg_row1, col_lo);
+          store_attn_column(attn_smem_ptr, g_smem_ptr, qk_reg_hi, row_base,
+                            row_hi, row_base_limit, row_hi_limit, reg_row0,
+                            reg_row1, col_hi);
         }
-      }
-    } else {
-      const uint32_t row_base_active = row_base < chunk_len;
-      const uint32_t row_hi_active = row_hi < chunk_len;
-      nv_bfloat16 *row_base_o_ptr =
-          o_ptr + (((chunk_start + static_cast<int64_t>(row_base)) *
-                        NUM_OUTPUT_HEADS +
-                    head_id) *
-                       VALUE_DIM +
-                   v_start);
-      nv_bfloat16 *row_hi_o_ptr = row_base_o_ptr + ROW_PAIR_OUTPUT_STRIDE;
-      const float g_row_base = __expf(g_smem_ptr[row_base]);
-      const float g_row_hi = __expf(g_smem_ptr[row_hi]);
-#pragma unroll
-      for (uint32_t fragment_pair = 0; fragment_pair < BLOCK_V / BLOCK_T;
-           ++fragment_pair) {
-        const uint32_t col_base = fragment_pair * BLOCK_T;
-        float ov_reg_lo[REGS_PER_FRAGMENT];
-        float ov_reg_hi[REGS_PER_FRAGMENT];
-        float qh_reg_lo[REGS_PER_FRAGMENT];
-        float qh_reg_hi[REGS_PER_FRAGMENT];
-        tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_lo, 0,
-                                       OUTPUT_TMEM_COL + col_base);
-        tcgen05_ld<SHAPE::_16x256b, 4>(
-            ov_reg_hi, 0, OUTPUT_TMEM_COL + col_base + COLS_PER_FRAGMENT);
-        tcgen05_ld<SHAPE::_16x256b, 4>(qh_reg_lo, 0, QH_TMEM_COL + col_base);
-        tcgen05_ld<SHAPE::_16x256b, 4>(
-            qh_reg_hi, 0, QH_TMEM_COL + col_base + COLS_PER_FRAGMENT);
-        tcgen05_wait_ld();
-#pragma unroll
-        for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
-          const uint32_t col_lo =
-              col_base + step_pair * 8U + 2U * lane_col;
-          const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
-          const uint32_t reg_row0 = step_pair * 4U;
-          const uint32_t reg_row1 = reg_row0 + 2U;
+        fence_proxy_async_shared_cta();
+        __syncwarp();
+        if (elect_sync()) {
+          mbarrier_arrive(attn_ready_barrier);
+        }
 
-          store_bf162_pair_no_allocate_if(
-              row_base_o_ptr + col_lo,
-              combine_output_pair(ov_reg_lo[reg_row0],
-                                  ov_reg_lo[reg_row0 + 1U],
-                                  qh_reg_lo[reg_row0],
-                                  qh_reg_lo[reg_row0 + 1U], g_row_base, scale),
-              row_base_o_ptr + col_hi,
-              combine_output_pair(ov_reg_hi[reg_row0],
-                                  ov_reg_hi[reg_row0 + 1U],
-                                  qh_reg_hi[reg_row0],
-                                  qh_reg_hi[reg_row0 + 1U], g_row_base, scale),
-              row_base_active);
-          store_bf162_pair_no_allocate_if(
-              row_hi_o_ptr + col_lo,
-              combine_output_pair(ov_reg_lo[reg_row1],
-                                  ov_reg_lo[reg_row1 + 1U],
-                                  qh_reg_lo[reg_row1],
-                                  qh_reg_lo[reg_row1 + 1U], g_row_hi, scale),
-              row_hi_o_ptr + col_hi,
-              combine_output_pair(ov_reg_hi[reg_row1],
-                                  ov_reg_hi[reg_row1 + 1U],
-                                  qh_reg_hi[reg_row1],
-                                  qh_reg_hi[reg_row1 + 1U], g_row_hi, scale),
-              row_hi_active);
+        mbarrier_wait(ov_mma_barrier, OV_MMA_PHASE ^ head_phase);
+        mbarrier_wait(qh_mma_barrier, QH_MMA_PHASE ^ head_phase);
+        tcgen05_fence_after_thread_sync();
+
+        if (full_chunk) {
+          const float g_row_base = __expf(g_smem_ptr[row_base]);
+          const float g_row_hi = __expf(g_smem_ptr[row_hi]);
+          nv_bfloat16 *row_base_o_ptr =
+              o_ptr + (((chunk_start + static_cast<int64_t>(row_base)) *
+                            NUM_OUTPUT_HEADS +
+                        head_id) *
+                           VALUE_DIM +
+                       v_start);
+          nv_bfloat16 *row_hi_o_ptr = row_base_o_ptr + ROW_PAIR_OUTPUT_STRIDE;
+#pragma unroll
+          for (uint32_t fragment_pair = 0; fragment_pair < BLOCK_V / BLOCK_T;
+               ++fragment_pair) {
+            const uint32_t col_base = fragment_pair * BLOCK_T;
+            float ov_reg_lo[REGS_PER_FRAGMENT];
+            float ov_reg_hi[REGS_PER_FRAGMENT];
+            float qh_reg_lo[REGS_PER_FRAGMENT];
+            float qh_reg_hi[REGS_PER_FRAGMENT];
+            tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_lo, 0,
+                                           OUTPUT_TMEM_COL + col_base);
+            tcgen05_ld<SHAPE::_16x256b, 4>(
+                ov_reg_hi, 0, OUTPUT_TMEM_COL + col_base + COLS_PER_FRAGMENT);
+            tcgen05_ld<SHAPE::_16x256b, 4>(qh_reg_lo, 0,
+                                           QH_TMEM_COL + col_base);
+            tcgen05_ld<SHAPE::_16x256b, 4>(
+                qh_reg_hi, 0, QH_TMEM_COL + col_base + COLS_PER_FRAGMENT);
+            tcgen05_wait_ld();
+#pragma unroll
+            for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS;
+                 ++step_pair) {
+              const uint32_t col_lo =
+                  col_base + step_pair * 8U + 2U * lane_col;
+              const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
+              const uint32_t reg_row0 = step_pair * 4U;
+              const uint32_t reg_row1 = reg_row0 + 2U;
+
+              store_bf162_no_allocate(
+                  row_base_o_ptr + col_lo,
+                  combine_output_pair(
+                      ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U],
+                      qh_reg_lo[reg_row0], qh_reg_lo[reg_row0 + 1U],
+                      g_row_base, scale));
+              store_bf162_no_allocate(
+                  row_base_o_ptr + col_hi,
+                  combine_output_pair(
+                      ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U],
+                      qh_reg_hi[reg_row0], qh_reg_hi[reg_row0 + 1U],
+                      g_row_base, scale));
+              store_bf162_no_allocate(
+                  row_hi_o_ptr + col_lo,
+                  combine_output_pair(
+                      ov_reg_lo[reg_row1], ov_reg_lo[reg_row1 + 1U],
+                      qh_reg_lo[reg_row1], qh_reg_lo[reg_row1 + 1U], g_row_hi,
+                      scale));
+              store_bf162_no_allocate(
+                  row_hi_o_ptr + col_hi,
+                  combine_output_pair(
+                      ov_reg_hi[reg_row1], ov_reg_hi[reg_row1 + 1U],
+                      qh_reg_hi[reg_row1], qh_reg_hi[reg_row1 + 1U], g_row_hi,
+                      scale));
+            }
+          }
+        } else {
+          const uint32_t row_base_active = row_base < chunk_len;
+          const uint32_t row_hi_active = row_hi < chunk_len;
+          nv_bfloat16 *row_base_o_ptr =
+              o_ptr + (((chunk_start + static_cast<int64_t>(row_base)) *
+                            NUM_OUTPUT_HEADS +
+                        head_id) *
+                           VALUE_DIM +
+                       v_start);
+          nv_bfloat16 *row_hi_o_ptr = row_base_o_ptr + ROW_PAIR_OUTPUT_STRIDE;
+          const float g_row_base = __expf(g_smem_ptr[row_base]);
+          const float g_row_hi = __expf(g_smem_ptr[row_hi]);
+#pragma unroll
+          for (uint32_t fragment_pair = 0; fragment_pair < BLOCK_V / BLOCK_T;
+               ++fragment_pair) {
+            const uint32_t col_base = fragment_pair * BLOCK_T;
+            float ov_reg_lo[REGS_PER_FRAGMENT];
+            float ov_reg_hi[REGS_PER_FRAGMENT];
+            float qh_reg_lo[REGS_PER_FRAGMENT];
+            float qh_reg_hi[REGS_PER_FRAGMENT];
+            tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_lo, 0,
+                                           OUTPUT_TMEM_COL + col_base);
+            tcgen05_ld<SHAPE::_16x256b, 4>(
+                ov_reg_hi, 0, OUTPUT_TMEM_COL + col_base + COLS_PER_FRAGMENT);
+            tcgen05_ld<SHAPE::_16x256b, 4>(qh_reg_lo, 0,
+                                           QH_TMEM_COL + col_base);
+            tcgen05_ld<SHAPE::_16x256b, 4>(
+                qh_reg_hi, 0, QH_TMEM_COL + col_base + COLS_PER_FRAGMENT);
+            tcgen05_wait_ld();
+#pragma unroll
+            for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS;
+                 ++step_pair) {
+              const uint32_t col_lo =
+                  col_base + step_pair * 8U + 2U * lane_col;
+              const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
+              const uint32_t reg_row0 = step_pair * 4U;
+              const uint32_t reg_row1 = reg_row0 + 2U;
+
+              store_bf162_pair_no_allocate_if(
+                  row_base_o_ptr + col_lo,
+                  combine_output_pair(
+                      ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U],
+                      qh_reg_lo[reg_row0], qh_reg_lo[reg_row0 + 1U],
+                      g_row_base, scale),
+                  row_base_o_ptr + col_hi,
+                  combine_output_pair(
+                      ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U],
+                      qh_reg_hi[reg_row0], qh_reg_hi[reg_row0 + 1U],
+                      g_row_base, scale),
+                  row_base_active);
+              store_bf162_pair_no_allocate_if(
+                  row_hi_o_ptr + col_lo,
+                  combine_output_pair(
+                      ov_reg_lo[reg_row1], ov_reg_lo[reg_row1 + 1U],
+                      qh_reg_lo[reg_row1], qh_reg_lo[reg_row1 + 1U], g_row_hi,
+                      scale),
+                  row_hi_o_ptr + col_hi,
+                  combine_output_pair(
+                      ov_reg_hi[reg_row1], ov_reg_hi[reg_row1 + 1U],
+                      qh_reg_hi[reg_row1], qh_reg_hi[reg_row1 + 1U], g_row_hi,
+                      scale),
+                  row_hi_active);
+            }
+          }
         }
       }
+
+      tcgen05_fence_before_thread_sync();
+      __syncthreads();
     }
   }
 
@@ -610,7 +639,32 @@ void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        SMEM_SIZE);
 
-  dim3 grid(VALUE_DIM / BLOCK_V, total_num_chunks_u, NUM_OUTPUT_HEADS);
+  if (total_num_chunks_u == 0U) {
+    return;
+  }
+
+  int active_blocks_per_sm = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active_blocks_per_sm, kernel,
+                                                NUM_THREADS, SMEM_SIZE);
+  int device_id = 0;
+  cudaGetDevice(&device_id);
+  cudaDeviceProp device_prop;
+  cudaGetDeviceProperties(&device_prop, device_id);
+  const uint32_t blocks_per_chunk = (VALUE_DIM / BLOCK_V) * NUM_QK_HEADS;
+  const uint32_t resident_blocks =
+      active_blocks_per_sm > 0
+          ? static_cast<uint32_t>(active_blocks_per_sm) *
+                static_cast<uint32_t>(device_prop.multiProcessorCount)
+          : blocks_per_chunk;
+  uint32_t persistent_grid_y = 2U * (resident_blocks / blocks_per_chunk);
+  if (persistent_grid_y == 0U) {
+    persistent_grid_y = 1U;
+  }
+  if (persistent_grid_y > total_num_chunks_u) {
+    persistent_grid_y = total_num_chunks_u;
+  }
+
+  dim3 grid(VALUE_DIM / BLOCK_V, persistent_grid_y, NUM_QK_HEADS);
   kernel<<<grid, NUM_THREADS, SMEM_SIZE>>>(
       q_tmap, k_tmap, v_tmap, h_tmap, g_cu_ptr, o_ptr, cu_seqlens_ptr,
       chunk_indices_ptr, total_num_chunks, static_cast<float>(scale));
