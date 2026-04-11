@@ -336,10 +336,10 @@ void h_kernel_cutlass(
                                        | (desc_encode(8 * 128) << 32ULL)   // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
 
-        mbarrier_wait(scaled_v_mbar_addr, h_parity);  // wait for (scaled) v_new store to tmem
-        profiler.stamp(WAIT_SCALED_V);
         mbarrier_wait(scaled_h_mbar_addr, h_parity);
         profiler.stamp(WAIT_SCALED_H);
+        mbarrier_wait(scaled_v_mbar_addr, h_parity);  // wait for (scaled) v_new store to tmem
+        profiler.stamp(WAIT_SCALED_V);
         tcgen05_fence_after_thread_sync();
 
         // k selects [V_dim/K_dim, 16] tile
