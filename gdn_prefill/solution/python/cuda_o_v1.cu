@@ -84,6 +84,8 @@ constexpr uint32_t SMEM_SIZE = (OFFSET_TMEM_ADDR + 4U + 1023U) & ~1023U;
 constexpr uint32_t MAX_COLUMNS = 512U;
 constexpr uint32_t OUTPUT_TMEM_COL = BLOCK_T;
 constexpr uint32_t QH_TMEM_COL = 3U * BLOCK_T;
+constexpr CUtensorMapL2promotion TMA_L2_PROMOTION =
+    CU_TENSOR_MAP_L2_PROMOTION_L2_256B;
 
 __device__ __forceinline__ uint32_t make_tile_layout_index(uint32_t tile_rows,
                                                            uint32_t row,
@@ -110,7 +112,7 @@ static CUtensorMap encode_tma(void *ptr, uint64_t outer, uint64_t rows,
   cuTensorMapEncodeTiled(
       &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr, globalDim,
       globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return tmap;
 }
@@ -133,7 +135,7 @@ static CUtensorMap encode_qk_tma(void *ptr, uint64_t num_tokens,
   cuTensorMapEncodeTiled(
       &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr, globalDim,
       globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return tmap;
 }
@@ -155,7 +157,7 @@ static CUtensorMap encode_v_tma(void *ptr, uint64_t num_tokens) {
   cuTensorMapEncodeTiled(
       &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr, globalDim,
       globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return tmap;
 }
