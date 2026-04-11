@@ -1,10 +1,4 @@
-# chunk_v7: chunk_v6 + two single-call kernel optimizations
-#
-# Over chunk_v6 (no cross-call state):
-# 1. No .item() sync — KKT reads total_num_chunks from GPU memory;
-#    inverse and o-kernels guard against excess blocks via total_chunks_ptr.
-# 2. Fused o-kernel — one block per (chunk, head) handles all BV tiles,
-#    loading q and k once instead of twice.
+# chunk_v7: chunk_v6 + fused o-kernel + no .item() sync
 
 import os
 from pathlib import Path
@@ -15,9 +9,8 @@ import triton.language as tl
 import tvm_ffi
 from torch import Tensor
 
-from .chunk_v6 import merge_16x16_to_64x64_inverse_kernel_v2, _unit_lower_inverse_16x16
+from .chunk_v6 import _unit_lower_inverse_16x16
 from .triton_v4 import (
-    chunk_fwd_kernel_o as chunk_fwd_kernel_o_2tile,
     chunk_gated_delta_rule_fwd_kernel_h,
     compute_chunks_kernel,
 )
@@ -28,20 +21,23 @@ CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
     name="gdn_prefill_cuda_v7",
-    cuda_files=[str(CURRENT_DIR / "cuda_kkt_v1.cu")],
+    cuda_files=[
+        str(CURRENT_DIR / "cuda_kkt_v1.cu"),
+    ],
     extra_cflags=["-O3"],
-    extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
+    extra_cuda_cflags=[
+        "-O3",
+        "--use_fast_math",
+        "-lineinfo",
+    ],
     extra_ldflags=["-lcuda"],
 )
+
 mod = tvm_ffi.load_module(lib_path)
 
 
-# ── Inverse kernel: chunk_v6's kernel + total_chunks_ptr guard ────────────────
-# The guard lets us use upper_bound_chunks as the grid size (avoiding .item())
-# without launching excess blocks that corrupt memory.
-
 @triton.jit
-def merge_inverse_v7(
+def merge_16x16_to_64x64_inverse_kernel_v2(
     k_ptr, v_ptr, w_ptr, u_ptr, A_ptr, Ai_ptr,
     beta_ptr, g_cu_ptr, cu_seqlens_ptr, chunk_indices_ptr,
     total_chunks_ptr,
@@ -51,7 +47,6 @@ def merge_inverse_v7(
     global_chunk_id = tl.program_id(0)
     head_id = tl.program_id(1)
 
-    # Guard: exit immediately if beyond actual total_chunks
     if global_chunk_id >= tl.load(total_chunks_ptr).to(tl.int32):
         return
 
@@ -64,8 +59,8 @@ def merge_inverse_v7(
     A_ptr  += bos * H * BT + head_id * BT
     Ai_ptr += bos * H * BT + head_id * BT
 
-    offs_t   = chunk_id * BT + tl.arange(0, 16)[:, None]
-    offsets  = offs_t * H * BT + tl.arange(0, 16)
+    offs_t  = chunk_id * BT + tl.arange(0, 16)[:, None]
+    offsets = offs_t * H * BT + tl.arange(0, 16)
 
     A_11 = tl.load(A_ptr + (offsets + (0  * H * BT + 0 )), mask=offs_t < seqlen - 0,  other=0.0)
     A_22 = tl.load(A_ptr + (offsets + (16 * H * BT + 16)), mask=offs_t < seqlen - 16, other=0.0)
@@ -112,12 +107,12 @@ def merge_inverse_v7(
     Ai_43 = Ai_43.to(tl.bfloat16).to(tl.float32)
     Ai_44 = Ai_44.to(tl.bfloat16).to(tl.float32)
 
-    k_ptr  += bos * Hg * K_dim + head_id // (H // Hg) * K_dim
-    v_ptr  += bos * H * V_dim + head_id * V_dim
-    w_ptr  += bos * H * K_dim + head_id * K_dim
-    u_ptr  += bos * H * V_dim + head_id * V_dim
-    beta_ptr  += bos * H + head_id
-    g_cu_ptr  += bos * H + head_id
+    k_ptr    += bos * Hg * K_dim + head_id // (H // Hg) * K_dim
+    v_ptr    += bos * H * V_dim + head_id * V_dim
+    w_ptr    += bos * H * K_dim + head_id * K_dim
+    u_ptr    += bos * H * V_dim + head_id * V_dim
+    beta_ptr += bos * H + head_id
+    g_cu_ptr += bos * H + head_id
 
     offs_16 = tl.arange(0, 16)
     offs_v  = tl.arange(0, V_dim)
@@ -152,13 +147,13 @@ def merge_inverse_v7(
     w0 = tl.dot((Ab_00 * eg0).to(k0.dtype), k0)
     Ab_10 = Ai_21 * b0; Ab_11 = Ai_22 * b1
     u1 = tl.dot(Ab_10.to(v0.dtype), v0); u1 = tl.dot(Ab_11.to(v1.dtype), v1, acc=u1)
-    w1 = tl.dot((Ab_10*eg0).to(k0.dtype), k0); w1 = tl.dot((Ab_11*eg1).to(k1.dtype), k1, acc=w1)
-    Ab_20 = Ai_31*b0; Ab_21 = Ai_32*b1; Ab_22 = Ai_33*b2
+    w1 = tl.dot((Ab_10 * eg0).to(k0.dtype), k0); w1 = tl.dot((Ab_11 * eg1).to(k1.dtype), k1, acc=w1)
+    Ab_20 = Ai_31 * b0; Ab_21 = Ai_32 * b1; Ab_22 = Ai_33 * b2
     u2 = tl.dot(Ab_20.to(v0.dtype), v0); u2 = tl.dot(Ab_21.to(v1.dtype), v1, acc=u2); u2 = tl.dot(Ab_22.to(v2.dtype), v2, acc=u2)
-    w2 = tl.dot((Ab_20*eg0).to(k0.dtype), k0); w2 = tl.dot((Ab_21*eg1).to(k1.dtype), k1, acc=w2); w2 = tl.dot((Ab_22*eg2).to(k2.dtype), k2, acc=w2)
-    Ab_30 = Ai_41*b0; Ab_31 = Ai_42*b1; Ab_32 = Ai_43*b2; Ab_33 = Ai_44*b3
+    w2 = tl.dot((Ab_20 * eg0).to(k0.dtype), k0); w2 = tl.dot((Ab_21 * eg1).to(k1.dtype), k1, acc=w2); w2 = tl.dot((Ab_22 * eg2).to(k2.dtype), k2, acc=w2)
+    Ab_30 = Ai_41 * b0; Ab_31 = Ai_42 * b1; Ab_32 = Ai_43 * b2; Ab_33 = Ai_44 * b3
     u3 = tl.dot(Ab_30.to(v0.dtype), v0); u3 = tl.dot(Ab_31.to(v1.dtype), v1, acc=u3); u3 = tl.dot(Ab_32.to(v2.dtype), v2, acc=u3); u3 = tl.dot(Ab_33.to(v3.dtype), v3, acc=u3)
-    w3 = tl.dot((Ab_30*eg0).to(k0.dtype), k0); w3 = tl.dot((Ab_31*eg1).to(k1.dtype), k1, acc=w3); w3 = tl.dot((Ab_32*eg2).to(k2.dtype), k2, acc=w3); w3 = tl.dot((Ab_33*eg3).to(k3.dtype), k3, acc=w3)
+    w3 = tl.dot((Ab_30 * eg0).to(k0.dtype), k0); w3 = tl.dot((Ab_31 * eg1).to(k1.dtype), k1, acc=w3); w3 = tl.dot((Ab_32 * eg2).to(k2.dtype), k2, acc=w3); w3 = tl.dot((Ab_33 * eg3).to(k3.dtype), k3, acc=w3)
 
     tl.store(u_ptr + (t0[:, None] * H * V_dim + offs_v[None, :]), u0, mask=m0[:, None])
     tl.store(u_ptr + (t1[:, None] * H * V_dim + offs_v[None, :]), u1, mask=m1[:, None])
@@ -170,10 +165,8 @@ def merge_inverse_v7(
     tl.store(w_ptr + (t3[:, None] * H * K_dim + offs_k[None, :]), w3, mask=m3[:, None])
 
 
-# ── Fused o-kernel: one block per (chunk, head), loops over BV tiles ──────────
-
 @triton.jit
-def chunk_fwd_kernel_o_fused(
+def chunk_fwd_kernel_o(
     q_ptr, k_ptr, v_ptr, h_ptr, g_cu_ptr, o_ptr,
     cu_seqlens_ptr, chunk_indices_ptr, total_chunks_ptr, scale,
     H: tl.constexpr, Hg: tl.constexpr, K_dim: tl.constexpr,
@@ -191,31 +184,27 @@ def chunk_fwd_kernel_o_fused(
     eos      = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen   = eos - bos
 
-    q_ptr   += (bos * Hg + head_id // (H // Hg)) * K_dim
-    k_ptr   += (bos * Hg + head_id // (H // Hg)) * K_dim
-    v_ptr   += (bos * H + head_id) * V_dim
-    o_ptr   += (bos * H + head_id) * V_dim
-    h_ptr   += (global_chunk_id * H + head_id) * V_dim * K_dim
+    q_ptr    += (bos * Hg + head_id // (H // Hg)) * K_dim
+    k_ptr    += (bos * Hg + head_id // (H // Hg)) * K_dim
+    v_ptr    += (bos * H + head_id) * V_dim
+    o_ptr    += (bos * H + head_id) * V_dim
+    h_ptr    += (global_chunk_id * H + head_id) * V_dim * K_dim
     g_cu_ptr += bos * H + head_id
 
-    offs_t   = chunk_id * BT + tl.arange(0, BT)[:, None]
-    offs_k   = tl.arange(0, K_dim)[None, :]
-    mask_t   = offs_t < seqlen
+    offs_t  = chunk_id * BT + tl.arange(0, BT)[:, None]
+    offs_k  = tl.arange(0, K_dim)[None, :]
+    mask_t  = offs_t < seqlen
 
-    # Load q, k, g_cu once — shared across all BV tiles
     q    = tl.load(q_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0)
     k    = tl.load(k_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0)
     t_1d = chunk_id * BT + tl.arange(0, BT)
     g_cu = tl.load(g_cu_ptr + t_1d * H, mask=t_1d < seqlen, other=0.0)
 
-    # Compute A = q@k.T once — reused for all BV tiles
-    A      = tl.dot(q, k.T) * tl.exp(g_cu[:, None] - g_cu[None, :])
-    A      = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], A, 0.0)
-    exp_g  = tl.exp(g_cu)
+    A     = tl.dot(q, k.T) * tl.exp(g_cu[:, None] - g_cu[None, :])
+    A     = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], A, 0.0)
+    exp_g = tl.exp(g_cu)
 
-    # Loop over BV tiles
-    NV: tl.constexpr = V_dim // BV
-    for i_v in tl.static_range(NV):
+    for i_v in tl.static_range(V_dim // BV):
         offs_v       = i_v * BV + tl.arange(0, BV)[:, None]
         offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
         h = tl.load(h_ptr + (offs_v * K_dim + offs_k))
@@ -225,77 +214,84 @@ def chunk_fwd_kernel_o_fused(
         tl.store(o_ptr + (offs_t * (H * V_dim) + offs_v_block), o, mask=mask_t)
 
 
-# ── Run ────────────────────────────────────────────────────────────────────────
-
 _FLAG = None
 
 
 def run(
-    q: Tensor, k: Tensor, v: Tensor, state: Tensor,
-    A_log: Tensor, a: Tensor, dt_bias: Tensor, b: Tensor,
-    cu_seqlens: Tensor, scale: float,
+    q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
+    k: Tensor,  # (total_seqlen, num_k_heads, head_dim)
+    v: Tensor,  # (total_seqlen, num_v_heads, head_dim)
+    state: Tensor,  # (num_seqs, num_v_heads, head_dim, head_dim)
+    A_log: Tensor,  # (num_v_heads)
+    a: Tensor,  # (total_seqlen, num_v_heads)
+    dt_bias: Tensor,  # (num_v_heads)
+    b: Tensor,  # (total_seqlen, num_v_heads)
+    cu_seqlens: Tensor,  # (num_seqlens + 1)
+    scale: float,
 ):
     T, Hg, K_dim = k.shape
     N, H, V_dim, _ = state.shape
-    BT  = 64
-    ub  = (N - 1) + triton.cdiv(T - (N - 1), BT)
-    dev = k.device
 
-    # Chunk metadata — no .item() sync: all grids use upper_bound or GPU pointer
+    BT = 64
+
     global _FLAG
     if _FLAG is None:
         _FLAG = q.new_zeros(1, dtype=torch.int32)
+
+    upper_bound_chunks = (N - 1) + triton.cdiv(T - (N - 1), BT)
     num_chunks    = q.new_empty(N, dtype=torch.int32)
     chunk_offsets = q.new_empty(N + 1, dtype=torch.int32)
-    chunk_indices = q.new_zeros((ub, 2), dtype=torch.int32)  # zero-init: safe for KKT excess iters
+    chunk_indices = q.new_zeros((upper_bound_chunks, 2), dtype=torch.int32)
     compute_chunks_kernel[(N,)](
-        cu_seqlens, num_chunks, chunk_offsets, chunk_indices, _FLAG,
-        N=N, BT=BT, BLOCK_SIZE=triton.next_power_of_2(N),
+        cu_seqlens,
+        num_chunks,
+        chunk_offsets,
+        chunk_indices,
+        _FLAG,
+        N=N,
+        BT=BT,
+        BLOCK_SIZE=triton.next_power_of_2(N),
     )
-    # total_chunks_ptr: GPU pointer to chunk_offsets[N] — read by KKT, inverse, o-kernel
-    # instead of .item() sync.  Stream ordering ensures compute_chunks finishes first.
     total_chunks_ptr = chunk_offsets[N:]
 
-    # Scratch tensors
-    g_cu        = torch.empty_like(a, dtype=torch.float32)
-    beta        = torch.empty_like(b, dtype=torch.float32)
-    A           = torch.empty(T, H, BT, device=dev, dtype=torch.float32)
-    Ai          = torch.empty_like(A, dtype=k.dtype)
-    u           = torch.empty_like(v)
-    w           = k.new_empty(T, H, K_dim)
-    h           = k.new_empty(ub, H, V_dim, K_dim)   # sized to upper_bound
-    final_state = torch.empty_like(state, dtype=torch.float32)
-    v_new       = torch.empty_like(u)
-    o           = torch.empty_like(v)
-
-    # KKT — reads total_num_chunks from GPU (no .item())
+    g_cu = torch.empty_like(a, dtype=torch.float32)
+    beta = torch.empty_like(b, dtype=torch.float32)
+    A    = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
     mod.kkt_v1(k, A_log, a, dt_bias, b, g_cu, beta, A,
                cu_seqlens, chunk_indices, total_chunks_ptr)
 
-    # Inverse — guarded via total_chunks_ptr (excess blocks exit immediately)
-    merge_inverse_v7[(ub, H)](
+    Ai    = torch.empty_like(A, dtype=k.dtype)
+    u     = torch.empty_like(v)
+    w     = k.new_empty(T, H, K_dim)
+    merge_16x16_to_64x64_inverse_kernel_v2[(upper_bound_chunks, H)](
         k, v, w, u, A, Ai, beta, g_cu,
         cu_seqlens, chunk_indices, total_chunks_ptr,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT,
-        DOT_PRECISION="tf32", num_warps=2,
+        DOT_PRECISION="tf32",
+        num_warps=2,
     )
 
-    # H-recurrence
-    h_grid = (triton.cdiv(V_dim, 16), N * H)
-    chunk_gated_delta_rule_fwd_kernel_h[h_grid](
+    h           = k.new_empty(upper_bound_chunks, H, V_dim, K_dim)
+    final_state = torch.empty_like(state, dtype=torch.float32)
+    v_new       = torch.empty_like(u)
+
+    BV   = 16
+    grid = (triton.cdiv(V_dim, BV), N * H)
+    chunk_gated_delta_rule_fwd_kernel_h[grid](
         k, u, w, v_new, g_cu, h, state, final_state,
         cu_seqlens, chunk_offsets,
-        H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, BV=16,
+        H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, BV=BV,
         num_warps=4, num_stages=3,
     )
 
-    # O-kernel — fused for large chunk counts, 2-tile for small
+    o  = torch.empty_like(v)
     BV = 64
-    if True:   # always try fused; guard handles any excess blocks
-        chunk_fwd_kernel_o_fused[(ub, H)](
-            q, k, v_new, h, g_cu, o, cu_seqlens, chunk_indices,
-            total_chunks_ptr, scale=scale,
-            H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, BV=BV, num_warps=8,
-        )
+    chunk_fwd_kernel_o[(upper_bound_chunks, H)](
+        q, k, v_new, h, g_cu, o,
+        cu_seqlens, chunk_indices, total_chunks_ptr,
+        scale=scale,
+        H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, BV=BV,
+        num_warps=8,
+    )
 
     return o, final_state
