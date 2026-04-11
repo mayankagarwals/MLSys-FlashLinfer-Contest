@@ -5,11 +5,11 @@ from pathlib import Path
 
 import torch
 import triton
+import triton.language as tl
 import tvm_ffi
 from torch import Tensor
 
 from .chunk_v6 import (
-    chunk_fwd_kernel_o,
     compute_chunks_kernel,
     merge_16x16_to_64x64_inverse_kernel_v2,
 )
@@ -34,6 +34,86 @@ lib_path = tvm_ffi.cpp.build(
 )
 
 mod = tvm_ffi.load_module(lib_path)
+
+
+@triton.jit
+def chunk_fwd_kernel_o(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    h_ptr,
+    g_cu_ptr,
+    o_ptr,
+    cu_seqlens_ptr,
+    chunk_indices_ptr,
+    scale,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K_dim: tl.constexpr,
+    V_dim: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    global_chunk_id = tl.program_id(1)
+    head_id = tl.program_id(2)
+
+    seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
+    chunk_id = tl.load(chunk_indices_ptr + (global_chunk_id * 2 + 1)).to(tl.int32)
+
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
+    seqlen = eos - bos
+
+    # offset calculation
+    q_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
+    k_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
+    v_ptr += (
+        (global_chunk_id - chunk_id) * BT * H + head_id
+    ) * V_dim  # this is changed
+    o_ptr += (bos * H + head_id) * V_dim
+    h_ptr += (global_chunk_id * H + head_id) * V_dim * K_dim
+    g_cu_ptr += bos * H + head_id
+
+    offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
+    offs_k = tl.arange(0, K_dim)[None, :]
+    offs_v = i_v * BV + tl.arange(0, BV)[:, None]
+    offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
+    mask_t = offs_t < seqlen
+
+    q = tl.load(
+        q_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0
+    )  # [BT, K_dim]
+    k = tl.load(
+        k_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0
+    )  # [BT, K_dim]
+    h = tl.load(h_ptr + (offs_v * K_dim + offs_k))  # [BV, K_dim]
+    offs_t_1d = chunk_id * BT + tl.arange(0, BT)
+    g_cu = tl.load(g_cu_ptr + offs_t_1d * H, mask=offs_t_1d < seqlen, other=0.0)
+
+    o = tl.dot(q, h.T)  # [BT, BV]
+    A = tl.dot(q, k.T)  # [BT, BT]
+
+    # apply g
+    o = o * tl.exp(g_cu)[:, None]
+    A = A * tl.exp(g_cu[:, None] - g_cu[None, :])
+
+    # apply causal mask
+    causal_offs_t = tl.arange(0, BT)
+    mask_A = causal_offs_t[:, None] >= causal_offs_t[None, :]
+    A = tl.where(mask_A, A, 0.0)
+    v = tl.load(
+        v_ptr + (offs_t * (H * V_dim) + offs_v_block),
+        mask=mask_t,
+        other=0.0,
+    )
+
+    o = tl.dot(A.to(v.dtype), v, acc=o) * scale
+    tl.store(
+        o_ptr + (offs_t * (H * V_dim) + offs_v_block),
+        o,
+        mask=mask_t,
+    )
 
 
 def export_trace(profiler: Tensor, path: Path):
@@ -206,9 +286,10 @@ def run(
         num_warps=2,
     )
 
+    # padded v_new so we can use TMA store for v_new in H kernel
     h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
     final_state = torch.empty_like(state, dtype=torch.float32)
-    v_new = torch.empty_like(u)
+    v_new = q.new_empty(total_num_chunks, BT, H, V_dim)
 
     # uncomment to enable profiling
     profiler = None
