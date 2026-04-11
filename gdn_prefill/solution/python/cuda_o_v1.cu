@@ -55,24 +55,28 @@ constexpr uint32_t V_MMA_SBO = SWIZZLE_WIDTH * 8U * sizeof(nv_bfloat16);
 constexpr uint32_t V_MMA_LBO = (BLOCK_T / 8U) * V_MMA_SBO;
 constexpr uint32_t BYTES_ONE_MMA_MMAJOR =
     MMA_K * SWIZZLE_WIDTH * sizeof(nv_bfloat16);
+constexpr uint32_t QK_STAGE_COUNT = 2U;
 
 //// Shared Memory Offsets in Bytes
 constexpr uint32_t Q_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
 constexpr uint32_t K_SMEM_SIZE = BLOCK_T * HEAD_DIM * sizeof(nv_bfloat16);
+constexpr uint32_t Q_SMEM_BYTES = QK_STAGE_COUNT * Q_SMEM_SIZE;
+constexpr uint32_t K_SMEM_BYTES = QK_STAGE_COUNT * K_SMEM_SIZE;
 constexpr uint32_t V_SMEM_SIZE = BLOCK_V * BLOCK_T * sizeof(nv_bfloat16);
 constexpr uint32_t H_SMEM_SIZE = BLOCK_V * HEAD_DIM * sizeof(nv_bfloat16);
 constexpr uint32_t ATTN_SMEM_SIZE = BLOCK_T * BLOCK_T * sizeof(nv_bfloat16);
 constexpr uint32_t OUTPUT_SMEM_SIZE = 0U;
 constexpr uint32_t G_SMEM_SIZE = BLOCK_T * sizeof(float);
+constexpr uint32_t QK_TMA_BARRIER_BYTES = QK_STAGE_COUNT * 8U;
 constexpr uint32_t OFFSET_Q = 0U;
-constexpr uint32_t OFFSET_K = OFFSET_Q + Q_SMEM_SIZE;
-constexpr uint32_t OFFSET_V = OFFSET_K + K_SMEM_SIZE;
+constexpr uint32_t OFFSET_K = OFFSET_Q + Q_SMEM_BYTES;
+constexpr uint32_t OFFSET_V = OFFSET_K + K_SMEM_BYTES;
 constexpr uint32_t OFFSET_H = OFFSET_V + V_SMEM_SIZE;
 constexpr uint32_t OFFSET_ATTN = OFFSET_H + H_SMEM_SIZE;
 constexpr uint32_t OFFSET_OUTPUT = OFFSET_ATTN + ATTN_SMEM_SIZE;
 constexpr uint32_t OFFSET_G = OFFSET_OUTPUT + OUTPUT_SMEM_SIZE;
 constexpr uint32_t OFFSET_QK_TMA_BAR = OFFSET_G + G_SMEM_SIZE;
-constexpr uint32_t OFFSET_V_TMA_BAR = OFFSET_QK_TMA_BAR + 8U;
+constexpr uint32_t OFFSET_V_TMA_BAR = OFFSET_QK_TMA_BAR + QK_TMA_BARRIER_BYTES;
 constexpr uint32_t OFFSET_H_TMA_BAR = OFFSET_V_TMA_BAR + 8U;
 constexpr uint32_t OFFSET_MMA_BAR = OFFSET_H_TMA_BAR + 8U;
 constexpr uint32_t OFFSET_ATTN_READY_BAR = OFFSET_MMA_BAR + 8U;
@@ -260,6 +264,17 @@ __device__ __forceinline__ __nv_bfloat162 combine_output_pair(
                                scale * __fmaf_rn(qh_1, g_row, ov_1));
 }
 
+__device__ __forceinline__ void tma_load_qk_stage(
+    uint32_t q_stage_smem, uint32_t k_stage_smem, const CUtensorMap *q_tmap,
+    const CUtensorMap *k_tmap, int32_t chunk_start_i32, uint32_t q_head_id,
+    uint32_t k_head_id, uint32_t qk_tma_barrier) {
+  tma_load_4d(q_stage_smem, q_tmap, 0, chunk_start_i32, 0, q_head_id,
+              qk_tma_barrier);
+  tma_load_4d(k_stage_smem, k_tmap, 0, chunk_start_i32, 0, k_head_id,
+              qk_tma_barrier);
+  mbarrier_arrive_expect_tx(qk_tma_barrier, Q_SMEM_SIZE + K_SMEM_SIZE);
+}
+
 __device__ __forceinline__ void store_bf162_no_allocate(nv_bfloat16 *ptr,
                                                         __nv_bfloat162 value) {
   const uint32_t data = reinterpret_cast<const uint32_t &>(value);
@@ -309,7 +324,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
   const uint32_t h_smem = smem + OFFSET_H;
   const uint32_t attn_smem = smem + OFFSET_ATTN;
   const uint32_t g_smem = smem + OFFSET_G;
-  const uint32_t qk_tma_barrier = smem + OFFSET_QK_TMA_BAR;
+  const uint32_t qk_tma_barriers = smem + OFFSET_QK_TMA_BAR;
   const uint32_t v_tma_barrier = smem + OFFSET_V_TMA_BAR;
   const uint32_t h_tma_barrier = smem + OFFSET_H_TMA_BAR;
   const uint32_t mma_barrier = smem + OFFSET_MMA_BAR;
@@ -322,7 +337,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
 
   if (warp_id == TMA_WARP) {
     if (elect_sync()) {
-      mbarrier_init(qk_tma_barrier, 1);
+      mbarrier_init(qk_tma_barriers + 0U * 8U, 1);
+      mbarrier_init(qk_tma_barriers + 1U * 8U, 1);
       mbarrier_init(v_tma_barrier, 1);
       mbarrier_init(h_tma_barrier, 1);
       mbarrier_init(mma_barrier, 1);
@@ -356,77 +372,140 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
     lane_col = lane_id % LANES_PER_ROW_GROUP;
   }
 
-  for (uint32_t global_chunk_id = blockIdx.y;
-       global_chunk_id < static_cast<uint32_t>(total_num_chunks);
-       global_chunk_id += gridDim.y) {
-    const int2 chunk_meta =
-        reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
-    const uint32_t seq_id = static_cast<uint32_t>(chunk_meta.x);
-    const uint32_t chunk_id = static_cast<uint32_t>(chunk_meta.y);
-    const int64_t bos = cu_seqlens_ptr[seq_id];
-    const int64_t eos = cu_seqlens_ptr[seq_id + 1];
-    const int64_t chunk_start = bos + static_cast<int64_t>(chunk_id) * BLOCK_T;
-    const int64_t remaining = eos - chunk_start;
-    const uint32_t chunk_len =
-        remaining <= 0
-            ? 0U
-            : static_cast<uint32_t>(remaining < static_cast<int64_t>(BLOCK_T)
-                                        ? remaining
-                                        : static_cast<int64_t>(BLOCK_T));
-    const int32_t chunk_start_i32 = static_cast<int32_t>(chunk_start);
-    const bool full_chunk = chunk_len == BLOCK_T;
-    const uint32_t row_base_limit = row_base < chunk_len ? row_base + 1U : 0U;
-    const uint32_t row_hi_limit = row_hi < chunk_len ? row_hi + 1U : 0U;
-    const uint32_t qk_phase =
-        ((global_chunk_id - blockIdx.y) / gridDim.y) & 1U;
+  const uint32_t total_num_chunks_u = static_cast<uint32_t>(total_num_chunks);
 
-    if (warp_id == TMA_WARP && elect_sync()) {
-      tma_load_4d(q_smem, &q_tmap, 0, chunk_start_i32, 0, q_head_id,
-                  qk_tma_barrier);
-      tma_load_4d(k_smem, &k_tmap, 0, chunk_start_i32, 0, k_head_id,
-                  qk_tma_barrier);
-      mbarrier_arrive_expect_tx(qk_tma_barrier, Q_SMEM_SIZE + K_SMEM_SIZE);
-    }
-    if (warp_id == MMA_WARP && elect_sync()) {
-      mbarrier_wait(qk_tma_barrier, TMA_PHASE ^ qk_phase);
-      tcgen05_fence_after_thread_sync();
-      mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_smem, k_smem);
-      tcgen05_commit(mma_barrier);
+  if (warp_id == TMA_WARP) {
+    if (blockIdx.y < total_num_chunks_u) {
+      const int2 first_chunk_meta =
+          reinterpret_cast<const int2 *>(chunk_indices_ptr)[blockIdx.y];
+      const uint32_t first_seq_id = static_cast<uint32_t>(first_chunk_meta.x);
+      const uint32_t first_chunk_id = static_cast<uint32_t>(first_chunk_meta.y);
+      const int32_t first_chunk_start_i32 = static_cast<int32_t>(
+          cu_seqlens_ptr[first_seq_id] +
+          static_cast<int64_t>(first_chunk_id) * static_cast<int64_t>(BLOCK_T));
+      if (elect_sync()) {
+        tma_load_qk_stage(q_smem, k_smem, &q_tmap, &k_tmap, first_chunk_start_i32,
+                          q_head_id, k_head_id, qk_tma_barriers);
+      }
     }
 
-    if (cuda_warp) {
-      mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
-      tcgen05_fence_after_thread_sync();
-    }
+    for (uint32_t global_chunk_id = blockIdx.y, chunk_iter = 0U;
+         global_chunk_id < total_num_chunks_u;
+         global_chunk_id += gridDim.y, ++chunk_iter) {
+      const int2 chunk_meta =
+          reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
+      const uint32_t seq_id = static_cast<uint32_t>(chunk_meta.x);
+      const uint32_t chunk_id = static_cast<uint32_t>(chunk_meta.y);
+      const int32_t chunk_start_i32 = static_cast<int32_t>(
+          cu_seqlens_ptr[seq_id] +
+          static_cast<int64_t>(chunk_id) * static_cast<int64_t>(BLOCK_T));
+      const uint32_t qk_phase = chunk_iter & 1U;
+      const uint32_t next_global_chunk_id = global_chunk_id + gridDim.y;
+      const uint32_t next_qk_phase = qk_phase ^ 1U;
+      const uint32_t next_qk_tma_barrier = qk_tma_barriers + next_qk_phase * 8U;
+
+      if (elect_sync() && next_global_chunk_id < total_num_chunks_u) {
+        const int2 next_chunk_meta =
+            reinterpret_cast<const int2 *>(chunk_indices_ptr)[next_global_chunk_id];
+        const uint32_t next_seq_id = static_cast<uint32_t>(next_chunk_meta.x);
+        const uint32_t next_chunk_id = static_cast<uint32_t>(next_chunk_meta.y);
+        const int32_t next_chunk_start_i32 = static_cast<int32_t>(
+            cu_seqlens_ptr[next_seq_id] +
+            static_cast<int64_t>(next_chunk_id) * static_cast<int64_t>(BLOCK_T));
+        tma_load_qk_stage(q_smem + next_qk_phase * Q_SMEM_SIZE,
+                          k_smem + next_qk_phase * K_SMEM_SIZE, &q_tmap,
+                          &k_tmap, next_chunk_start_i32, q_head_id, k_head_id,
+                          next_qk_tma_barrier);
+      }
 
 #pragma unroll
-    for (uint32_t head_offset = 0; head_offset < HEADS_PER_QK_HEAD;
-         ++head_offset) {
-      const uint32_t head_phase = head_offset & 1U;
-      const uint32_t head_id = head_id_base + head_offset;
-      const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
+      for (uint32_t head_offset = 0; head_offset < HEADS_PER_QK_HEAD;
+           ++head_offset) {
+        const uint32_t head_id = head_id_base + head_offset;
+        const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
 
-      if (warp_id == TMA_WARP && elect_sync()) {
-        tma_load_4d(v_smem, &v_tmap, 0, chunk_start_i32, v_tile, head_id,
-                    v_tma_barrier);
-        tma_load_4d(h_smem, &h_tmap, 0, v_start, 0, h_outer, h_tma_barrier);
-        mbarrier_arrive_expect_tx(v_tma_barrier, V_SMEM_SIZE);
-        mbarrier_arrive_expect_tx(h_tma_barrier, H_SMEM_SIZE);
+        if (elect_sync()) {
+          tma_load_4d(v_smem, &v_tmap, 0, chunk_start_i32, v_tile, head_id,
+                      v_tma_barrier);
+          tma_load_4d(h_smem, &h_tmap, 0, v_start, 0, h_outer, h_tma_barrier);
+          mbarrier_arrive_expect_tx(v_tma_barrier, V_SMEM_SIZE);
+          mbarrier_arrive_expect_tx(h_tma_barrier, H_SMEM_SIZE);
+        }
+
+        tcgen05_fence_before_thread_sync();
+        __syncthreads();
+      }
+    }
+  } else if (warp_id == MMA_WARP) {
+    for (uint32_t global_chunk_id = blockIdx.y, chunk_iter = 0U;
+         global_chunk_id < total_num_chunks_u;
+         global_chunk_id += gridDim.y, ++chunk_iter) {
+      const uint32_t qk_phase = chunk_iter & 1U;
+      const uint32_t q_stage_smem = q_smem + qk_phase * Q_SMEM_SIZE;
+      const uint32_t k_stage_smem = k_smem + qk_phase * K_SMEM_SIZE;
+      const uint32_t qk_tma_barrier = qk_tma_barriers + qk_phase * 8U;
+      const uint32_t qk_tma_stage_phase = (chunk_iter / QK_STAGE_COUNT) & 1U;
+
+      if (elect_sync()) {
+        mbarrier_wait(qk_tma_barrier, TMA_PHASE ^ qk_tma_stage_phase);
+        tcgen05_fence_after_thread_sync();
+        mma_swizzled<NUM_SWIZZLE_ATOMS>(0, q_stage_smem, k_stage_smem);
+        tcgen05_commit(mma_barrier);
       }
 
-      if (warp_id == MMA_WARP && elect_sync()) {
-        mbarrier_wait(h_tma_barrier, head_phase);
-        tcgen05_fence_after_thread_sync();
-        mma_swizzled_qh_64x128(QH_TMEM_COL, q_smem, h_smem);
-        tcgen05_commit(qh_mma_barrier);
-        mbarrier_wait(v_tma_barrier, head_phase);
-        mbarrier_wait(attn_ready_barrier, head_phase);
-        tcgen05_fence_after_thread_sync();
-        mma_attn_v_mmajor_64x128(OUTPUT_TMEM_COL, attn_smem, v_smem);
-        tcgen05_commit(ov_mma_barrier);
-      }
+#pragma unroll
+      for (uint32_t head_offset = 0; head_offset < HEADS_PER_QK_HEAD;
+           ++head_offset) {
+        const uint32_t head_phase = head_offset & 1U;
 
-      if (cuda_warp) {
+        if (elect_sync()) {
+          mbarrier_wait(h_tma_barrier, head_phase);
+          tcgen05_fence_after_thread_sync();
+          mma_swizzled_qh_64x128(QH_TMEM_COL, q_stage_smem, h_smem);
+          tcgen05_commit(qh_mma_barrier);
+          mbarrier_wait(v_tma_barrier, head_phase);
+          mbarrier_wait(attn_ready_barrier, head_phase);
+          tcgen05_fence_after_thread_sync();
+          mma_attn_v_mmajor_64x128(OUTPUT_TMEM_COL, attn_smem, v_smem);
+          tcgen05_commit(ov_mma_barrier);
+        }
+
+        tcgen05_fence_before_thread_sync();
+        __syncthreads();
+      }
+    }
+  } else {
+    for (uint32_t global_chunk_id = blockIdx.y, chunk_iter = 0U;
+         global_chunk_id < total_num_chunks_u;
+         global_chunk_id += gridDim.y, ++chunk_iter) {
+      const int2 chunk_meta =
+          reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
+      const uint32_t seq_id = static_cast<uint32_t>(chunk_meta.x);
+      const uint32_t chunk_id = static_cast<uint32_t>(chunk_meta.y);
+      const int64_t bos = cu_seqlens_ptr[seq_id];
+      const int64_t eos = cu_seqlens_ptr[seq_id + 1];
+      const int64_t chunk_start = bos + static_cast<int64_t>(chunk_id) * BLOCK_T;
+      const int64_t remaining = eos - chunk_start;
+      const uint32_t chunk_len =
+          remaining <= 0
+              ? 0U
+              : static_cast<uint32_t>(remaining < static_cast<int64_t>(BLOCK_T)
+                                          ? remaining
+                                          : static_cast<int64_t>(BLOCK_T));
+      const bool full_chunk = chunk_len == BLOCK_T;
+      const uint32_t row_base_limit = row_base < chunk_len ? row_base + 1U : 0U;
+      const uint32_t row_hi_limit = row_hi < chunk_len ? row_hi + 1U : 0U;
+      const uint32_t qk_phase = chunk_iter & 1U;
+
+      mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
+      tcgen05_fence_after_thread_sync();
+
+#pragma unroll
+      for (uint32_t head_offset = 0; head_offset < HEADS_PER_QK_HEAD;
+           ++head_offset) {
+        const uint32_t head_phase = head_offset & 1U;
+        const uint32_t head_id = head_id_base + head_offset;
+
         for (uint32_t i = tid; i < BLOCK_T; i += NUM_CUDA_WARPS * WARP_SIZE) {
           float g_value = 0.0f;
           if (i < chunk_len) {
@@ -597,10 +676,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
             }
           }
         }
-      }
 
-      tcgen05_fence_before_thread_sync();
-      __syncthreads();
+        tcgen05_fence_before_thread_sync();
+        __syncthreads();
+      }
     }
   }
 
@@ -660,6 +739,8 @@ void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
   if (persistent_grid_y == 0U) {
     persistent_grid_y = 1U;
   }
+  persistent_grid_y = persistent_grid_y > 1U ? (persistent_grid_y + 1U) / 2U
+                                             : 1U;
   if (persistent_grid_y > total_num_chunks_u) {
     persistent_grid_y = total_num_chunks_u;
   }
