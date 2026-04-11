@@ -76,17 +76,26 @@ constexpr uint32_t V_size = BT * V_dim * sizeof(nv_bfloat16);
 constexpr uint32_t K_size = BT * K_dim * sizeof(nv_bfloat16);
 constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
 
+constexpr uint32_t H_fp32_size = V_dim * K_dim * sizeof(float);
 constexpr uint32_t v_scale_size = BT * sizeof(float);
 
 constexpr int NUM_WARPS = 4 + 4 + 2;
 constexpr int WARP_SIZE = 32;
 constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
+__device__ inline
+void lds_f32x4(float *data, uint32_t addr) {
+  asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];"
+              : "=f"(data[0]), "=f"(data[1]), "=f"(data[2]), "=f"(data[3])
+              : "r"(addr));
+};
+
 enum ProfilerTag {
   START = 0,
   SETUP,
   WAIT_MMA,
   WAIT_TMA,
+  WAIT_H0,
   WAIT_H,
   WAIT_SCALED_H,
   WAIT_SCALED_V,
@@ -152,10 +161,10 @@ void h_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,      // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap W_tmap,      // [total_T, H, K_dim]
+  const __grid_constant__ CUtensorMap H0_tmap,     // [N, H, V_dim, K_dim]
         nv_bfloat16 *V_new_ptr,                    // [total_T, H, V_dim]
   const float       *g_cu_ptr,                     // [total_T, H]
         nv_bfloat16 *h_ptr,                        // [total_num_chunks, H, V_dim, K_dim]
-  const float       *h0_ptr,                       // [N, H, V_dim, K_dim]
         float       *ht_ptr,                       // [N, H, V_dim, K_dim]
   const int64_t     *cu_seqlens_ptr,               // [N+1]
   const int32_t     *chunk_offsets_ptr,            // [N]
@@ -180,14 +189,16 @@ void h_kernel_cutlass(
   // set up smem
   extern __shared__ __align__(1024) char smem_ptr[];
   const uint32_t smem = __cvta_generic_to_shared(smem_ptr);
-  const uint32_t V_new_smem = smem + NUM_STAGES * STAGE_SIZE;
+  const uint32_t H0_f32_smem = smem + NUM_STAGES * STAGE_SIZE;
+  const uint32_t V_new_smem = H0_f32_smem + H_fp32_size;
 
   const uint32_t v_scale_smem = V_new_smem + V_size;
   float *v_scale_smem_ptr = reinterpret_cast<float *>(smem_ptr + (v_scale_smem - smem));
 
   const uint32_t tma_mbar_addr      = v_scale_smem + v_scale_size;
   const uint32_t mma_mbar_addr      = tma_mbar_addr + NUM_STAGES * 8;
-  const uint32_t h_mbar_addr        = mma_mbar_addr + NUM_STAGES * 8;
+  const uint32_t h0_mbar_addr       = mma_mbar_addr + NUM_STAGES * 8;
+  const uint32_t h_mbar_addr        = h0_mbar_addr + 8;
   const uint32_t scaled_h_mbar_addr = h_mbar_addr + 8;
   const uint32_t scaled_v_mbar_addr = scaled_h_mbar_addr + 8;
   const uint32_t wh_mbar_addr       = scaled_v_mbar_addr + 8;
@@ -211,6 +222,7 @@ void h_kernel_cutlass(
         mbarrier_init(tma_mbar_addr + i * 8, 1);
         mbarrier_init(mma_mbar_addr + i * 8, 1);
       }
+      mbarrier_init(h0_mbar_addr, 1);
       mbarrier_init(h_mbar_addr, WARP_SIZE * 4);
       mbarrier_init(scaled_h_mbar_addr, WARP_SIZE * 4);
       mbarrier_init(scaled_v_mbar_addr, WARP_SIZE * 4);
@@ -222,9 +234,10 @@ void h_kernel_cutlass(
   else if (warp_id == 1) {
     // prefetch TMA descriptor
     if (elect_sync()) {
-      prefetch_tensormap(&K_tmap);
-      prefetch_tensormap(&V_tmap);
+      prefetch_tensormap(&H0_tmap);
       prefetch_tensormap(&W_tmap);
+      prefetch_tensormap(&V_tmap);
+      prefetch_tensormap(&K_tmap);
     }
   }
   __syncthreads();
@@ -237,6 +250,11 @@ void h_kernel_cutlass(
       int parity = 1;
 
       const int k_head_id = head_id / (H / Hg);
+
+      // natural shape:  [N, H, V_dim, K_dim]
+      // permuted shape: [N, H, K_dim/32, V_dim, 32]
+      tma_load_5d(H0_f32_smem, &H0_tmap, 0, 0, 0, head_id, seq_id, h0_mbar_addr, EVICT_FIRST);
+      mbarrier_arrive_expect_tx(h0_mbar_addr, H_fp32_size);
 
       for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
         // compute addresses
@@ -364,7 +382,13 @@ void h_kernel_cutlass(
       h_scale = warp_uniform(h_scale);
 
       // for chunk_id > 0, wait for vk MMA to update H
-      if (chunk_id > 0) {
+      if (chunk_id == 0) {
+        if (warp_id_ == 0)
+          mbarrier_wait(h0_mbar_addr, 0);
+        bar_sync<1>(128);
+        if (elect_sync()) profiler.stamp(WAIT_H0);
+      }
+      else {
         if (warp_id_ == 0)
           mbarrier_wait(vk_mbar_addr, vk_parity);
         bar_sync<1>(128);
@@ -376,25 +400,30 @@ void h_kernel_cutlass(
       // prepare H input for wh MMA to unblock it ASAP
       // collectively, 4 warps represent H[V_dim, K_dim]
       // each thread processes 1 row
-      for (int i = 0; i < K_dim / 16; i++) {
-        float h_f32[16];
-        uint32_t tmp[8];
+      for (int i = 0; i < K_dim / 32; i++) {
+        float h_f32[32];
+        uint32_t tmp[16];
 
         if (chunk_id == 0) {
-          // load H0 from gmem for 1st chunk
-          const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
-          ldg_u32x8_fast(h_f32 + 0, h0_ptr + (offset + i * 16 + 0));
-          ldg_u32x8_fast(h_f32 + 8, h0_ptr + (offset + i * 16 + 8));
+          // load H0 from smem for 1st chunk
+          // natural shape:  [N, H, V_dim, K_dim]
+          // permuted shape: [N, H, K_dim/32, V_dim, 32]
+          // box shape:      [K_dim/32, V_dim, 32] with swizzling
+          for (int j = 0; j < 32 / 4; j++) {
+            const int col = j ^ (tid_ % 8);
+            const int addr = H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16;
+            lds_f32x4(h_f32 + j * 4, addr);
+          }
         }
         else {
           // for subsequent chunks, load from tmem
-          tcgen05_ld<SHAPE::_32x32b, 16>(h_f32, warp_id_ * 32, vk_tmem + i * 16);
+          tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
         }
 
-        // pack to BF16 for O kernel and wh MMA
-        for (int j = 0; j < 8; j++)
+        // pack to BF16 for wh MMA
+        for (int j = 0; j < 16; j++)
           tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
-        tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, h_tmem_base + i * 8, tmp);  // for wh MMA
+        tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, h_tmem_base + i * 16, tmp);
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
@@ -403,30 +432,36 @@ void h_kernel_cutlass(
 
       // slowly prepare for O kernel and store vk MMA acc
       // TODO: for O kernel, may want to store to smem then TMA store
-      for (int i = 0; i < K_dim / 16; i++) {
-        float h_f32[16];
-        uint32_t tmp[8];
+      for (int i = 0; i < K_dim / 32; i++) {
+        float h_f32[32];
+        uint32_t tmp[16];
 
         if (chunk_id == 0) {
-          // load H0 from gmem for 1st chunk
-          const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
-          ldg_u32x8_fast(h_f32 + 0, h0_ptr + (offset + i * 16 + 0));
-          ldg_u32x8_fast(h_f32 + 8, h0_ptr + (offset + i * 16 + 8));
+          // load H0 from smem for 1st chunk
+          // natural shape:  [N, H, V_dim, K_dim]
+          // permuted shape: [N, H, K_dim/32, V_dim, 32]
+          // box shape:      [K_dim/32, V_dim, 32] with swizzling
+          for (int j = 0; j < 32 / 4; j++) {
+            const int col = j ^ (tid_ % 8);
+            const int addr = H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16;
+            lds_f32x4(h_f32 + j * 4, addr);
+          }
         }
         else {
           // for subsequent chunks, load from tmem
-          tcgen05_ld<SHAPE::_32x32b, 16>(h_f32, warp_id_ * 32, vk_tmem + i * 16);
+          tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
         }
 
-        // pack to BF16 for O kernel and wh MMA
-        for (int j = 0; j < 8; j++)
+        // pack to BF16 for O kernel
+        for (int j = 0; j < 16; j++)
           tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
-        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);    // for O kernel
+        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 32 +  0), tmp + 0);
+        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 32 + 16), tmp + 8);
 
         // scaled H for vk MMA
-        for (int j = 0; j < 16; j++)
+        for (int j = 0; j < 32; j++)
           h_f32[j] *= h_scale;
-        tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, vk_tmem + i * 16, h_f32);  // for vk MMA
+        tcgen05_st<SHAPE::_32x32b, 32>(warp_id_ * 32, vk_tmem + i * 32, h_f32);  // for vk MMA
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
@@ -627,10 +662,31 @@ void h_v1(
   auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
   auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
 
+  CUtensorMap H0_tmap;
+  {
+    // natural shape:  [N, H, V_dim, K_dim]
+    // permuted shape: [N, H, K_dim/32, V_dim, 32]
+    constexpr uint32_t rank = 5;
+    uint64_t globalDim[rank] = {32, V_dim, K_dim / 32, H, N};
+    uint64_t globalStrides[rank - 1] = {            K_dim * sizeof(float),
+                                                                      128,
+                                            V_dim * K_dim * sizeof(float),
+                                        H * V_dim * K_dim * sizeof(float)};  // in bytes
+    uint32_t boxDim[rank] = {32, V_dim, K_dim / 32, 1, 1};
+    uint32_t elementStrides[rank] = {1, 1, 1, 1, 1};
+
+    cuTensorMapEncodeTiled(
+      &H0_tmap, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, rank, h0.data_ptr(),
+      globalDim, globalStrides, boxDim, elementStrides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE,
+      CU_TENSOR_MAP_SWIZZLE_128B,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  }
+
   auto *V_new_ptr         = reinterpret_cast<nv_bfloat16 *>(V_new.data_ptr());
   auto *g_cu_ptr          = reinterpret_cast<const float *>(g_cu.data_ptr());
   auto *h_ptr             = reinterpret_cast<nv_bfloat16 *>(h.data_ptr());
-  auto *h0_ptr            = reinterpret_cast<const float *>(h0.data_ptr());
   auto *ht_ptr            = reinterpret_cast<      float *>(ht.data_ptr());
   auto *cu_seqlens_ptr    = reinterpret_cast<int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_offsets_ptr = reinterpret_cast<int32_t *>(chunk_offsets.data_ptr());
@@ -638,11 +694,12 @@ void h_v1(
   // deeper pipeline is slower?
   constexpr int NUM_STAGES = 2;
   constexpr int smem_size = STAGE_SIZE * NUM_STAGES
+                          + H_fp32_size      // H0
                           + V_size           // V_new
                           + v_scale_size     // v_scale
                           + 8 * NUM_STAGES   // TMA mbar
                           + 8 * NUM_STAGES   // MMA mbar
-                          + 8 * 5            // h, h_scale, v_scale, wh, vk mbar
+                          + 8 * 6            // h0, h, h_scale, v_scale, wh, vk mbar
                           + 4;               // tmem addr
 
   if (profiler.has_value()) {
@@ -653,16 +710,16 @@ void h_v1(
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     dim3 grid(H, N);
     kernel<<<grid, TB_SIZE, smem_size>>>(
-      K_tmap, V_tmap, W_tmap, V_new_ptr,
-      g_cu_ptr, h_ptr, h0_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr, profiler_ptr, num_entries);
+      K_tmap, V_tmap, W_tmap, H0_tmap, V_new_ptr,
+      g_cu_ptr, h_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr, profiler_ptr, num_entries);
   }
   else {
     auto kernel = h_kernel_cutlass<NUM_STAGES, false>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     dim3 grid(H, N);
     kernel<<<grid, TB_SIZE, smem_size>>>(
-      K_tmap, V_tmap, W_tmap, V_new_ptr,
-      g_cu_ptr, h_ptr, h0_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr, nullptr, 0);
+      K_tmap, V_tmap, W_tmap, H0_tmap, V_new_ptr,
+      g_cu_ptr, h_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr, nullptr, 0);
   }
 }
 

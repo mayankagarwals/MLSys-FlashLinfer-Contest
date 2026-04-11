@@ -47,6 +47,7 @@ def export_trace(profiler: Tensor, path: Path):
         "SETUP",
         "WAIT_MMA",
         "WAIT_TMA",
+        "WAIT_H0",
         "WAIT_H",
         "WAIT_SCALED_H",
         "WAIT_SCALED_V",
