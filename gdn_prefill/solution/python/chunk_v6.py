@@ -299,7 +299,7 @@ def run(
         k, v, w, u, A, Ai, beta, g_cu,
         cu_seqlens, chunk_indices,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT,
-        DOT_PRECISION="tf32",  # bf16 roundtrip masks the reduced precision
+        DOT_PRECISION="tf32x3",  # tf32 can cause errors near tolerance boundary
         num_warps=2,
     )
 
