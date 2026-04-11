@@ -13,6 +13,12 @@ Changes in v11_1 vs v9 (the kernel used by v10 for B>=48):
   4. g/beta: lane-0 compute + 2 shfl_sync → all-lanes compute (elim 2 broadcasts/CTA)
   5. v_scalar: lane-0 load + shfl_sync → all-lanes uniform read (elim 1 broadcast/iter)
 """
+import ctypes
+
+# get weird errors without this
+ctypes.CDLL("libcudart.so", mode=ctypes.RTLD_GLOBAL)
+
+
 import torch
 
 from .gdn_decode_baseline import run as baseline_run
