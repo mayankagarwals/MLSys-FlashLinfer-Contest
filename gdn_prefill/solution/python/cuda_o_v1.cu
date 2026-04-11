@@ -114,11 +114,11 @@ static CUtensorMap encode_tma(void *ptr, uint64_t outer, uint64_t rows,
                            static_cast<uint32_t>(cols / SWIZZLE_WIDTH), 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
-  cuTensorMapEncodeTiled(
-      &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr, globalDim,
-      globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  cuTensorMapEncodeTiled(&tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr,
+                         globalDim, globalStrides, boxDim, elementStrides,
+                         CU_TENSOR_MAP_INTERLEAVE_NONE,
+                         CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
+                         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return tmap;
 }
 
@@ -137,11 +137,11 @@ static CUtensorMap encode_qk_tma(void *ptr, uint64_t num_tokens,
                            static_cast<uint32_t>(dim / SWIZZLE_WIDTH), 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
-  cuTensorMapEncodeTiled(
-      &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr, globalDim,
-      globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  cuTensorMapEncodeTiled(&tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr,
+                         globalDim, globalStrides, boxDim, elementStrides,
+                         CU_TENSOR_MAP_INTERLEAVE_NONE,
+                         CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
+                         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return tmap;
 }
 
@@ -155,23 +155,20 @@ static CUtensorMap encode_v_tma(void *ptr, uint64_t num_tokens) {
       SWIZZLE_WIDTH * sizeof(nv_bfloat16),
       VALUE_DIM * sizeof(nv_bfloat16),
   };
-  uint32_t boxDim[rank] = {SWIZZLE_WIDTH, BLOCK_T,
-                           BLOCK_V / SWIZZLE_WIDTH, 1U};
+  uint32_t boxDim[rank] = {SWIZZLE_WIDTH, BLOCK_T, BLOCK_V / SWIZZLE_WIDTH, 1U};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
-  cuTensorMapEncodeTiled(
-      &tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr, globalDim,
-      globalStrides, boxDim, elementStrides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  cuTensorMapEncodeTiled(&tmap, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, rank, ptr,
+                         globalDim, globalStrides, boxDim, elementStrides,
+                         CU_TENSOR_MAP_INTERLEAVE_NONE,
+                         CU_TENSOR_MAP_SWIZZLE_128B, TMA_L2_PROMOTION,
+                         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   return tmap;
 }
 
-__device__ __forceinline__ uint64_t make_tcgen05_desc_mmajor_v(
-    uint32_t addr) {
+__device__ __forceinline__ uint64_t make_tcgen05_desc_mmajor_v(uint32_t addr) {
   return desc_encode(addr) | (desc_encode(V_MMA_LBO) << 16ULL) |
-         (desc_encode(V_MMA_SBO) << 32ULL) | (1ULL << 46ULL) |
-         (2ULL << 61ULL);
+         (desc_encode(V_MMA_SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
 }
 
 template <int NUM_ATOMS>
@@ -198,8 +195,9 @@ __device__ __forceinline__ void mma_swizzled(uint32_t output_tmem,
   }
 }
 
-__device__ __forceinline__ void mma_swizzled_qh_64x128(
-    uint32_t output_tmem, uint32_t matrix_a_smem, uint32_t matrix_b_smem) {
+__device__ __forceinline__ void mma_swizzled_qh_64x128(uint32_t output_tmem,
+                                                       uint32_t matrix_a_smem,
+                                                       uint32_t matrix_b_smem) {
   constexpr uint32_t idesc = make_tcgen05_idesc(MMA_M, BLOCK_V);
   constexpr uint64_t desc_base =
       (desc_encode(SWIZZLE_SBO) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
@@ -221,8 +219,9 @@ __device__ __forceinline__ void mma_swizzled_qh_64x128(
   }
 }
 
-__device__ __forceinline__ void mma_attn_v_mmajor_64x128(
-    uint32_t output_tmem, uint32_t matrix_a_smem, uint32_t matrix_b_smem) {
+__device__ __forceinline__ void
+mma_attn_v_mmajor_64x128(uint32_t output_tmem, uint32_t matrix_a_smem,
+                         uint32_t matrix_b_smem) {
   constexpr uint32_t idesc = make_tcgen05_idesc(MMA_M, BLOCK_V) | (1U << 16U);
   constexpr uint32_t matrix_a_k_stride_bytes =
       BLOCK_T * MMA_K * sizeof(nv_bfloat16);
@@ -237,11 +236,11 @@ __device__ __forceinline__ void mma_attn_v_mmajor_64x128(
   }
 }
 
-__device__ __forceinline__ void store_attn_column(
-    nv_bfloat16 *attn_smem_ptr, const float *g_smem_ptr, const float *reg,
-    uint32_t row_base, uint32_t row_hi, uint32_t row_base_limit,
-    uint32_t row_hi_limit, uint32_t reg_row0, uint32_t reg_row1,
-    uint32_t col) {
+__device__ __forceinline__ void
+store_attn_column(nv_bfloat16 *attn_smem_ptr, const float *g_smem_ptr,
+                  const float *reg, uint32_t row_base, uint32_t row_hi,
+                  uint32_t row_base_limit, uint32_t row_hi_limit,
+                  uint32_t reg_row0, uint32_t reg_row1, uint32_t col) {
   float value_row0 = 0.0f;
   if (col < row_base_limit) {
     value_row0 = reg[reg_row0] * __expf(g_smem_ptr[row_base] - g_smem_ptr[col]);
@@ -264,10 +263,11 @@ __device__ __forceinline__ __nv_bfloat162 combine_output_pair(
                                scale * __fmaf_rn(qh_1, g_row, ov_1));
 }
 
-__device__ __forceinline__ void tma_load_qk_stage(
-    uint32_t q_stage_smem, uint32_t k_stage_smem, const CUtensorMap *q_tmap,
-    const CUtensorMap *k_tmap, int32_t chunk_start_i32, uint32_t q_head_id,
-    uint32_t k_head_id, uint32_t qk_tma_barrier) {
+__device__ __forceinline__ void
+tma_load_qk_stage(uint32_t q_stage_smem, uint32_t k_stage_smem,
+                  const CUtensorMap *q_tmap, const CUtensorMap *k_tmap,
+                  int32_t chunk_start_i32, uint32_t q_head_id,
+                  uint32_t k_head_id, uint32_t qk_tma_barrier) {
   tma_load_4d(q_stage_smem, q_tmap, 0, chunk_start_i32, 0, q_head_id,
               qk_tma_barrier);
   tma_load_4d(k_stage_smem, k_tmap, 0, chunk_start_i32, 0, k_head_id,
@@ -278,13 +278,14 @@ __device__ __forceinline__ void tma_load_qk_stage(
 __device__ __forceinline__ void store_bf162_no_allocate(nv_bfloat16 *ptr,
                                                         __nv_bfloat162 value) {
   const uint32_t data = reinterpret_cast<const uint32_t &>(value);
-  asm volatile("st.global.relaxed.cta.L1::no_allocate.u32 [%0], %1;"
-               :: "l"(ptr), "r"(data));
+  asm volatile("st.global.relaxed.cta.L1::no_allocate.u32 [%0], %1;" ::"l"(ptr),
+               "r"(data));
 }
 
-__device__ __forceinline__ void store_bf162_pair_no_allocate_if(
-    nv_bfloat16 *ptr_0, __nv_bfloat162 value_0, nv_bfloat16 *ptr_1,
-    __nv_bfloat162 value_1, uint32_t predicate) {
+__device__ __forceinline__ void
+store_bf162_pair_no_allocate_if(nv_bfloat16 *ptr_0, __nv_bfloat162 value_0,
+                                nv_bfloat16 *ptr_1, __nv_bfloat162 value_1,
+                                uint32_t predicate) {
   const uint32_t data_0 = reinterpret_cast<const uint32_t &>(value_0);
   const uint32_t data_1 = reinterpret_cast<const uint32_t &>(value_1);
   asm volatile("{\n\t"
@@ -292,9 +293,8 @@ __device__ __forceinline__ void store_bf162_pair_no_allocate_if(
                "setp.ne.u32 p, %4, 0;\n\t"
                "@p st.global.relaxed.cta.L1::no_allocate.u32 [%0], %2;\n\t"
                "@p st.global.relaxed.cta.L1::no_allocate.u32 [%1], %3;\n\t"
-               "}"
-               :: "l"(ptr_0), "l"(ptr_1), "r"(data_0), "r"(data_1),
-                  "r"(predicate));
+               "}" ::"l"(ptr_0),
+               "l"(ptr_1), "r"(data_0), "r"(data_1), "r"(predicate));
 }
 
 __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
@@ -384,8 +384,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
           cu_seqlens_ptr[first_seq_id] +
           static_cast<int64_t>(first_chunk_id) * static_cast<int64_t>(BLOCK_T));
       if (elect_sync()) {
-        tma_load_qk_stage(q_smem, k_smem, &q_tmap, &k_tmap, first_chunk_start_i32,
-                          q_head_id, k_head_id, qk_tma_barriers);
+        tma_load_qk_stage(q_smem, k_smem, &q_tmap, &k_tmap,
+                          first_chunk_start_i32, q_head_id, k_head_id,
+                          qk_tma_barriers);
       }
     }
 
@@ -405,13 +406,13 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       const uint32_t next_qk_tma_barrier = qk_tma_barriers + next_qk_phase * 8U;
 
       if (elect_sync() && next_global_chunk_id < total_num_chunks_u) {
-        const int2 next_chunk_meta =
-            reinterpret_cast<const int2 *>(chunk_indices_ptr)[next_global_chunk_id];
+        const int2 next_chunk_meta = reinterpret_cast<const int2 *>(
+            chunk_indices_ptr)[next_global_chunk_id];
         const uint32_t next_seq_id = static_cast<uint32_t>(next_chunk_meta.x);
         const uint32_t next_chunk_id = static_cast<uint32_t>(next_chunk_meta.y);
         const int32_t next_chunk_start_i32 = static_cast<int32_t>(
-            cu_seqlens_ptr[next_seq_id] +
-            static_cast<int64_t>(next_chunk_id) * static_cast<int64_t>(BLOCK_T));
+            cu_seqlens_ptr[next_seq_id] + static_cast<int64_t>(next_chunk_id) *
+                                              static_cast<int64_t>(BLOCK_T));
         tma_load_qk_stage(q_smem + next_qk_phase * Q_SMEM_SIZE,
                           k_smem + next_qk_phase * K_SMEM_SIZE, &q_tmap,
                           &k_tmap, next_chunk_start_i32, q_head_id, k_head_id,
@@ -484,7 +485,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
       const uint32_t chunk_id = static_cast<uint32_t>(chunk_meta.y);
       const int64_t bos = cu_seqlens_ptr[seq_id];
       const int64_t eos = cu_seqlens_ptr[seq_id + 1];
-      const int64_t chunk_start = bos + static_cast<int64_t>(chunk_id) * BLOCK_T;
+      const int64_t chunk_start =
+          bos + static_cast<int64_t>(chunk_id) * BLOCK_T;
       const int64_t remaining = eos - chunk_start;
       const uint32_t chunk_len =
           remaining <= 0
@@ -579,8 +581,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
 #pragma unroll
             for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS;
                  ++step_pair) {
-              const uint32_t col_lo =
-                  col_base + step_pair * 8U + 2U * lane_col;
+              const uint32_t col_lo = col_base + step_pair * 8U + 2U * lane_col;
               const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
               const uint32_t reg_row0 = step_pair * 4U;
               const uint32_t reg_row1 = reg_row0 + 2U;
@@ -589,14 +590,14 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
                   row_base_o_ptr + col_lo,
                   combine_output_pair(
                       ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U],
-                      qh_reg_lo[reg_row0], qh_reg_lo[reg_row0 + 1U],
-                      g_row_base, scale));
+                      qh_reg_lo[reg_row0], qh_reg_lo[reg_row0 + 1U], g_row_base,
+                      scale));
               store_bf162_no_allocate(
                   row_base_o_ptr + col_hi,
                   combine_output_pair(
                       ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U],
-                      qh_reg_hi[reg_row0], qh_reg_hi[reg_row0 + 1U],
-                      g_row_base, scale));
+                      qh_reg_hi[reg_row0], qh_reg_hi[reg_row0 + 1U], g_row_base,
+                      scale));
               store_bf162_no_allocate(
                   row_hi_o_ptr + col_lo,
                   combine_output_pair(
@@ -643,8 +644,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
 #pragma unroll
             for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS;
                  ++step_pair) {
-              const uint32_t col_lo =
-                  col_base + step_pair * 8U + 2U * lane_col;
+              const uint32_t col_lo = col_base + step_pair * 8U + 2U * lane_col;
               const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
               const uint32_t reg_row0 = step_pair * 4U;
               const uint32_t reg_row1 = reg_row0 + 2U;
@@ -653,13 +653,13 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_swizzled(
                   row_base_o_ptr + col_lo,
                   combine_output_pair(
                       ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U],
-                      qh_reg_lo[reg_row0], qh_reg_lo[reg_row0 + 1U],
-                      g_row_base, scale),
+                      qh_reg_lo[reg_row0], qh_reg_lo[reg_row0 + 1U], g_row_base,
+                      scale),
                   row_base_o_ptr + col_hi,
                   combine_output_pair(
                       ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U],
-                      qh_reg_hi[reg_row0], qh_reg_hi[reg_row0 + 1U],
-                      g_row_base, scale),
+                      qh_reg_hi[reg_row0], qh_reg_hi[reg_row0 + 1U], g_row_base,
+                      scale),
                   row_base_active);
               store_bf162_pair_no_allocate_if(
                   row_hi_o_ptr + col_lo,
@@ -739,8 +739,8 @@ void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
   if (persistent_grid_y == 0U) {
     persistent_grid_y = 1U;
   }
-  persistent_grid_y = persistent_grid_y > 1U ? (persistent_grid_y + 1U) / 2U
-                                             : 1U;
+  persistent_grid_y =
+      persistent_grid_y > 1U ? (persistent_grid_y + 1U) / 2U : 1U;
   if (persistent_grid_y > total_num_chunks_u) {
     persistent_grid_y = total_num_chunks_u;
   }
