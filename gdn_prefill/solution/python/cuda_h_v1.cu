@@ -333,55 +333,16 @@ void h_kernel_cutlass(
   }
   else if (warp_id >= 4) {
     // CUDA H warps
+    if (elect_sync()) profiler.stamp(SETUP);
     const int tid_ = tid % 128;
     const int warp_id_ = warp_id % 4;
 
     const int chunk_offset = chunk_offsets_ptr[seq_id];
     h_ptr += (chunk_offset * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
 
-    if (elect_sync()) profiler.stamp(SETUP);
-
-    // chunk_id = 0: load H from H0 gmem
-    {
-      // load g_cu_last and compute scaling for H
-      float h_scale;
-      if (lane_id == 0) {
-        const int last_idx = min(bos + BT, eos) - 1;
-        h_scale = __expf(g_cu_ptr[last_idx * H + head_id]);
-      }
-      h_scale = warp_uniform(h_scale);
-
-      // collectively, 4 warps represent H[V_dim, K_dim]
-      // each thread processes 1 row
-      for (int i = 0; i < K_dim / 16; i++) {
-        float h_f32[16];
-        uint32_t tmp[8];
-
-        // load H0 from gmem
-        const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
-        ldg_u32x8_fast(h_f32 + 0, h0_ptr + (offset + i * 16 + 0));
-        ldg_u32x8_fast(h_f32 + 8, h0_ptr + (offset + i * 16 + 8));
-
-        // pack to BF16 for O kernel and wh MMA
-        for (int j = 0; j < 8; j++)
-          tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
-        stg_u32x8_fast(h_ptr + i * 16, tmp);                                          // for O kernel
-        tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, h_tmem_base + i * 8, tmp);  // for wh MMA
-
-        // scaled H for vk MMA
-        for (int j = 0; j < 16; j++)
-          h_f32[j] *= h_scale;
-        tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, vk_tmem + i * 16, h_f32);  // for vk MMA
-      }
-      tcgen05_wait_st();
-      tcgen05_fence_before_thread_sync();
-      mbarrier_arrive(h_mbar_addr);
-      if (elect_sync()) profiler.stamp(PROCESS_H);
-    }
-
-    // chunk_id >= 1: load H from vk MMA
     int vk_parity = 0;
-    for (int chunk_id = 1; chunk_id < num_chunks; chunk_id++) {
+
+    auto process = [&](int chunk_id) {
       // load g_cu_last and compute scaling for H
       float h_scale;
       if (lane_id == 0) {
@@ -390,12 +351,15 @@ void h_kernel_cutlass(
       }
       h_scale = warp_uniform(h_scale);
 
-      // wait for vk MMA and update H
-      if (warp_id_ == 0)
-        mbarrier_wait(vk_mbar_addr, vk_parity);
-      bar_sync<1>(128);
-      tcgen05_fence_after_thread_sync();
-      if (elect_sync()) profiler.stamp(WAIT_VK_MMA);
+      // for chunk_id > 0, wait for vk MMA to update H
+      if (chunk_id > 0) {
+        if (warp_id_ == 0)
+          mbarrier_wait(vk_mbar_addr, vk_parity);
+        bar_sync<1>(128);
+        tcgen05_fence_after_thread_sync();
+        if (elect_sync()) profiler.stamp(WAIT_VK_MMA);
+        vk_parity ^= 1;
+      }
 
       // collectively, 4 warps represent H[V_dim, K_dim]
       // each thread processes 1 row
@@ -403,13 +367,21 @@ void h_kernel_cutlass(
         float h_f32[16];
         uint32_t tmp[8];
 
-        // load H from vk MMA
-        tcgen05_ld<SHAPE::_32x32b, 16>(h_f32, warp_id_ * 32, vk_tmem + i * 16);
+        if (chunk_id == 0) {
+          // load H0 from gmem for 1st chunk
+          const int offset = (seq_id * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
+          ldg_u32x8_fast(h_f32 + 0, h0_ptr + (offset + i * 16 + 0));
+          ldg_u32x8_fast(h_f32 + 8, h0_ptr + (offset + i * 16 + 8));
+        }
+        else {
+          // for subsequent chunks, load from tmem
+          tcgen05_ld<SHAPE::_32x32b, 16>(h_f32, warp_id_ * 32, vk_tmem + i * 16);
+        }
 
         // pack to BF16 for O kernel and wh MMA
         for (int j = 0; j < 8; j++)
           tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
-        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);         // for O kernel
+        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 16), tmp);    // for O kernel
         tcgen05_st<SHAPE::_32x32b, 8>(warp_id_ * 32, h_tmem_base + i * 8, tmp);  // for wh MMA
 
         // scaled H for vk MMA
@@ -421,9 +393,11 @@ void h_kernel_cutlass(
       tcgen05_fence_before_thread_sync();
       mbarrier_arrive(h_mbar_addr);
       if (elect_sync()) profiler.stamp(PROCESS_H);
+    };
 
-      vk_parity ^= 1;
-    }
+    process(0);
+    for (int chunk_id = 1; chunk_id < num_chunks; chunk_id++)
+      process(chunk_id);
 
     // store final H
     // wait for vk MMA

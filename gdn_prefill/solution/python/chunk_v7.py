@@ -209,7 +209,7 @@ def run(
 
     # uncomment to enable profiling
     profiler = None
-    profiler = torch.zeros(148, 10, 1 + 1000 * 2, dtype=torch.int64, device="cuda")
+    # profiler = torch.zeros(148, 10, 1 + 1000 * 2, dtype=torch.int64, device="cuda")
     mod.h_v1(
         k,
         u,
