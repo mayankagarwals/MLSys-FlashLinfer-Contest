@@ -525,51 +525,51 @@ void h_kernel_cutlass(
       if (elect_sync()) profiler.stamp(WAIT_WH_MMA);
 
       // compute v_new
-      // total tile is [V_dim, BT]
-      // each warp processes [32, BT]
-      // each i iteration processes [16, BT] tile per warp
-      for (int i = 0; i < 2; i++) {
-        // each 16x256b tile corresponds to 16x8 tile of wh
-        float tmp[BT / 2];
-        const int t_row = warp_id * 32 + i * 16;
-        tcgen05_ld<SHAPE::_16x256b, BT / 8>(tmp, t_row, wh_tmem);
+      // total tile:  [V_dim, BT]
+      // each warp:   [32, BT]
+      // each thread: [1, BT]
+      for (int i = 0; i < BT / 8; i++) {
+        float tmp[8];
+        tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 0, warp_id * 32 +  0, wh_tmem + i * 8);
+        tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 4, warp_id * 32 + 16, wh_tmem + i * 8);
 
-        // each j iteration processes a [16, 16] tile per warp
-        // V smem layout is [V_dim/64, BT, 64] with swizzling
-        for (int j = 0; j < BT / 16; j++) {
-          uint32_t v_tmp[4];
-          const uint32_t offset = (warp_id / 2) * BT * 128;
-          const uint32_t s_row = j * 16 + (lane_id / 16) * 8 + (lane_id % 8);
-          const uint32_t s_col = ((warp_id % 2) * 4 + i * 2 + (lane_id % 16) / 8) ^ (lane_id % 8);
-          ldmatrix_trans<4>(v_tmp, V_smem + offset + s_row * 128 + s_col * 16);
+        // V smem layout: [V_dim/64, BT, 64] = [2, BT, 64]
+        // each ldmatrix loads [8, 32] along the last 2 dims
+        uint32_t v_tmp[4];
+        const uint32_t offset = (warp_id / 2) * BT * 128;
+        const uint32_t s_row = i * 8 + (lane_id % 8);
+        const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
+        ldmatrix_trans<4>(v_tmp, V_smem + offset + s_row * 128 + s_col * 16);
 
-          for (int k = 0; k < 4; k++) {
-            // unpack V to FP32
-            float v_fp32[2];
-            bf16x2_to_fp32x2(v_fp32, v_tmp[k]);
+        float2 v_scale = reinterpret_cast<float2 *>(v_scale_smem_ptr + (i * 8 + (lane_id % 4) * 2))[0];
 
-            // compute v_new = v - w @ h.T
-            v_fp32[0] -= tmp[j * 8 + k * 2 + 0];
-            v_fp32[1] -= tmp[j * 8 + k * 2 + 1];
+        for (int k = 0; k < 4; k++) {
+          // unpack V to FP32
+          float v_fp32[2];
+          bf16x2_to_fp32x2(v_fp32, v_tmp[k]);
 
-            // pack v_new for O kernel
-            v_tmp[k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
+          // compute v_new = v - w @ h.T
+          v_fp32[0] -= tmp[k * 2 + 0];
+          v_fp32[1] -= tmp[k * 2 + 1];
 
-            // scale v_new for vk MMA
-            float2 v_scale = reinterpret_cast<float2 *>(v_scale_smem_ptr + (j * 16 + (k / 2) * 8 + (lane_id % 4) * 2))[0];
-            v_fp32[0] *= v_scale.x;
-            v_fp32[1] *= v_scale.y;
-            reinterpret_cast<uint32_t *>(tmp)[j * 4 + k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
-          }
+          // pack v_new for O kernel
+          v_tmp[k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
 
-          // store v_new for O kernel to smem
-          // this mirrors ldmatrix for V
-          stmatrix_trans<4>(V_new_smem + offset + s_row * 128 + s_col * 16, v_tmp);
+          // scale v_new for vk MMA
+          v_fp32[0] *= v_scale.x;
+          v_fp32[1] *= v_scale.y;
+          reinterpret_cast<uint32_t *>(tmp)[k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
         }
 
+        // store v_new for O kernel to smem
+        // this mirrors ldmatrix for V
+        stmatrix_trans<4>(V_new_smem + offset + s_row * 128 + s_col * 16, v_tmp);
+
         // store scaled v_new for vk MMA
-        tcgen05_st<SHAPE::_16x128b, BT / 8>(t_row, v_tmem_base, tmp);
+        tcgen05_st<SHAPE::_16x128b, 1>(warp_id * 32 +  0, v_tmem_base + i * 4, tmp + 0);
+        tcgen05_st<SHAPE::_16x128b, 1>(warp_id * 32 + 16, v_tmem_base + i * 4, tmp + 2);
       }
+
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
       mbarrier_arrive(scaled_v_mbar_addr);
