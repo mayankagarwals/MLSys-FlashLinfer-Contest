@@ -41,11 +41,26 @@ mod = tvm_ffi.load_module(lib_path)
 
 
 @triton.jit
-def _unit_lower_inverse_16x16(A, DOT_PRECISION: tl.constexpr):
+def _unit_lower_inverse_16x16(A_orig, DOT_PRECISION: tl.constexpr):
+    """Compute (I + A)^{-1} for strict lower triangular A using tf32 + Newton-Schulz refinement.
+
+    The 6-dot inverse formula uses DOT_PRECISION (tf32) for speed. tf32 has 11-bit mantissa,
+    so after 6 chained dots the accumulated error is ~6 * 2^{-11} ≈ 0.003. This is close to
+    bf16 precision (~2^{-8} ≈ 0.004), causing some elements to round to wrong bf16 values.
+
+    Newton-Schulz refinement fixes this: given approximate inverse Ai with error E (~10^{-3}),
+        Ai_new = Ai @ (2I - M @ Ai)    where M = I + A
+    produces error E^2 (~10^{-6}), well below bf16's ~10^{-2.4} threshold.
+
+    The refinement dots use tf32x3 (23-bit) so they don't re-introduce tf32-level error.
+    Total: 6 tf32 dots (fast inverse) + 2 tf32x3 dots (refinement) = 12 MMA passes per block,
+    vs 18 MMA passes for full tf32x3. ~33% fewer passes per diagonal block.
+    """
     o_i = tl.arange(0, 16)
     m_I = tl.where(o_i[:, None] == o_i[None, :], 1.0, 0.0)
 
-    # (I + A)^-1 = (I - A)(I + A^2)(I + A^4)(I + A^8) for strict-lower 16x16 A.
+    # Fast tf32 inverse: (I + A)^-1 = (I - A)(I + A^2)(I + A^4)(I + A^8)
+    A = A_orig
     Ai = m_I - A
     A = tl.dot(A, A, input_precision=DOT_PRECISION)
     Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
@@ -53,6 +68,11 @@ def _unit_lower_inverse_16x16(A, DOT_PRECISION: tl.constexpr):
     Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
     A = tl.dot(A, A, input_precision=DOT_PRECISION)
     Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
+
+    # Newton-Schulz refinement: squares the error (E -> E^2)
+    MAi = Ai + tl.dot(A_orig, Ai, input_precision="tf32x3")  # M @ Ai = (I + A) @ Ai
+    Ai = tl.dot(Ai, 2.0 * m_I - MAi, input_precision="tf32x3")  # Ai @ (2I - M @ Ai)
+
     return Ai
 
 
@@ -110,27 +130,29 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     A_42 = tl.load(A_ptr + (offsets + (48 * H * BT + 16)), mask=offs_t < seqlen - 48)
     A_43 = tl.load(A_ptr + (offsets + (48 * H * BT + 32)), mask=offs_t < seqlen - 48)
 
-    tmp = tl.dot(Ai_22, A_21, input_precision=DOT_PRECISION)
-    Ai_21 = -tl.dot(tmp, Ai_11, input_precision=DOT_PRECISION)
+    # Off-diagonal blocks use tf32x3: up to 4 chained dots can accumulate ~4*2^{-11} ≈ 0.002
+    # error with tf32, which is borderline for bf16. tf32x3 keeps it safe.
+    tmp = tl.dot(Ai_22, A_21, input_precision="tf32x3")
+    Ai_21 = -tl.dot(tmp, Ai_11, input_precision="tf32x3")
 
-    tmp = tl.dot(Ai_33, A_32, input_precision=DOT_PRECISION)
-    Ai_32 = -tl.dot(tmp, Ai_22, input_precision=DOT_PRECISION)
+    tmp = tl.dot(Ai_33, A_32, input_precision="tf32x3")
+    Ai_32 = -tl.dot(tmp, Ai_22, input_precision="tf32x3")
 
-    tmp = tl.dot(Ai_44, A_43, input_precision=DOT_PRECISION)
-    Ai_43 = -tl.dot(tmp, Ai_33, input_precision=DOT_PRECISION)
+    tmp = tl.dot(Ai_44, A_43, input_precision="tf32x3")
+    Ai_43 = -tl.dot(tmp, Ai_33, input_precision="tf32x3")
 
-    tmp = tl.dot(A_31, Ai_11, input_precision=DOT_PRECISION)
-    tmp = tl.dot(A_32, Ai_21, acc=tmp, input_precision=DOT_PRECISION)
-    Ai_31 = -tl.dot(Ai_33, tmp, input_precision=DOT_PRECISION)
+    tmp = tl.dot(A_31, Ai_11, input_precision="tf32x3")
+    tmp = tl.dot(A_32, Ai_21, acc=tmp, input_precision="tf32x3")
+    Ai_31 = -tl.dot(Ai_33, tmp, input_precision="tf32x3")
 
-    tmp = tl.dot(A_42, Ai_22, input_precision=DOT_PRECISION)
-    tmp = tl.dot(A_43, Ai_32, acc=tmp, input_precision=DOT_PRECISION)
-    Ai_42 = -tl.dot(Ai_44, tmp, input_precision=DOT_PRECISION)
+    tmp = tl.dot(A_42, Ai_22, input_precision="tf32x3")
+    tmp = tl.dot(A_43, Ai_32, acc=tmp, input_precision="tf32x3")
+    Ai_42 = -tl.dot(Ai_44, tmp, input_precision="tf32x3")
 
-    tmp = tl.dot(A_41, Ai_11, input_precision=DOT_PRECISION)
-    tmp = tl.dot(A_42, Ai_21, acc=tmp, input_precision=DOT_PRECISION)
-    tmp = tl.dot(A_43, Ai_31, acc=tmp, input_precision=DOT_PRECISION)
-    Ai_41 = -tl.dot(Ai_44, tmp, input_precision=DOT_PRECISION)
+    tmp = tl.dot(A_41, Ai_11, input_precision="tf32x3")
+    tmp = tl.dot(A_42, Ai_21, acc=tmp, input_precision="tf32x3")
+    tmp = tl.dot(A_43, Ai_31, acc=tmp, input_precision="tf32x3")
+    Ai_41 = -tl.dot(Ai_44, tmp, input_precision="tf32x3")
 
     # === Block-wise W/U: skip global Ai store + barrier + reload ===
     # bf16 roundtrip on Ai blocks matches the L2 store/reload precision profile.
@@ -299,7 +321,7 @@ def run(
         k, v, w, u, A, Ai, beta, g_cu,
         cu_seqlens, chunk_indices,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT,
-        DOT_PRECISION="tf32x3",  # tf32 can cause errors near tolerance boundary
+        DOT_PRECISION="tf32",  # tf32 for diagonal inverse speed; Newton-Schulz corrects precision
         num_warps=2,
     )
 
