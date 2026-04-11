@@ -554,8 +554,8 @@ void h_kernel_cutlass(
               :: "l"(dst_addr), "r"(src_addr)
             );
         }
-        if (elect_sync()) profiler.stamp(STORE_V_NEW);
       }
+      if (elect_sync()) profiler.stamp(STORE_V_NEW);
 
       tma_stage = (tma_stage + 1) % NUM_STAGES;
       if (tma_stage == 0)
