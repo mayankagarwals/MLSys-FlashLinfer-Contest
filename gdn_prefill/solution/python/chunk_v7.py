@@ -8,10 +8,10 @@ import triton
 import tvm_ffi
 from torch import Tensor
 
-from .triton_v4 import (
+from .chunk_v6 import (
     chunk_fwd_kernel_o,
     compute_chunks_kernel,
-    merge_16x16_to_64x64_inverse_kernel,
+    merge_16x16_to_64x64_inverse_kernel_v2,
 )
 
 os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
@@ -183,7 +183,7 @@ def run(
     Ai = torch.empty_like(A, dtype=k.dtype)  # BF16
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
-    merge_16x16_to_64x64_inverse_kernel[(total_num_chunks, H)](
+    merge_16x16_to_64x64_inverse_kernel_v2[(total_num_chunks, H)](
         k,
         v,
         w,
