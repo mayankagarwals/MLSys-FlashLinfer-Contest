@@ -36,6 +36,69 @@ lib_path = tvm_ffi.cpp.build(
 mod = tvm_ffi.load_module(lib_path)
 
 
+def export_trace(profiler: Tensor, path: Path):
+    import gzip
+    import json
+
+    num_sms, num_warps, _ = profiler.shape
+
+    TAGS = [
+        "START",
+        "SETUP",
+        "WAIT_MMA",
+        "WAIT_TMA",
+        "WAIT_H",
+        "WAIT_V",
+        "WAIT_WH_MMA",
+        "WAIT_VK_MMA",
+        "ISSUE_TMA",
+        "ISSUE_WH_MMA",
+        "ISSUE_VK_MMA",
+        "PROCESS_H",
+        "COMPUTE_V_SCALE",
+        "PROCESS_V",
+        "STORE_V_NEW",
+        "END",
+    ]
+
+    events = []
+    profiler_data = profiler.tolist()
+    for sm_id in range(num_sms):
+        for warp_id in range(num_warps):
+            data = profiler_data[sm_id][warp_id]
+            cnt = data[0]
+
+            if cnt == 0:
+                continue
+
+            # start timestamp
+            tag, ts = data[1:3]
+            assert tag == 0, tag
+            start = ts
+
+            for i in range(1, cnt):
+                tag, ts = data[1 + i * 2 : 1 + (i + 1) * 2]
+                events.append(
+                    dict(
+                        name=TAGS[tag],
+                        ph="X",
+                        ts=start,
+                        dur=ts - start,
+                        pid=sm_id,
+                        tid=sm_id + warp_id,
+                    )
+                )
+                start = ts
+
+    offset = min([evt["ts"] for evt in events])
+    for evt in events:
+        evt["ts"] -= offset
+
+    path.parent.mkdir(exist_ok=True)
+    trace = dict(traceEvents=events)
+    gzip.open(path, "w").write(json.dumps(trace).encode("utf-8"))
+
+
 _FLAG = None
 
 
@@ -144,8 +207,9 @@ def run(
     final_state = torch.empty_like(state, dtype=torch.float32)
     v_new = torch.empty_like(u)
 
-    # reduce BV to increase no. of SMs used.
-    # helpful when N * H is small.
+    # uncomment to enable profiling
+    profiler = None
+    profiler = torch.zeros(148, 10, 1 + 1000 * 2, dtype=torch.int64, device="cuda")
     mod.h_v1(
         k,
         u,
@@ -157,7 +221,11 @@ def run(
         final_state,
         cu_seqlens,
         chunk_offsets,
+        profiler,
     )
+
+    if profiler is not None:
+        export_trace(profiler, Path("trace.json.gz"))
 
     o = torch.empty_like(v)
 
