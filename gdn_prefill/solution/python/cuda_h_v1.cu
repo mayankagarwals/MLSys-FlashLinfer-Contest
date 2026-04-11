@@ -90,6 +90,13 @@ void lds_f32x4(float *data, uint32_t addr) {
               : "r"(addr));
 };
 
+__device__ inline
+void sts_b32x4(uint32_t addr, const uint32_t *data) {
+  asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+              :: "r"(addr),
+                 "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]));
+};
+
 enum ProfilerTag {
   START = 0,
   SETUP,
@@ -162,9 +169,9 @@ void h_kernel_cutlass(
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap W_tmap,      // [total_T, H, K_dim]
   const __grid_constant__ CUtensorMap H0_tmap,     // [N, H, V_dim, K_dim]
+  const __grid_constant__ CUtensorMap H_tmap,      // [total_num_chunks, H, V_dim, K_dim]
         nv_bfloat16 *V_new_ptr,                    // [total_T, H, V_dim]
   const float       *g_cu_ptr,                     // [total_T, H]
-        nv_bfloat16 *h_ptr,                        // [total_num_chunks, H, V_dim, K_dim]
         float       *ht_ptr,                       // [N, H, V_dim, K_dim]
   const int64_t     *cu_seqlens_ptr,               // [N+1]
   const int32_t     *chunk_offsets_ptr,            // [N]
@@ -190,7 +197,8 @@ void h_kernel_cutlass(
   extern __shared__ __align__(1024) char smem_ptr[];
   const uint32_t smem = __cvta_generic_to_shared(smem_ptr);
   const uint32_t H0_f32_smem = smem + NUM_STAGES * STAGE_SIZE;
-  const uint32_t V_new_smem = H0_f32_smem + H_fp32_size;
+  const uint32_t H_smem = H0_f32_smem + H_fp32_size;
+  const uint32_t V_new_smem = H_smem + H_fp32_size / 2;
 
   const uint32_t v_scale_smem = V_new_smem + V_size;
   float *v_scale_smem_ptr = reinterpret_cast<float *>(smem_ptr + (v_scale_smem - smem));
@@ -368,7 +376,6 @@ void h_kernel_cutlass(
     const int warp_id_ = warp_id % 4;
 
     const int chunk_offset = chunk_offsets_ptr[seq_id];
-    h_ptr += (chunk_offset * H + head_id) * V_dim * K_dim + (tid_ * K_dim);
 
     int vk_parity = 0;
 
@@ -430,6 +437,11 @@ void h_kernel_cutlass(
       mbarrier_arrive(h_mbar_addr);
       if (elect_sync()) profiler.stamp(PROCESS_H);
 
+      // drain H TMA store of the previous iteration before overwriting its smem
+      if (warp_id_ == 0 && elect_sync())
+        cp_async_bulk_wait_group_read<0>();
+      bar_sync<1>(128);
+
       // slowly prepare for O kernel and store vk MMA acc
       // TODO: for O kernel, may want to store to smem then TMA store
       for (int i = 0; i < K_dim / 32; i++) {
@@ -455,8 +467,13 @@ void h_kernel_cutlass(
         // pack to BF16 for O kernel
         for (int j = 0; j < 16; j++)
           tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
-        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 32 +  0), tmp + 0);
-        stg_u32x8_fast(h_ptr + (chunk_id * H * V_dim * K_dim + i * 32 + 16), tmp + 8);
+
+        // H smem layout: [K_dim/64, V_dim, 64]
+        for (int j = 0; j < 32 / 8; j++) {
+          const int col = ((i % 2) * 4 + j) ^ (tid_ % 8);
+          const int addr = H_smem + (i / 2) * V_dim * 128 + tid_ * 128 + col * 16;
+          sts_b32x4(addr, tmp + j * 4);
+        }
 
         // scaled H for vk MMA
         for (int j = 0; j < 32; j++)
@@ -467,6 +484,15 @@ void h_kernel_cutlass(
       tcgen05_fence_before_thread_sync();
       mbarrier_arrive(scaled_h_mbar_addr);
       if (elect_sync()) profiler.stamp(PROCESS_SCALED_H);
+
+      bar_sync<1>(128);
+      asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;");
+      if (warp_id_ == 0 && elect_sync()) {
+        // natural shape:  [total_num_chunks, H, V_dim, K_dim]
+        // permuted shape: [total_num_chunks*H, K_dim/64, V_dim, 64]
+        tma_store_4d(&H_tmap, H_smem, 0, 0, 0, (chunk_offset + chunk_id) * H + head_id);
+        cp_async_bulk_commit_group();
+      }
     };
 
     process(0);
@@ -643,21 +669,28 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
 }
 
 static
-CUtensorMap encode_h_tma(void *ptr, uint64_t N) {
+CUtensorMap encode_h_tma(void *ptr, uint64_t N, CUtensorMapDataType dtype) {
   CUtensorMap tmap;
 
+  int elem_width = 0;
+  if (dtype == CU_TENSOR_MAP_DATA_TYPE_FLOAT32) elem_width = 4;
+  else if (dtype == CU_TENSOR_MAP_DATA_TYPE_BFLOAT16) elem_width = 2;
+
+  const int num_elems = 128 / elem_width;
+
+  // for FP32
   // natural shape:  [N, H, V_dim, K_dim]
   // permuted shape: [N*H, K_dim/32, V_dim, 32]
   constexpr uint32_t rank = 4;
-  uint64_t globalDim[rank] = {32, V_dim, K_dim / 32, N * H};
-  uint64_t globalStrides[rank - 1] = {        K_dim * sizeof(float),
-                                                                128,
-                                      V_dim * K_dim * sizeof(float)};  // in bytes
-  uint32_t boxDim[rank] = {32, V_dim, K_dim / 32, 1};
+  uint64_t globalDim[rank] = {num_elems, V_dim, K_dim / num_elems, N * H};
+  uint64_t globalStrides[rank - 1] = {        K_dim * elem_width,
+                                                             128,
+                                      V_dim * K_dim * elem_width};  // in bytes
+  uint32_t boxDim[rank] = {num_elems, V_dim, K_dim / num_elems, 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
   cuTensorMapEncodeTiled(
-    &tmap, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, rank, ptr,
+    &tmap, dtype, rank, ptr,
     globalDim, globalStrides, boxDim, elementStrides,
     CU_TENSOR_MAP_INTERLEAVE_NONE,
     CU_TENSOR_MAP_SWIZZLE_128B,
@@ -685,11 +718,11 @@ void h_v1(
   auto K_tmap  = encode_tma(K.data_ptr(), T, Hg, K_dim);
   auto V_tmap  = encode_tma(V.data_ptr(), T, H, V_dim);
   auto W_tmap  = encode_tma(W.data_ptr(), T, H, K_dim);
-  auto H0_tmap = encode_h_tma(h0.data_ptr(), N);
+  auto H0_tmap = encode_h_tma(h0.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
+  auto H_tmap  = encode_h_tma(h.data_ptr(), 100000, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
 
   auto *V_new_ptr         = reinterpret_cast<nv_bfloat16 *>(V_new.data_ptr());
   auto *g_cu_ptr          = reinterpret_cast<const float *>(g_cu.data_ptr());
-  auto *h_ptr             = reinterpret_cast<nv_bfloat16 *>(h.data_ptr());
   auto *ht_ptr            = reinterpret_cast<      float *>(ht.data_ptr());
   auto *cu_seqlens_ptr    = reinterpret_cast<int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_offsets_ptr = reinterpret_cast<int32_t *>(chunk_offsets.data_ptr());
@@ -698,6 +731,7 @@ void h_v1(
   constexpr int NUM_STAGES = 2;
   constexpr int smem_size = STAGE_SIZE * NUM_STAGES
                           + H_fp32_size      // H0
+                          + H_fp32_size / 2  // H
                           + V_size           // V_new
                           + v_scale_size     // v_scale
                           + 8 * NUM_STAGES   // TMA mbar
@@ -713,16 +747,16 @@ void h_v1(
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     dim3 grid(H, N);
     kernel<<<grid, TB_SIZE, smem_size>>>(
-      K_tmap, V_tmap, W_tmap, H0_tmap, V_new_ptr,
-      g_cu_ptr, h_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr, profiler_ptr, num_entries);
+      K_tmap, V_tmap, W_tmap, H0_tmap, H_tmap, V_new_ptr,
+      g_cu_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr, profiler_ptr, num_entries);
   }
   else {
     auto kernel = h_kernel_cutlass<NUM_STAGES, false>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     dim3 grid(H, N);
     kernel<<<grid, TB_SIZE, smem_size>>>(
-      K_tmap, V_tmap, W_tmap, H0_tmap, V_new_ptr,
-      g_cu_ptr, h_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr, nullptr, 0);
+      K_tmap, V_tmap, W_tmap, H0_tmap, H_tmap, V_new_ptr,
+      g_cu_ptr, ht_ptr, cu_seqlens_ptr, chunk_offsets_ptr, nullptr, 0);
   }
 }
 
