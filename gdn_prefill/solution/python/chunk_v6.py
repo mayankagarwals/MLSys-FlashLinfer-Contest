@@ -42,19 +42,28 @@ mod = tvm_ffi.load_module(lib_path)
 
 @triton.jit
 def _unit_lower_inverse_16x16(A_orig, DOT_PRECISION: tl.constexpr):
-    """Compute (I + A)^{-1} for strict lower triangular A using tf32 + Newton-Schulz refinement.
+    """Compute (I + A)^{-1} for strict lower triangular A.
 
-    The 6-dot inverse formula uses DOT_PRECISION (tf32) for speed. tf32 has 11-bit mantissa,
-    so after 6 chained dots the accumulated error is ~6 * 2^{-11} ≈ 0.003. This is close to
-    bf16 precision (~2^{-8} ≈ 0.004), causing some elements to round to wrong bf16 values.
+    Precision strategy:
+    - The 6-dot Neumann series uses DOT_PRECISION="tf32" (1 MMA pass per dot, fast).
+      On Blackwell, Triton's tf32 compiles to HMMA.1688 (m16n8k8), which has 11-bit
+      mantissa. After 6 chained dots, error accumulates to ~6 * 2^{-11} ≈ 0.003.
+      This is close to bf16 precision (~2^{-8} ≈ 0.004), so some elements round to
+      wrong bf16 values. Using tf32 alone fails on some workloads.
 
-    Newton-Schulz refinement fixes this: given approximate inverse Ai with error E (~10^{-3}),
-        Ai_new = Ai @ (2I - M @ Ai)    where M = I + A
-    produces error E^2 (~10^{-6}), well below bf16's ~10^{-2.4} threshold.
+    - Newton-Schulz refinement corrects this. Given approximate inverse Ai with
+      relative error E (~10^{-3}):
+          Ai_new = Ai @ (2I - M @ Ai)    where M = I + A
+      The new error is E^2 (~10^{-6}), well below bf16's ~10^{-2.4} threshold.
+      The 2 refinement dots use tf32x3 (3 MMA passes, 23-bit precision) so they
+      don't re-introduce tf32-level error.
 
-    The refinement dots use tf32x3 (23-bit) so they don't re-introduce tf32-level error.
-    Total: 6 tf32 dots (fast inverse) + 2 tf32x3 dots (refinement) = 12 MMA passes per block,
-    vs 18 MMA passes for full tf32x3. ~33% fewer passes per diagonal block.
+    Note: CUDA wmma avoids this issue because ptxas compiles wmma.m16n16k8 to
+    HMMA.1684 (K=4), giving finer accumulation. Triton emits mma.sync which maps
+    to HMMA.1688 (K=8), hence the need for Newton-Schulz.
+
+    Total: 6 tf32 dots + 2 tf32x3 dots = 12 MMA passes per diagonal block,
+    vs 18 MMA passes for full tf32x3. ~33% fewer passes.
     """
     o_i = tl.arange(0, 16)
     m_I = tl.where(o_i[:, None] == o_i[None, :], 1.0, 0.0)
@@ -154,10 +163,18 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     tmp = tl.dot(A_43, Ai_31, acc=tmp, input_precision="tf32x3")
     Ai_41 = -tl.dot(Ai_44, tmp, input_precision="tf32x3")
 
-    # === Block-wise W/U: skip global Ai store + barrier + reload ===
-    # bf16 roundtrip on Ai blocks matches the L2 store/reload precision profile.
-    # This also enables tf32 for the inverse (bf16 truncation masks reduced precision).
-    # acc= chaining preserves the MMA accumulation order of a single [64,64] dot.
+    # === Block-wise W/U: compute directly from register-resident Ai blocks ===
+    #
+    # Original chunk_v5 flow: store Ai to global (bf16) → debug_barrier → reload [64,64] → single big dot
+    # New flow: skip the global roundtrip, compute W/U from the 10 Ai blocks directly.
+    #
+    # bf16 roundtrip (.to(bf16).to(f32)): the original path stored Ai as bf16 to global memory,
+    # which truncated precision. We replicate that truncation here so the downstream W/U dots
+    # see identical bf16 values. Without this, 2 workloads fail at the atol=1e-2 boundary.
+    #
+    # acc= chaining (below): each row-block's W/U is computed as a sum of [16,16]@[16,dim] dots
+    # using tl.dot(..., acc=prev). This feeds the MMA accumulator across dots, matching the
+    # accumulation order of the original single [64,64]@[64,dim] dot.
     Ai_11 = Ai_11.to(tl.bfloat16).to(tl.float32)
     Ai_21 = Ai_21.to(tl.bfloat16).to(tl.float32)
     Ai_22 = Ai_22.to(tl.bfloat16).to(tl.float32)
