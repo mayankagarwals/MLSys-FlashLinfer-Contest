@@ -539,8 +539,8 @@ void h_kernel_cutlass(
         if (t < eos)
           v_new_scale = __expf(g_cu_last - g_cu);
         v_scale_smem_ptr[tid] = v_new_scale;
+        if (elect_sync()) profiler.stamp(COMPUTE_V_SCALE);
       }
-      if (elect_sync()) profiler.stamp(COMPUTE_V_SCALE);
 
       const uint32_t W_smem = smem + tma_stage * STAGE_SIZE;
       const uint32_t V_smem = W_smem + W_size;
