@@ -20,7 +20,7 @@ os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
-    name="gdn_prefill_cuda_v7",
+    name="gdn_prefill_cuda_v6_2",
     cuda_files=[
         str(CURRENT_DIR / "cuda_kkt_v1.cu"),
     ],
