@@ -5,7 +5,7 @@ author = "CUDA_ERROR_UNKNOWN"
 
 [build]
 language = "python"
-entry_point = "gdn_prefill_mix.py::run"
+entry_point = "chunk_v6b_o_v1b.py::run"
 destination_passing_style = false
 
 #language = "python"
