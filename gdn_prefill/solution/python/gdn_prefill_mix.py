@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .chunk_v6c import run as chunk_v6c  # v6 + Newton-Schulz + v6b optimizations
+from .chunk_v6b import run as chunk_v6b  # production: 16x16 hierarchical inverse
 from .cuda_parallel_v3 import run as cuda_v3
 
 
@@ -27,9 +27,9 @@ def run(
 
     T = q.shape[0]
 
-    # chunk_v6c for large workloads
+    # chunk_v6b for large workloads (16x16 hierarchical inverse, fastest)
     if T >= 1024:
-        return chunk_v6c(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+        return chunk_v6b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA v3 chunk kernel for medium workloads
     if T >= 64:
