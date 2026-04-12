@@ -254,28 +254,48 @@ mma_attn_v_mmajor_64x128(uint32_t output_tmem, uint32_t matrix_a_smem,
   }
 }
 
+__device__ __forceinline__ float scale_qk_if_active(float qk, float g_row,
+                                                    float g_col,
+                                                    uint32_t active) {
+  if (active == 0U) {
+    return 0.0f;
+  }
+  return g_row < g_col ? (qk * g_row) * g_col : (qk * g_col) * g_row;
+}
+
+__device__ __forceinline__ void store_bf162_shared(nv_bfloat16 *ptr,
+                                                   __nv_bfloat162 value) {
+  const uint32_t data = reinterpret_cast<const uint32_t &>(value);
+  asm volatile("st.shared.b32 [%0], %1;" :: "r"(cvt_smem_ptr(ptr)), "r"(data)
+               : "memory");
+}
+
 __device__ __forceinline__ void
-store_attn_column(nv_bfloat16 *attn_smem_ptr, const float *g_neg_smem_ptr,
-                  float qk_row0, float qk_row1, float g_row0, float g_row1,
-                  uint32_t row_base, uint32_t row_hi, uint32_t row_base_limit,
-                  uint32_t row_hi_limit, uint32_t col) {
-  const float g_col = g_neg_smem_ptr[col];
-  float value_row0 = 0.0f;
-  if (col < row_base_limit) {
-    value_row0 = g_row0 < g_col ? (qk_row0 * g_row0) * g_col
-                                : (qk_row0 * g_col) * g_row0;
-  }
+store_attn_column_pair(nv_bfloat16 *attn_smem_ptr, const float *g_neg_smem_ptr,
+                       float qk_row0_col0, float qk_row0_col1,
+                       float qk_row1_col0, float qk_row1_col1, float g_row0,
+                       float g_row1, uint32_t row_base, uint32_t row_hi,
+                       uint32_t row_base_limit, uint32_t row_hi_limit,
+                       uint32_t col) {
+  const uint32_t col_hi = col + 1U;
+  const float g_col0 = g_neg_smem_ptr[col];
+  const float g_col1 = g_neg_smem_ptr[col_hi];
+  const uint32_t row_base_idx = make_tile_layout_index(BLOCK_T, row_base, col);
+  const uint32_t row_hi_idx = make_tile_layout_index(BLOCK_T, row_hi, col);
 
-  float value_row1 = 0.0f;
-  if (col < row_hi_limit) {
-    value_row1 = g_row1 < g_col ? (qk_row1 * g_row1) * g_col
-                                : (qk_row1 * g_col) * g_row1;
-  }
-
-  attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_base, col)] =
-      __float2bfloat16_rn(value_row0);
-  attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_hi, col)] =
-      __float2bfloat16_rn(value_row1);
+  store_bf162_shared(
+      attn_smem_ptr + row_base_idx,
+      __floats2bfloat162_rn(
+          scale_qk_if_active(qk_row0_col0, g_row0, g_col0,
+                             col < row_base_limit),
+          scale_qk_if_active(qk_row0_col1, g_row0, g_col1,
+                             col_hi < row_base_limit)));
+  store_bf162_shared(
+      attn_smem_ptr + row_hi_idx,
+      __floats2bfloat162_rn(
+          scale_qk_if_active(qk_row1_col0, g_row1, g_col0, col < row_hi_limit),
+          scale_qk_if_active(qk_row1_col1, g_row1, g_col1,
+                             col_hi < row_hi_limit)));
 }
 
 __device__ __forceinline__ __nv_bfloat162 combine_output_pair(
@@ -652,44 +672,23 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_lo, 0, 0);
         tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_hi, 0, COLS_PER_FRAGMENT);
         tcgen05_wait_ld();
-        if (full_chunk) {
 #pragma unroll
-          for (uint32_t step = 0; step < FRAGMENT_STEPS; ++step) {
-            const uint32_t col_in_fragment =
-                (step / 2U) * 8U + 2U * lane_col + (step % 2U);
-            const uint32_t col_lo = col_in_fragment;
-            const uint32_t col_hi = col_in_fragment + COLS_PER_FRAGMENT;
-            const uint32_t reg_row0 = (step / 2U) * 4U + (step % 2U);
-            const uint32_t reg_row1 = reg_row0 + 2U;
+        for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS;
+             ++step_pair) {
+          const uint32_t col_lo = step_pair * 8U + 2U * lane_col;
+          const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
+          const uint32_t reg_base = step_pair * 4U;
 
-            store_attn_column(
-                attn_smem_ptr, g_neg_head_ptr, qk_reg_lo[reg_row0],
-                qk_reg_lo[reg_row1], g_row_base, g_row_hi, row_base, row_hi,
-                row_base_limit, row_hi_limit, col_lo);
-            store_attn_column(
-                attn_smem_ptr, g_neg_head_ptr, qk_reg_hi[reg_row0],
-                qk_reg_hi[reg_row1], g_row_base, g_row_hi, row_base, row_hi,
-                row_base_limit, row_hi_limit, col_hi);
-          }
-        } else {
-#pragma unroll
-          for (uint32_t step = 0; step < FRAGMENT_STEPS; ++step) {
-            const uint32_t col_in_fragment =
-                (step / 2U) * 8U + 2U * lane_col + (step % 2U);
-            const uint32_t col_lo = col_in_fragment;
-            const uint32_t col_hi = col_in_fragment + COLS_PER_FRAGMENT;
-            const uint32_t reg_row0 = (step / 2U) * 4U + (step % 2U);
-            const uint32_t reg_row1 = reg_row0 + 2U;
-
-            store_attn_column(
-                attn_smem_ptr, g_neg_head_ptr, qk_reg_lo[reg_row0],
-                qk_reg_lo[reg_row1], g_row_base, g_row_hi, row_base, row_hi,
-                row_base_limit, row_hi_limit, col_lo);
-            store_attn_column(
-                attn_smem_ptr, g_neg_head_ptr, qk_reg_hi[reg_row0],
-                qk_reg_hi[reg_row1], g_row_base, g_row_hi, row_base, row_hi,
-                row_base_limit, row_hi_limit, col_hi);
-          }
+          store_attn_column_pair(
+              attn_smem_ptr, g_neg_head_ptr, qk_reg_lo[reg_base],
+              qk_reg_lo[reg_base + 1U], qk_reg_lo[reg_base + 2U],
+              qk_reg_lo[reg_base + 3U], g_row_base, g_row_hi, row_base,
+              row_hi, row_base_limit, row_hi_limit, col_lo);
+          store_attn_column_pair(
+              attn_smem_ptr, g_neg_head_ptr, qk_reg_hi[reg_base],
+              qk_reg_hi[reg_base + 1U], qk_reg_hi[reg_base + 2U],
+              qk_reg_hi[reg_base + 3U], g_row_base, g_row_hi, row_base,
+              row_hi, row_base_limit, row_hi_limit, col_hi);
         }
         fence_proxy_async_shared_cta();
         __syncwarp();
