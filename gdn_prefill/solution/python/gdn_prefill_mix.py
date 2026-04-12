@@ -24,14 +24,13 @@ def run(
     scale: float,
 ):
     T = q.shape[0]
+    N = cu_seqlens.shape[0] - 1
 
-    # chunk_v6b for large workloads
-    if T >= 1024:
+    # chunk_v6b for T>=525 (beats v4 on all these workloads)
+    if T >= 525:
         return chunk_v6b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    N = cu_seqlens.shape[0] - 1
-    # CUDA v4 chunk kernel for medium workloads
-    # Also faster than recurrent for single-seq workloads with T>=46
+    # CUDA v4 for medium workloads
     if T >= 64 or (N == 1 and T >= 46):
         return cuda_v4(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
