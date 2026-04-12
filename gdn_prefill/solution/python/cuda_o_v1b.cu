@@ -529,6 +529,11 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
 
       mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
       tcgen05_fence_after_thread_sync();
+      float qk_reg_lo[REGS_PER_FRAGMENT];
+      float qk_reg_hi[REGS_PER_FRAGMENT];
+      tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_lo, 0, 0);
+      tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_hi, 0, COLS_PER_FRAGMENT);
+      tcgen05_wait_ld();
 
 #pragma unroll
       for (uint32_t head_offset = 0; head_offset < HEADS_PER_QK_HEAD;
@@ -538,11 +543,6 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
 
         nv_bfloat16 *attn_smem_ptr =
             reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_smem - smem));
-        float qk_reg_lo[REGS_PER_FRAGMENT];
-        float qk_reg_hi[REGS_PER_FRAGMENT];
-        tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_lo, 0, 0);
-        tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_hi, 0, COLS_PER_FRAGMENT);
-        tcgen05_wait_ld();
 #pragma unroll
         for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
           const uint32_t col_lo = step_pair * 8U + 2U * lane_col;
