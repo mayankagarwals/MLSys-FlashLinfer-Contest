@@ -15,7 +15,7 @@ def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
     k: Tensor,  # (total_seqlen, num_k_heads, head_dim)
     v: Tensor,  # (total_seqlen, num_v_heads, head_dim)
-    state: Tensor,  # (num_seqs, num_v_heads, head_dim, head_dim)
+    state: Tensor,  # (num_seqs, num_v_heads, head_dim, head_pad)
     A_log: Tensor,  # (num_v_heads)
     a: Tensor,  # (total_seqlen, num_v_heads)
     dt_bias: Tensor,  # (num_v_heads)
@@ -26,11 +26,11 @@ def run(
     T = q.shape[0]
 
     # chunk_v6b for large workloads
-    if T >= 128:
+    if T >= 255:
         return chunk_v6b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA v3 chunk kernel for medium workloads
-    if T >= 64:
+    if T >= 61:
         return cuda_v3(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA recurrent for tiny workloads
