@@ -38,7 +38,7 @@ mod = tvm_ffi.load_module(lib_path)
 
 @triton.jit
 def merge_16x16_to_64x64_inverse_kernel_v2(
-    k_ptr, v_ptr, w_ptr, u_ptr, A_ptr, Ai_ptr,
+    k_ptr, v_ptr, w_ptr, u_ptr, A_ptr,
     beta_ptr, g_cu_ptr, cu_seqlens_ptr, chunk_indices_ptr,
     total_chunks_ptr,
     H: tl.constexpr, Hg: tl.constexpr, K_dim: tl.constexpr,
@@ -57,7 +57,6 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     seqlen   = eos - bos
 
     A_ptr  += bos * H * BT + head_id * BT
-    Ai_ptr += bos * H * BT + head_id * BT
 
     offs_t  = chunk_id * BT + tl.arange(0, 16)[:, None]
     offsets = offs_t * H * BT + tl.arange(0, 16)
@@ -96,6 +95,12 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     tmp = tl.dot(A_43, Ai_31, acc=tmp, input_precision="tf32x3")
     Ai_41 = -tl.dot(Ai_44, tmp, input_precision="tf32x3")
 
+    # bf16 roundtrip: matches the standard "fp32 inverse → bf16 → MMA" pipeline that
+    # the flashinfer reference also uses. The reference computes the inverse via scalar
+    # fp32 back-substitution, then stores to smem as bf16 before W/U MMA. We replicate
+    # this truncation so our block-wise W/U dot inputs match. Without this, 2 workloads
+    # fail at atol=1e-2 because keeping fp32 Ai causes different bf16 rounding in
+    # Ab = (Ai * beta).to(bf16), diverging from the reference's bf16-quantized path.
     Ai_11 = Ai_11.to(tl.bfloat16).to(tl.float32)
     Ai_21 = Ai_21.to(tl.bfloat16).to(tl.float32)
     Ai_22 = Ai_22.to(tl.bfloat16).to(tl.float32)
@@ -260,11 +265,10 @@ def run(
     mod.kkt_v1b(k, A_log, a, dt_bias, b, g_cu, beta, A,
                cu_seqlens, chunk_indices, total_chunks_ptr)
 
-    Ai    = torch.empty_like(A, dtype=k.dtype)
     u     = torch.empty_like(v)
     w     = k.new_empty(T, H, K_dim)
     merge_16x16_to_64x64_inverse_kernel_v2[(upper_bound_chunks, H)](
-        k, v, w, u, A, Ai, beta, g_cu,
+        k, v, w, u, A, beta, g_cu,
         cu_seqlens, chunk_indices, total_chunks_ptr,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT,
         DOT_PRECISION="tf32",
