@@ -256,7 +256,6 @@ def run(
         w,
         u,
         A,
-        A,
         beta,
         g_cu,
         cu_seqlens,
