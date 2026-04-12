@@ -386,6 +386,7 @@ void h_kernel_cutlass(
         const int last_idx = min(bos + (chunk_id + 1) * BT, eos) - 1;
         h_scale = __expf(g_cu_ptr[last_idx * H + head_id]);
       }
+      h_scale = warp_uniform(h_scale);
       if (elect_sync()) profiler.stamp(COMPUTE_H_SCALE);
 
       // for chunk_id > 0, wait for vk MMA to update H
