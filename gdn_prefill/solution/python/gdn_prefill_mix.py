@@ -26,7 +26,7 @@ def run(
     T = q.shape[0]
 
     # chunk_v6b for large workloads
-    if T >= 1024:
+    if T >= 128:
         return chunk_v6b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA v3 chunk kernel for medium workloads
