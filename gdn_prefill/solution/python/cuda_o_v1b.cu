@@ -72,8 +72,7 @@ constexpr uint32_t G_SMEM_SIZE = BLOCK_T * sizeof(float);
 constexpr uint32_t QK_TMA_BARRIER_BYTES = QK_STAGE_COUNT * 8U;
 constexpr uint32_t OFFSET_Q = 0U;
 constexpr uint32_t OFFSET_K = OFFSET_Q + Q_SMEM_BYTES;
-constexpr uint32_t OFFSET_V = OFFSET_K + K_SMEM_BYTES;
-constexpr uint32_t OFFSET_H = OFFSET_V + V_SMEM_SIZE;
+constexpr uint32_t OFFSET_H = OFFSET_K + K_SMEM_BYTES;
 constexpr uint32_t OFFSET_ATTN = OFFSET_H + H_SMEM_SIZE;
 constexpr uint32_t OFFSET_OUTPUT = OFFSET_ATTN + ATTN_SMEM_SIZE;
 constexpr uint32_t OFFSET_G = OFFSET_OUTPUT + OUTPUT_SMEM_SIZE;
@@ -342,7 +341,6 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
 
   const uint32_t q_smem = smem + OFFSET_Q;
   const uint32_t k_smem = smem + OFFSET_K;
-  const uint32_t v_smem = smem + OFFSET_V;
   const uint32_t h_smem = smem + OFFSET_H;
   const uint32_t attn_smem = smem + OFFSET_ATTN;
   const uint32_t g_smem = smem + OFFSET_G;
@@ -427,6 +425,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
       const uint32_t next_global_chunk_id = global_chunk_id + gridDim.y;
       const uint32_t next_qk_phase = qk_phase ^ 1U;
       const uint32_t next_qk_tma_barrier = qk_tma_barriers + next_qk_phase * 8U;
+      const uint32_t v_stage_smem = k_smem + qk_phase * K_SMEM_SIZE;
 
       if (elect_sync() && next_global_chunk_id < total_num_chunks_u) {
         const int2 next_chunk_meta = reinterpret_cast<const int2 *>(
@@ -449,11 +448,12 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
         const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
 
         if (elect_sync()) {
-          tma_load_4d(v_smem, &v_tmap, 0, chunk_start_i32, v_tile, head_id,
-                      v_tma_barrier);
           tma_load_4d(h_smem, &h_tmap, 0, v_start, 0, h_outer, h_tma_barrier);
-          mbarrier_arrive_expect_tx(v_tma_barrier, V_SMEM_SIZE);
           mbarrier_arrive_expect_tx(h_tma_barrier, H_SMEM_SIZE);
+          mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
+          tma_load_4d(v_stage_smem, &v_tmap, 0, chunk_start_i32, v_tile, head_id,
+                      v_tma_barrier);
+          mbarrier_arrive_expect_tx(v_tma_barrier, V_SMEM_SIZE);
         }
 
         tcgen05_fence_before_thread_sync();
@@ -467,6 +467,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
       const uint32_t qk_phase = chunk_iter & 1U;
       const uint32_t q_stage_smem = q_smem + qk_phase * Q_SMEM_SIZE;
       const uint32_t k_stage_smem = k_smem + qk_phase * K_SMEM_SIZE;
+      const uint32_t v_stage_smem = k_stage_smem;
       const uint32_t qk_tma_barrier = qk_tma_barriers + qk_phase * 8U;
       const uint32_t qk_tma_stage_phase = (chunk_iter / QK_STAGE_COUNT) & 1U;
 
@@ -490,7 +491,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
           mbarrier_wait(v_tma_barrier, head_phase);
           mbarrier_wait(attn_ready_barrier, head_phase);
           tcgen05_fence_after_thread_sync();
-          mma_attn_v_mmajor_64x128(OUTPUT_TMEM_COL, attn_smem, v_smem);
+          mma_attn_v_mmajor_64x128(OUTPUT_TMEM_COL, attn_smem, v_stage_smem);
           tcgen05_commit(ov_mma_barrier);
         }
 
