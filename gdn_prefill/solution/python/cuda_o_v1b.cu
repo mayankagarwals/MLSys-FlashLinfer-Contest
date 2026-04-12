@@ -534,11 +534,6 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
            ++head_offset) {
         const uint32_t head_phase = head_offset & 1U;
         const uint32_t head_id = head_id_base + head_offset;
-        if (head_offset != 0U) {
-          load_g_to_smem(g_smem_ptr, g_cu_ptr, chunk_start, chunk_len, head_id,
-                         tid);
-          bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
-        }
 
         nv_bfloat16 *attn_smem_ptr =
             reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_smem - smem));
@@ -580,14 +575,20 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
         if (elect_sync()) {
           mbarrier_arrive(attn_ready_barrier);
         }
+        const float g_row_base = __expf(g_smem_ptr[row_base]);
+        const float g_row_hi = __expf(g_smem_ptr[row_hi]);
+        if (head_offset == 0U) {
+          bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
+          load_g_to_smem(g_smem_ptr, g_cu_ptr, chunk_start, chunk_len,
+                         head_id_base + 1U, tid);
+          bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
+        }
 
         mbarrier_wait(ov_mma_barrier, OV_MMA_PHASE ^ head_phase);
         mbarrier_wait(qh_mma_barrier, QH_MMA_PHASE ^ head_phase);
         tcgen05_fence_after_thread_sync();
 
         if (full_chunk) {
-          const float g_row_base = __expf(g_smem_ptr[row_base]);
-          const float g_row_hi = __expf(g_smem_ptr[row_hi]);
           nv_bfloat16 *row_base_o_ptr =
               o_ptr + (((chunk_start + static_cast<int64_t>(row_base)) *
                             NUM_OUTPUT_HEADS +
@@ -656,8 +657,6 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
                            VALUE_DIM +
                        v_start);
           nv_bfloat16 *row_hi_o_ptr = row_base_o_ptr + ROW_PAIR_OUTPUT_STRIDE;
-          const float g_row_base = __expf(g_smem_ptr[row_base]);
-          const float g_row_hi = __expf(g_smem_ptr[row_hi]);
 #pragma unroll
           for (uint32_t fragment_pair = 0; fragment_pair < BLOCK_V / BLOCK_T;
                ++fragment_pair) {
