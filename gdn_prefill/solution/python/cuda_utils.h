@@ -211,6 +211,17 @@ void tma_load_4d(uint32_t smem_addr, const void *tmap_ptr,
        "r"(mbar_addr), "l"(cache_policy) : "memory");
 }
 
+__device__ __forceinline__
+void tma_load_5d(uint32_t smem_addr, const void *tmap_ptr,
+                 int x, int y, int z, int w, int t,
+                 uint32_t mbar_addr, uint64_t cache_policy = EVICT_NORMAL) {
+  asm volatile(
+    "cp.async.bulk.tensor.5d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint "
+    "[%0], [%1, {%2, %3, %4, %5, %6}], [%7], %8;"
+    :: "r"(smem_addr), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w), "r"(t),
+       "r"(mbar_addr), "l"(cache_policy) : "memory");
+}
+
 // TMA device-side stores
 __device__ __forceinline__
 void tma_store_2d(const void *tmap_ptr, uint32_t smem_addr, 
@@ -744,6 +755,16 @@ void ldg_u32x8(void *data_, const void *ptr) {
 }
 
 __device__ inline
+void ldg_u32x8_fast(void *data_, const void *ptr) {
+  uint32_t *data = reinterpret_cast<uint32_t *>(data_);
+  asm volatile(
+    "ld.global.relaxed.cta.L1::no_allocate.v8.f32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+    : "=r"(data[0]), "=r"(data[1]), "=r"(data[2]), "=r"(data[3]),
+      "=r"(data[4]), "=r"(data[5]), "=r"(data[6]), "=r"(data[7])
+    : "l"(ptr));
+}
+
+__device__ inline
 void stg_u32x8(void *ptr, const void *data_) {
   const uint32_t *data = reinterpret_cast<const uint32_t *>(data_);
   asm volatile(
@@ -818,4 +839,16 @@ void cp_async_cg_128(uint32_t smem_addr, const void *gmem_ptr, bool pred) {
   uint32_t p = pred ? 16 : 0;
   asm volatile("cp.async.cg.shared.global [%0], [%1], 0x10, %2;"
     :: "r"(smem_addr), "l"(gmem_ptr), "r"(p) : "memory");
+}
+
+template <int nregs>
+__device__ __forceinline__
+void setmaxnreg_inc() {
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;" :: "n"(nregs));
+}
+
+template <int nregs>
+__device__ __forceinline__
+void setmaxnreg_dec() {
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;" :: "n"(nregs));
 }
