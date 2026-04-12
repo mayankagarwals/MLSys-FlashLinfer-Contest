@@ -44,6 +44,8 @@ constexpr uint32_t FRAGMENT_PAIRS = FRAGMENT_STEPS / 2U;
 //// Swizzle 128B, 1024 bit width atom
 constexpr uint32_t TILE_ATOM = 8U;
 constexpr uint32_t TILE_ATOM_ELEMS = TILE_ATOM * TILE_ATOM;
+constexpr uint32_t ATTN_FRAGMENT_SMEM_OFFSET =
+    (COLS_PER_FRAGMENT / TILE_ATOM) * BLOCK_T * TILE_ATOM;
 constexpr uint32_t SWIZZLE_HEIGHT = BLOCK_T;
 constexpr uint32_t SWIZZLE_WIDTH = 128U / sizeof(nv_bfloat16);
 constexpr uint32_t SWIZZLE_BYTES =
@@ -236,25 +238,28 @@ mma_attn_v_mmajor_64x128(uint32_t output_tmem, uint32_t matrix_a_smem,
   }
 }
 
-__device__ __forceinline__ void
-store_attn_column(nv_bfloat16 *attn_smem_ptr, const float *g_smem_ptr,
-                  const float *reg, uint32_t row_base, uint32_t row_hi,
-                  uint32_t row_base_limit, uint32_t row_hi_limit,
-                  uint32_t reg_row0, uint32_t reg_row1, uint32_t col) {
-  float value_row0 = 0.0f;
-  if (col < row_base_limit) {
-    value_row0 = reg[reg_row0] * __expf(g_smem_ptr[row_base] - g_smem_ptr[col]);
+__device__ __forceinline__ __nv_bfloat162
+make_attn_pair(const float *g_smem_ptr, const float *reg, uint32_t row,
+               uint32_t row_limit, uint32_t reg_lo, uint32_t reg_hi,
+               uint32_t col) {
+  float value_lo = 0.0f;
+  if (col < row_limit) {
+    value_lo = reg[reg_lo] * __expf(g_smem_ptr[row] - g_smem_ptr[col]);
   }
 
-  float value_row1 = 0.0f;
-  if (col < row_hi_limit) {
-    value_row1 = reg[reg_row1] * __expf(g_smem_ptr[row_hi] - g_smem_ptr[col]);
+  const uint32_t col_hi = col + 1U;
+  float value_hi = 0.0f;
+  if (col_hi < row_limit) {
+    value_hi = reg[reg_hi] * __expf(g_smem_ptr[row] - g_smem_ptr[col_hi]);
   }
 
-  attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_base, col)] =
-      __float2bfloat16_rn(value_row0);
-  attn_smem_ptr[make_tile_layout_index(BLOCK_T, row_hi, col)] =
-      __float2bfloat16_rn(value_row1);
+  return __floats2bfloat162_rn(value_lo, value_hi);
+}
+
+__device__ __forceinline__ void store_attn_pair(nv_bfloat16 *attn_smem_ptr,
+                                                uint32_t index,
+                                                __nv_bfloat162 value) {
+  *reinterpret_cast<__nv_bfloat162 *>(attn_smem_ptr + index) = value;
 }
 
 __device__ __forceinline__ __nv_bfloat162 combine_output_pair(
@@ -295,6 +300,22 @@ store_bf162_pair_no_allocate_if(nv_bfloat16 *ptr_0, __nv_bfloat162 value_0,
                "@p st.global.relaxed.cta.L1::no_allocate.u32 [%1], %3;\n\t"
                "}" ::"l"(ptr_0),
                "l"(ptr_1), "r"(data_0), "r"(data_1), "r"(predicate));
+}
+
+__device__ __forceinline__ void load_g_to_smem(float *g_smem_ptr,
+                                               const float *g_cu_ptr,
+                                               int64_t chunk_start,
+                                               uint32_t chunk_len,
+                                               uint32_t head_id,
+                                               uint32_t tid) {
+  for (uint32_t i = tid; i < BLOCK_T; i += NUM_CUDA_WARPS * WARP_SIZE) {
+    float g_value = 0.0f;
+    if (i < chunk_len) {
+      const int64_t token_idx = chunk_start + static_cast<int64_t>(i);
+      g_value = g_cu_ptr[token_idx * NUM_OUTPUT_HEADS + head_id];
+    }
+    g_smem_ptr[i] = g_value;
+  }
 }
 
 __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
@@ -500,6 +521,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
       const uint32_t row_base_limit = row_base < chunk_len ? row_base + 1U : 0U;
       const uint32_t row_hi_limit = row_hi < chunk_len ? row_hi + 1U : 0U;
       const uint32_t qk_phase = chunk_iter & 1U;
+      const uint32_t head0_id = head_id_base;
+
+      load_g_to_smem(g_smem_ptr, g_cu_ptr, chunk_start, chunk_len, head0_id, tid);
+      bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
 
       mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
       tcgen05_fence_after_thread_sync();
@@ -509,16 +534,11 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
            ++head_offset) {
         const uint32_t head_phase = head_offset & 1U;
         const uint32_t head_id = head_id_base + head_offset;
-
-        for (uint32_t i = tid; i < BLOCK_T; i += NUM_CUDA_WARPS * WARP_SIZE) {
-          float g_value = 0.0f;
-          if (i < chunk_len) {
-            const int64_t token_idx = chunk_start + static_cast<int64_t>(i);
-            g_value = g_cu_ptr[token_idx * NUM_OUTPUT_HEADS + head_id];
-          }
-          g_smem_ptr[i] = g_value;
+        if (head_offset != 0U) {
+          load_g_to_smem(g_smem_ptr, g_cu_ptr, chunk_start, chunk_len, head_id,
+                         tid);
+          bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
         }
-        bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
 
         nv_bfloat16 *attn_smem_ptr =
             reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_smem - smem));
@@ -528,20 +548,32 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
         tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_hi, 0, COLS_PER_FRAGMENT);
         tcgen05_wait_ld();
 #pragma unroll
-        for (uint32_t step = 0; step < FRAGMENT_STEPS; ++step) {
-          const uint32_t col_in_fragment =
-              (step / 2U) * 8U + 2U * lane_col + (step % 2U);
-          const uint32_t col_lo = col_in_fragment;
-          const uint32_t col_hi = col_in_fragment + COLS_PER_FRAGMENT;
-          const uint32_t reg_row0 = (step / 2U) * 4U + (step % 2U);
+        for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
+          const uint32_t col_lo = step_pair * 8U + 2U * lane_col;
+          const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
+          const uint32_t reg_row0 = step_pair * 4U;
           const uint32_t reg_row1 = reg_row0 + 2U;
+          const uint32_t row_base_lo_idx =
+              make_tile_layout_index(BLOCK_T, row_base, col_lo);
+          const uint32_t row_hi_lo_idx =
+              make_tile_layout_index(BLOCK_T, row_hi, col_lo);
 
-          store_attn_column(attn_smem_ptr, g_smem_ptr, qk_reg_lo, row_base,
-                            row_hi, row_base_limit, row_hi_limit, reg_row0,
-                            reg_row1, col_lo);
-          store_attn_column(attn_smem_ptr, g_smem_ptr, qk_reg_hi, row_base,
-                            row_hi, row_base_limit, row_hi_limit, reg_row0,
-                            reg_row1, col_hi);
+          store_attn_pair(
+              attn_smem_ptr, row_base_lo_idx,
+              make_attn_pair(g_smem_ptr, qk_reg_lo, row_base, row_base_limit,
+                             reg_row0, reg_row0 + 1U, col_lo));
+          store_attn_pair(
+              attn_smem_ptr, row_base_lo_idx + ATTN_FRAGMENT_SMEM_OFFSET,
+              make_attn_pair(g_smem_ptr, qk_reg_hi, row_base, row_base_limit,
+                             reg_row0, reg_row0 + 1U, col_hi));
+          store_attn_pair(
+              attn_smem_ptr, row_hi_lo_idx,
+              make_attn_pair(g_smem_ptr, qk_reg_lo, row_hi, row_hi_limit,
+                             reg_row1, reg_row1 + 1U, col_lo));
+          store_attn_pair(
+              attn_smem_ptr, row_hi_lo_idx + ATTN_FRAGMENT_SMEM_OFFSET,
+              make_attn_pair(g_smem_ptr, qk_reg_hi, row_hi, row_hi_limit,
+                             reg_row1, reg_row1 + 1U, col_hi));
         }
         fence_proxy_async_shared_cta();
         __syncwarp();
