@@ -297,13 +297,14 @@ store_bf162_pair_no_allocate_if(nv_bfloat16 *ptr_0, __nv_bfloat162 value_0,
                "l"(ptr_1), "r"(data_0), "r"(data_1), "r"(predicate));
 }
 
-__global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
+__global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1b_kernel_cutlass(
     const __grid_constant__ CUtensorMap q_tmap,
     const __grid_constant__ CUtensorMap k_tmap,
     const __grid_constant__ CUtensorMap v_tmap,
     const __grid_constant__ CUtensorMap h_tmap, const float *g_cu_ptr,
     nv_bfloat16 *o_ptr, const int64_t *cu_seqlens_ptr,
-    const int32_t *chunk_indices_ptr, int32_t total_num_chunks, float scale) {
+    const int32_t *chunk_indices_ptr, const int32_t *total_num_chunks_ptr,
+    float scale) {
   const uint32_t tid = threadIdx.x;
   const uint32_t warp_id = tid / WARP_SIZE;
   const uint32_t lane_id = tid % WARP_SIZE;
@@ -372,7 +373,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
     lane_col = lane_id % LANES_PER_ROW_GROUP;
   }
 
-  const uint32_t total_num_chunks_u = static_cast<uint32_t>(total_num_chunks);
+  const uint32_t total_num_chunks_u =
+      static_cast<uint32_t>(*total_num_chunks_ptr);
 
   if (warp_id == TMA_WARP) {
     if (blockIdx.y < total_num_chunks_u) {
@@ -691,13 +693,15 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
   return;
 }
 
-void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
-          TensorView h, TensorView g_cu, TensorView o, TensorView cu_seqlens,
-          TensorView chunk_indices, int total_num_chunks, double scale) {
+void o_v1b(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
+           TensorView h, TensorView g_cu, TensorView o, TensorView cu_seqlens,
+           TensorView chunk_indices, TensorView total_num_chunks_ptr,
+           double scale) {
   const uint32_t total_num_tokens = static_cast<uint32_t>(q_chunks.size(0));
-  const uint32_t total_num_chunks_u = static_cast<uint32_t>(total_num_chunks);
+  const uint32_t upper_bound_chunks_u =
+      static_cast<uint32_t>(chunk_indices.size(0));
   const uint64_t total_num_output_tiles =
-      static_cast<uint64_t>(total_num_chunks_u) * NUM_OUTPUT_HEADS;
+      static_cast<uint64_t>(upper_bound_chunks_u) * NUM_OUTPUT_HEADS;
 
   auto q_tmap = encode_qk_tma(q_chunks.data_ptr(), total_num_tokens,
                               NUM_QK_HEADS, HEAD_DIM);
@@ -713,12 +717,14 @@ void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
       reinterpret_cast<const int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_indices_ptr =
       reinterpret_cast<const int32_t *>(chunk_indices.data_ptr());
+  auto *total_num_chunks_ptr_d =
+      reinterpret_cast<const int32_t *>(total_num_chunks_ptr.data_ptr());
 
-  auto kernel = o_v1_kernel_cutlass;
+  auto kernel = o_v1b_kernel_cutlass;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                        SMEM_SIZE);
 
-  if (total_num_chunks_u == 0U) {
+  if (upper_bound_chunks_u == 0U) {
     return;
   }
 
@@ -741,14 +747,14 @@ void o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
   }
   persistent_grid_y =
       persistent_grid_y > 1U ? (persistent_grid_y + 1U) / 2U : 1U;
-  if (persistent_grid_y > total_num_chunks_u) {
-    persistent_grid_y = total_num_chunks_u;
+  if (persistent_grid_y > upper_bound_chunks_u) {
+    persistent_grid_y = upper_bound_chunks_u;
   }
 
   dim3 grid(VALUE_DIM / BLOCK_V, persistent_grid_y, NUM_QK_HEADS);
   kernel<<<grid, NUM_THREADS, SMEM_SIZE>>>(
       q_tmap, k_tmap, v_tmap, h_tmap, g_cu_ptr, o_ptr, cu_seqlens_ptr,
-      chunk_indices_ptr, total_num_chunks, static_cast<float>(scale));
+      chunk_indices_ptr, total_num_chunks_ptr_d, static_cast<float>(scale));
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(o_v1, o_v1);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(o_v1b, o_v1b);
