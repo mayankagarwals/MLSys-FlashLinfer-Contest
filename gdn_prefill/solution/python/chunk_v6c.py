@@ -92,7 +92,6 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     w_ptr,
     u_ptr,
     A_ptr,
-    Ai_ptr,
     beta_ptr,
     g_cu_ptr,
     cu_seqlens_ptr,
@@ -116,7 +115,6 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
 
     # compute inverse
     A_ptr += bos * H * BT + head_id * BT
-    Ai_ptr += bos * H * BT + head_id * BT
 
     offs_t = chunk_id * BT + tl.arange(0, 16)[:, None]
     offsets = offs_t * H * BT + tl.arange(0, 16)
@@ -168,9 +166,12 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     # Original chunk_v5 flow: store Ai to global (bf16) → debug_barrier → reload [64,64] → single big dot
     # New flow: skip the global roundtrip, compute W/U from the 10 Ai blocks directly.
     #
-    # bf16 roundtrip (.to(bf16).to(f32)): the original path stored Ai as bf16 to global memory,
-    # which truncated precision. We replicate that truncation here so the downstream W/U dots
-    # see identical bf16 values. Without this, 2 workloads fail at the atol=1e-2 boundary.
+    # bf16 roundtrip (.to(bf16).to(f32)): numerical compatibility hack. The original chunk_v5
+    # stored Ai as bf16 to global memory, truncating precision. We replicate that truncation
+    # so the block-wise W/U dots produce results matching the reference. Without this,
+    # 2 workloads fail at the atol=1e-2 boundary — not because fp32 Ai is less accurate,
+    # but because the block-wise [16,16] accumulation differs slightly from the reference's
+    # single [64,64] dot. Removing this requires changing how W/U accumulation works.
     #
     # acc= chaining (below): each row-block's W/U is computed as a sum of [16,16]@[16,dim] dots
     # using tl.dot(..., acc=prev). This feeds the MMA accumulator across dots, matching the
@@ -331,11 +332,10 @@ def run(
         cu_seqlens, chunk_indices, total_num_chunks,
     )
 
-    Ai = torch.empty_like(A, dtype=k.dtype)  # BF16
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
     merge_16x16_to_64x64_inverse_kernel_v2[(total_num_chunks, H)](
-        k, v, w, u, A, Ai, beta, g_cu,
+        k, v, w, u, A, beta, g_cu,
         cu_seqlens, chunk_indices,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT,
         DOT_PRECISION="tf32",  # tf32 for diagonal inverse speed; Newton-Schulz corrects precision
