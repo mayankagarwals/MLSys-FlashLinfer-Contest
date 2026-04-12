@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .chunk_v6c import run as chunk_v6c
+from .chunk_v6c import run as chunk_v6c  # v6 + Newton-Schulz + v6b optimizations
 from .cuda_parallel_v3 import run as cuda_v3
 
 
@@ -23,6 +23,8 @@ def run(
     cu_seqlens: Tensor,  # (num_seqlens + 1)
     scale: float,
 ):
+    T = q.shape[0]
+
     T = q.shape[0]
 
     # chunk_v6c for large workloads
