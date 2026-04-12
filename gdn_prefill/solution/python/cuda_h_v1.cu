@@ -402,12 +402,17 @@ void h_kernel_cutlass(
           if (vk_stage_id == 0)
             vk_parity ^= 1;
         }
+        else if (warp_id_ == 3) {
+          // drain H TMA store of the previous iteration before overwriting its smem
+          if (elect_sync())
+            cp_async_bulk_wait_group_read<0>();
+        }
         bar_sync<1>(128);
         tcgen05_fence_after_thread_sync();
         if (elect_sync()) profiler.stamp(WAIT_VK_MMA);
       }
 
-      // prepare H input for wh MMA to unblock it ASAP
+      // convert H to BF16 for wh MMA input and store to gmem for O kernel
       // collectively, 4 warps represent H[V_dim, K_dim]
       // each thread processes 1 row
       for (int i = 0; i < K_dim / 32; i++) {
@@ -430,26 +435,29 @@ void h_kernel_cutlass(
           tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
         }
 
-        // pack to BF16 for wh MMA
+        // pack to BF16
         for (int j = 0; j < 16; j++)
           tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
+
+        // for wh MMA input
         tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, h_tmem_base + i * 16, tmp);
+
+        // for O kernel
+        // H smem layout: [K_dim/64, V_dim, 64]
+        for (int j = 0; j < 32 / 8; j++) {
+          const int col = ((i % 2) * 4 + j) ^ (tid_ % 8);
+          const int addr = H_smem + (i / 2) * V_dim * 128 + tid_ * 128 + col * 16;
+          sts_b32x4(addr, tmp + j * 4);
+        }
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
       mbarrier_arrive(wh_in_mbar_addr + stage_id * 8);
       if (elect_sync()) profiler.stamp(PROCESS_H);
 
-      // drain H TMA store of the previous iteration before overwriting its smem
-      if (warp_id_ == 0 && elect_sync())
-        cp_async_bulk_wait_group_read<0>();
-      bar_sync<1>(128);
-
-      // slowly prepare for O kernel and store vk MMA acc
-      // TODO: for O kernel, may want to store to smem then TMA store
+      // scale H for vk MMA acc
       for (int i = 0; i < K_dim / 32; i++) {
         float h_f32[32];
-        uint32_t tmp[16];
 
         if (chunk_id == 0) {
           // load H0 from smem for 1st chunk
@@ -467,18 +475,6 @@ void h_kernel_cutlass(
           tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
         }
 
-        // pack to BF16 for O kernel
-        for (int j = 0; j < 16; j++)
-          tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
-
-        // H smem layout: [K_dim/64, V_dim, 64]
-        for (int j = 0; j < 32 / 8; j++) {
-          const int col = ((i % 2) * 4 + j) ^ (tid_ % 8);
-          const int addr = H_smem + (i / 2) * V_dim * 128 + tid_ * 128 + col * 16;
-          sts_b32x4(addr, tmp + j * 4);
-        }
-
-        // scaled H for vk MMA
         for (int j = 0; j < 32; j++)
           h_f32[j] *= h_scale;
         tcgen05_st<SHAPE::_32x32b, 32>(warp_id_ * 32, vk_tmem + i * 32, h_f32);  // for vk MMA
@@ -490,7 +486,7 @@ void h_kernel_cutlass(
 
       bar_sync<1>(128);
       asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;");
-      if (warp_id_ == 0 && elect_sync()) {
+      if (warp_id_ == 3 && elect_sync()) {
         // natural shape:  [total_num_chunks, H, V_dim, K_dim]
         // permuted shape: [total_num_chunks*H, K_dim/64, V_dim, 64]
         tma_store_4d(&H_tmap, H_smem, 0, 0, 0, (chunk_offset + chunk_id) * H + head_id);
