@@ -1,8 +1,7 @@
 # chunk_v6c: EXPERIMENTAL — direct 64×64 inverse (reference only, not used in production)
 # Uses single [64,64] Neumann series instead of hierarchical 16×16 blocks.
-# Slower than chunk_v6/v6b (14,713 us vs 11,004 us) due to cubic compute growth:
-# 14 [64,64] dots = 896 equivalent [16,16] dots, vs 48 actual [16,16] dots in v6/v6b.
-# Kept as reference for comparison. Production uses chunk_v6b (16×16 hierarchical).
+# Kept as reference for comparison.
+# Also evaluated 32x32, also slower than 16x16.
 
 import os
 from pathlib import Path

@@ -95,6 +95,12 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     tmp = tl.dot(A_43, Ai_31, acc=tmp, input_precision="tf32x3")
     Ai_41 = -tl.dot(Ai_44, tmp, input_precision="tf32x3")
 
+    # bf16 roundtrip: matches the standard "fp32 inverse → bf16 → MMA" pipeline that
+    # the flashinfer reference also uses. The reference computes the inverse via scalar
+    # fp32 back-substitution, then stores to smem as bf16 before W/U MMA. We replicate
+    # this truncation so our block-wise W/U dot inputs match. Without this, 2 workloads
+    # fail at atol=1e-2 because keeping fp32 Ai causes different bf16 rounding in
+    # Ab = (Ai * beta).to(bf16), diverging from the reference's bf16-quantized path.
     Ai_11 = Ai_11.to(tl.bfloat16).to(tl.float32)
     Ai_21 = Ai_21.to(tl.bfloat16).to(tl.float32)
     Ai_22 = Ai_22.to(tl.bfloat16).to(tl.float32)

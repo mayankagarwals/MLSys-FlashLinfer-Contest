@@ -168,11 +168,9 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     #
     # bf16 roundtrip (.to(bf16).to(f32)): matches the standard "fp32 inverse → bf16 → MMA"
     # pipeline that the flashinfer reference also uses. The reference computes the inverse
-    # via scalar fp32 back-substitution, then stores results to smem as bf16 before the
-    # W/U MMA step. We replicate this bf16 truncation so our W/U dot inputs match.
-    # Without this, 2 workloads fail at the atol=1e-2 boundary because keeping extra fp32
-    # precision in Ai causes different bf16 rounding in Ab = (Ai * beta).to(bf16),
-    # which diverges from the reference's bf16-quantized path.
+    # via scalar fp32 back-substitution, then stores to smem as bf16 before W/U MMA.
+    # Without this, 2 workloads fail at atol=1e-2 because keeping fp32 Ai causes different
+    # bf16 rounding in Ab = (Ai * beta).to(bf16), diverging from the reference.
     #
     # acc= chaining (below): each row-block's W/U is computed as a sum of [16,16]@[16,dim] dots
     # using tl.dot(..., acc=prev). This feeds the MMA accumulator across dots, matching the
