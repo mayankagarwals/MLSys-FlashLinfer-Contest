@@ -231,7 +231,7 @@ void h_kernel_cutlass(
         mbarrier_init(mma_mbar_addr + i * 8, 1);
       }
       mbarrier_init(h0_mbar_addr, 1);
-      mbarrier_init(h_mbar_addr, WARP_SIZE * 4);
+      mbarrier_init(h_mbar_addr, WARP_SIZE * 8);
       mbarrier_init(scaled_h_mbar_addr, WARP_SIZE * 4);
       mbarrier_init(scaled_v_mbar_addr, WARP_SIZE * 4);
       mbarrier_init(wh_mbar_addr, 1);
@@ -310,7 +310,7 @@ void h_kernel_cutlass(
         // wh MMA
         // H in tmem, W in smem. both are K-major
         // [V_dim, K_dim] x [BT, K_dim] -> [V_dim, BT]
-        constexpr uint32_t wh_idesc = make_tcgen05_idesc(V_dim, BT);
+        constexpr uint32_t wh_idesc = make_tcgen05_idesc(V_dim, BT) | (1U << 13U);  // negate A
 
         // 128B swizzling
         constexpr uint64_t w_desc_base = (desc_encode(8 * 128) << 32ULL)  // SBO
@@ -328,8 +328,7 @@ void h_kernel_cutlass(
           for (int j = 0; j < 64 / 16; j++) {
             const int h_tmem = h_tmem_base + i * 32 + j * 8;
             const uint64_t w_desc = w_desc_base | ((W_smem + i * BT * 128 + j * 32) >> 4);
-            const int enable_input_d = (i > 0) || (j > 0);
-            tcgen05_mma_tmem(wh_tmem, h_tmem, w_desc, wh_idesc, enable_input_d);
+            tcgen05_mma_tmem(wh_tmem, h_tmem, w_desc, wh_idesc, 1);  // always enable input d
           }
         tcgen05_commit(wh_mbar_addr);
         profiler.stamp(ISSUE_WH_MMA);
@@ -528,6 +527,39 @@ void h_kernel_cutlass(
     const int chunk_offset = chunk_offsets_ptr[seq_id];
 
     for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
+      const uint32_t W_smem = smem + tma_stage * STAGE_SIZE;
+      const uint32_t V_smem = W_smem + W_size;
+      const uint32_t K_smem = V_smem + V_size;
+
+      // wait for V
+      if (warp_id == 0)
+        mbarrier_wait(tma_mbar_addr + tma_stage * 8, tma_parity);
+      bar_sync<2>(128);
+
+      // unpack V from BF16->FP32, then store as acc for wh MMA
+      // total tile:  [V_dim, BT]
+      // each warp:   [32, BT]
+      // each thread: [1, BT]
+      for (int i = 0; i < BT / 8; i++) {
+        // V smem layout: [V_dim/64, BT, 64] = [2, BT, 64]
+        // each ldmatrix loads [8, 32] along the last 2 dims
+        uint32_t v_bf16[4];
+        const uint32_t offset = (warp_id / 2) * BT * 128;
+        const uint32_t s_row = i * 8 + (lane_id % 8);
+        const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
+        ldmatrix_trans<4>(v_bf16, V_smem + offset + s_row * 128 + s_col * 16);
+
+        float v_fp32[8];
+        for (int k = 0; k < 4; k++)
+          bf16x2_to_fp32x2(v_fp32 + k * 2, v_bf16[k]);
+
+        tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 +  0, wh_tmem + i * 8, v_fp32 + 0);
+        tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 + 16, wh_tmem + i * 8, v_fp32 + 4);
+      }
+      tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
+      mbarrier_arrive(h_mbar_addr);
+
       // load g_cu and compute scaling for v_new
       if (tid < BT) {
         const int last_idx = min(bos + (chunk_id + 1) * BT, eos) - 1;
@@ -542,13 +574,8 @@ void h_kernel_cutlass(
         if (elect_sync()) profiler.stamp(COMPUTE_V_SCALE);
       }
 
-      const uint32_t W_smem = smem + tma_stage * STAGE_SIZE;
-      const uint32_t V_smem = W_smem + W_size;
-      const uint32_t K_smem = V_smem + V_size;
-
       if (warp_id == 2) {
-        // wait for V TMA and wh MMA
-        mbarrier_wait(tma_mbar_addr + tma_stage * 8, tma_parity);
+        // wait for wh MMA
         mbarrier_wait(wh_mbar_addr, wh_parity);
       }
       else if (warp_id == 3) {
@@ -569,36 +596,25 @@ void h_kernel_cutlass(
         tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 0, warp_id * 32 +  0, wh_tmem + i * 8);
         tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 4, warp_id * 32 + 16, wh_tmem + i * 8);
 
-        // V smem layout: [V_dim/64, BT, 64] = [2, BT, 64]
-        // each ldmatrix loads [8, 32] along the last 2 dims
         uint32_t v_tmp[4];
-        const uint32_t offset = (warp_id / 2) * BT * 128;
-        const uint32_t s_row = i * 8 + (lane_id % 8);
-        const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
-        ldmatrix_trans<4>(v_tmp, V_smem + offset + s_row * 128 + s_col * 16);
-
         float2 v_scale = reinterpret_cast<float2 *>(v_scale_smem_ptr + (i * 8 + (lane_id % 4) * 2))[0];
 
         for (int k = 0; k < 4; k++) {
-          // unpack V to FP32
-          float v_fp32[2];
-          bf16x2_to_fp32x2(v_fp32, v_tmp[k]);
-
-          // compute v_new = v - w @ h.T
-          v_fp32[0] -= tmp[k * 2 + 0];
-          v_fp32[1] -= tmp[k * 2 + 1];
-
           // pack v_new for O kernel
-          v_tmp[k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
+          v_tmp[k] = fp32x2_to_bf16x2(tmp[k * 2 + 0], tmp[k * 2 + 1]);
 
           // scale v_new for vk MMA
-          v_fp32[0] *= v_scale.x;
-          v_fp32[1] *= v_scale.y;
-          reinterpret_cast<uint32_t *>(tmp)[k] = fp32x2_to_bf16x2(v_fp32[0], v_fp32[1]);
+          reinterpret_cast<uint32_t *>(tmp)[k] = fp32x2_to_bf16x2(tmp[k * 2 + 0] * v_scale.x,
+                                                                  tmp[k * 2 + 1] * v_scale.y);
         }
 
         // store v_new for O kernel to smem
         // this mirrors ldmatrix for V
+        // V smem layout: [V_dim/64, BT, 64] = [2, BT, 64]
+        // each stmatrix stores [8, 32] along the last 2 dims
+        const uint32_t offset = (warp_id / 2) * BT * 128;
+        const uint32_t s_row = i * 8 + (lane_id % 8);
+        const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
         stmatrix_trans<4>(V_new_smem + offset + s_row * 128 + s_col * 16, v_tmp);
 
         // store scaled v_new for vk MMA
