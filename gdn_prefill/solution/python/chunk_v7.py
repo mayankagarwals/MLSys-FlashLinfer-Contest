@@ -1,4 +1,4 @@
-# from triton_v4, but replace kkt kernel with CUDA version
+# from triton_v6b, but replace H kernel with CUDA version
 
 import os
 from pathlib import Path
