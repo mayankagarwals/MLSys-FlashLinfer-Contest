@@ -122,7 +122,6 @@ def export_trace(profiler: Tensor, path: Path):
         "COMPUTE_H_SCALE",
         "PROCESS_H",
         "PROCESS_SCALED_H",
-        "STORE_HT",
         # V warps
         "COMPUTE_V_SCALE",
         "PROCESS_V",
