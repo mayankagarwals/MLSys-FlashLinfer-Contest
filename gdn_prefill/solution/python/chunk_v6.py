@@ -58,9 +58,9 @@ def _unit_lower_inverse_16x16(A_orig, DOT_PRECISION: tl.constexpr):
       The 2 refinement dots use tf32x3 (3 MMA passes, 23-bit precision) so they
       don't re-introduce tf32-level error.
 
-    Note: CUDA wmma avoids this issue because ptxas compiles wmma.m16n16k8 to
-    HMMA.1684 (K=4), giving finer accumulation. Triton emits mma.sync which maps
-    to HMMA.1688 (K=8), hence the need for Newton-Schulz.
+    Note: CUDA wmma also uses single-pass tf32 and happens to pass tests for
+    these workloads, but this is not guaranteed for all inputs. Newton-Schulz
+    provides a provable precision guarantee (error E -> E^2).
 
     Total: 6 tf32 dots + 2 tf32x3 dots = 12 MMA passes per diagonal block,
     vs 18 MMA passes for full tf32x3. ~33% fewer passes.
@@ -92,7 +92,6 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     w_ptr,
     u_ptr,
     A_ptr,
-    Ai_ptr,
     beta_ptr,
     g_cu_ptr,
     cu_seqlens_ptr,
@@ -116,7 +115,6 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
 
     # compute inverse
     A_ptr += bos * H * BT + head_id * BT
-    Ai_ptr += bos * H * BT + head_id * BT
 
     offs_t = chunk_id * BT + tl.arange(0, 16)[:, None]
     offsets = offs_t * H * BT + tl.arange(0, 16)
@@ -168,9 +166,13 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     # Original chunk_v5 flow: store Ai to global (bf16) → debug_barrier → reload [64,64] → single big dot
     # New flow: skip the global roundtrip, compute W/U from the 10 Ai blocks directly.
     #
-    # bf16 roundtrip (.to(bf16).to(f32)): the original path stored Ai as bf16 to global memory,
-    # which truncated precision. We replicate that truncation here so the downstream W/U dots
-    # see identical bf16 values. Without this, 2 workloads fail at the atol=1e-2 boundary.
+    # bf16 roundtrip (.to(bf16).to(f32)): matches the standard "fp32 inverse → bf16 → MMA"
+    # pipeline that the flashinfer reference also uses. The reference computes the inverse
+    # via scalar fp32 back-substitution, then stores results to smem as bf16 before the
+    # W/U MMA step. We replicate this bf16 truncation so our W/U dot inputs match.
+    # Without this, 2 workloads fail at the atol=1e-2 boundary because keeping extra fp32
+    # precision in Ai causes different bf16 rounding in Ab = (Ai * beta).to(bf16),
+    # which diverges from the reference's bf16-quantized path.
     #
     # acc= chaining (below): each row-block's W/U is computed as a sum of [16,16]@[16,dim] dots
     # using tl.dot(..., acc=prev). This feeds the MMA accumulator across dots, matching the
@@ -331,11 +333,10 @@ def run(
         cu_seqlens, chunk_indices, total_num_chunks,
     )
 
-    Ai = torch.empty_like(A, dtype=k.dtype)  # BF16
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
     merge_16x16_to_64x64_inverse_kernel_v2[(total_num_chunks, H)](
-        k, v, w, u, A, Ai, beta, g_cu,
+        k, v, w, u, A, beta, g_cu,
         cu_seqlens, chunk_indices,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT,
         DOT_PRECISION="tf32",  # tf32 for diagonal inverse speed; Newton-Schulz corrects precision
