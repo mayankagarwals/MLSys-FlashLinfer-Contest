@@ -403,10 +403,11 @@ void tcgen05_commit(uint32_t mbar_addr) {
 
 template <auto> struct ptx_str{};
 
-enum class SHAPE { _32x32b, _16x128b, _16x256b };
+enum class SHAPE { _32x32b, _16x128b, _16x256b, _16x32bx2 };
 template<> struct ptx_str<SHAPE::_32x32b>  { static constexpr char value[] = ".32x32b"; };
 template<> struct ptx_str<SHAPE::_16x128b> { static constexpr char value[] = ".16x128b"; };
 template<> struct ptx_str<SHAPE::_16x256b> { static constexpr char value[] = ".16x256b"; };
+template<> struct ptx_str<SHAPE::_16x32bx2>{ static constexpr char value[] = ".16x32bx2"; };
 
 // each 32x32b tile uses 1 register per thread
 // each 16x256b tile uses 4 registers per thread
@@ -414,6 +415,7 @@ template <SHAPE shape> struct _regs_per_tile{};
 template<> struct _regs_per_tile<SHAPE::_32x32b>  { static constexpr int value = 1; };
 template<> struct _regs_per_tile<SHAPE::_16x128b> { static constexpr int value = 2; };
 template<> struct _regs_per_tile<SHAPE::_16x256b> { static constexpr int value = 4; };
+template<> struct _regs_per_tile<SHAPE::_16x32bx2>{ static constexpr int value = 1; };
 
 template <SHAPE shape, int NUM>
 __device__ inline
@@ -615,6 +617,37 @@ void tcgen05_st(uint32_t row, uint32_t col, const void *tmp_) {
               "r"(addr), "C"(ptx_str<shape>::value), "n"(NUM));
 }
 
+// Specialized tcgen05 ld/st for 16x32bx2 shape (requires ncols argument in PTX).
+// addr = pre-composed TMEM address (taddr + tmem_offset).
+// Loads/stores 16 tiles × 1 reg/tile = 16 uint32 registers, ncols=16.
+__device__ __forceinline__
+void tcgen05_ld_16x32bx2(uint32_t (&out)[16], int addr) {
+  asm volatile(
+    "tcgen05.ld.sync.aligned.16x32bx2.x16.b32 "
+    "{%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15}, [%16 + 0], 16;"
+    : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
+      "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7]),
+      "=r"(out[8]), "=r"(out[9]), "=r"(out[10]), "=r"(out[11]),
+      "=r"(out[12]), "=r"(out[13]), "=r"(out[14]), "=r"(out[15])
+    : "r"(addr));
+  asm volatile("tcgen05.wait::ld.sync.aligned;");
+}
+
+__device__ __forceinline__
+void tcgen05_st_16x32bx2(int addr, const uint32_t (&in)[16]) {
+  asm volatile(
+    "{\n\t.reg .pred p;\n\tmov.pred p, -1;\n\t"
+    "@p tcgen05.st.sync.aligned.16x32bx2.x16.b32 [%0 + 0], 16, "
+    "{%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};\n\t}"
+    :: "r"(addr),
+       "r"(in[0]), "r"(in[1]), "r"(in[2]), "r"(in[3]),
+       "r"(in[4]), "r"(in[5]), "r"(in[6]), "r"(in[7]),
+       "r"(in[8]), "r"(in[9]), "r"(in[10]), "r"(in[11]),
+       "r"(in[12]), "r"(in[13]), "r"(in[14]), "r"(in[15])
+    : "memory");
+  asm volatile("tcgen05.wait::st.sync.aligned;");
+}
+
 __device__ __forceinline__ void tcgen05_wait_ld() { asm volatile("tcgen05.wait::ld.sync.aligned;"); }
 __device__ __forceinline__ void tcgen05_wait_st() { asm volatile("tcgen05.wait::st.sync.aligned;"); }
 
@@ -758,6 +791,21 @@ void mma_m16n8k16_bf16(
     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
     : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
     : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1),
+      "f"(c0), "f"(c1), "f"(c2), "f"(c3));
+}
+
+// mma.sync m16n8k8 (tf32 inputs → fp32 accumulator)
+__device__ __forceinline__
+void mma_m16n8k8_tf32(
+    float &d0, float &d1, float &d2, float &d3,
+    float a0, float a1, float a2, float a3,
+    float b0, float b1,
+    float c0, float c1, float c2, float c3) {
+  asm volatile(
+    "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+    "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};"
+    : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
+    : "f"(a0), "f"(a1), "f"(a2), "f"(a3), "f"(b0), "f"(b1),
       "f"(c0), "f"(c1), "f"(c2), "f"(c3));
 }
 

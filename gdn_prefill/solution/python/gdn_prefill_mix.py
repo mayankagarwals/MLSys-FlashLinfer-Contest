@@ -8,7 +8,7 @@ from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
 from .chunk_v6b import run as chunk_v6b
-from .cuda_parallel_v3 import run as cuda_v3
+from .cuda_parallel_v4 import run as cuda_v4
 
 
 def run(
@@ -24,14 +24,15 @@ def run(
     scale: float,
 ):
     T = q.shape[0]
+    N = cu_seqlens.shape[0] - 1
 
-    # chunk_v6b for large workloads
-    if T >= 1024:
+    # chunk_v6b for T>=525 (beats v4 on all these workloads)
+    if T >= 525:
         return chunk_v6b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA v3 chunk kernel for medium workloads
-    if T >= 64:
-        return cuda_v3(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+    # CUDA v4 for medium workloads
+    if T >= 64 or (N == 1 and T >= 46):
+        return cuda_v4(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA recurrent for tiny workloads
     o = torch.empty_like(v)
