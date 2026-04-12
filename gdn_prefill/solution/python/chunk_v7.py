@@ -111,19 +111,22 @@ def export_trace(profiler: Tensor, path: Path):
         "WAIT_MMA",
         "WAIT_TMA",
         "WAIT_H0",
-        "WAIT_H",
-        "WAIT_SCALED_H",
-        "WAIT_SCALED_V",
+        "WAIT_WH_IN",
+        "WAIT_VK_IN",
         "WAIT_WH_MMA",
         "WAIT_VK_MMA",
         "ISSUE_TMA",
         "ISSUE_WH_MMA",
         "ISSUE_VK_MMA",
+        # H warps
+        "COMPUTE_H_SCALE",
         "PROCESS_H",
         "PROCESS_SCALED_H",
+        "STORE_HT",
+        # V warps
         "COMPUTE_V_SCALE",
         "PROCESS_V",
-        "STORE_V_NEW",
+        "PROCESS_SCALED_V",
         "END",
     ]
 
