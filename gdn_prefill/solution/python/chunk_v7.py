@@ -9,7 +9,7 @@ import triton.language as tl
 import tvm_ffi
 from torch import Tensor
 
-from .chunk_v6 import (
+from .chunk_v6b import (
     compute_chunks_kernel,
     merge_16x16_to_64x64_inverse_kernel_v2,
 )
@@ -21,7 +21,7 @@ CURRENT_DIR = Path(__file__).parent
 lib_path = tvm_ffi.cpp.build(
     name="gdn_prefill_cuda",
     cuda_files=[
-        str(CURRENT_DIR / "cuda_kkt_v1.cu"),
+        str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
         str(CURRENT_DIR / "cuda_h_v1.cu"),
     ],
     extra_cflags=["-O3"],
@@ -46,6 +46,7 @@ def chunk_fwd_kernel_o(
     o_ptr,
     cu_seqlens_ptr,
     chunk_indices_ptr,
+    total_chunks_ptr,
     scale,
     H: tl.constexpr,
     Hg: tl.constexpr,
@@ -54,66 +55,48 @@ def chunk_fwd_kernel_o(
     BT: tl.constexpr,
     BV: tl.constexpr,
 ):
-    i_v = tl.program_id(0)
-    global_chunk_id = tl.program_id(1)
-    head_id = tl.program_id(2)
+    global_chunk_id = tl.program_id(0)
+    head_id = tl.program_id(1)
+
+    if global_chunk_id >= tl.load(total_chunks_ptr).to(tl.int32):
+        return
 
     seq_id = tl.load(chunk_indices_ptr + global_chunk_id * 2).to(tl.int32)
     chunk_id = tl.load(chunk_indices_ptr + (global_chunk_id * 2 + 1)).to(tl.int32)
-
     bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
     eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
 
-    # offset calculation
     q_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
     k_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
-    v_ptr += (
-        (global_chunk_id - chunk_id) * BT * H + head_id
-    ) * V_dim  # this is changed
+    v_ptr += ((global_chunk_id - chunk_id) * BT * H + head_id) * V_dim
     o_ptr += (bos * H + head_id) * V_dim
     h_ptr += (global_chunk_id * H + head_id) * V_dim * K_dim
     g_cu_ptr += bos * H + head_id
 
     offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
     offs_k = tl.arange(0, K_dim)[None, :]
-    offs_v = i_v * BV + tl.arange(0, BV)[:, None]
-    offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
     mask_t = offs_t < seqlen
 
-    q = tl.load(
-        q_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0
-    )  # [BT, K_dim]
-    k = tl.load(
-        k_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0
-    )  # [BT, K_dim]
-    h = tl.load(h_ptr + (offs_v * K_dim + offs_k))  # [BV, K_dim]
-    offs_t_1d = chunk_id * BT + tl.arange(0, BT)
-    g_cu = tl.load(g_cu_ptr + offs_t_1d * H, mask=offs_t_1d < seqlen, other=0.0)
+    q = tl.load(q_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0)
+    k = tl.load(k_ptr + (offs_t * (Hg * K_dim) + offs_k), mask=mask_t, other=0.0)
+    t_1d = chunk_id * BT + tl.arange(0, BT)
+    g_cu = tl.load(g_cu_ptr + t_1d * H, mask=t_1d < seqlen, other=0.0)
 
-    o = tl.dot(q, h.T)  # [BT, BV]
-    A = tl.dot(q, k.T)  # [BT, BT]
+    A = tl.dot(q, k.T) * tl.exp(g_cu[:, None] - g_cu[None, :])
+    A = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], A, 0.0)
+    exp_g = tl.exp(g_cu)
 
-    # apply g
-    o = o * tl.exp(g_cu)[:, None]
-    A = A * tl.exp(g_cu[:, None] - g_cu[None, :])
-
-    # apply causal mask
-    causal_offs_t = tl.arange(0, BT)
-    mask_A = causal_offs_t[:, None] >= causal_offs_t[None, :]
-    A = tl.where(mask_A, A, 0.0)
-    v = tl.load(
-        v_ptr + (offs_t * (H * V_dim) + offs_v_block),
-        mask=mask_t,
-        other=0.0,
-    )
-
-    o = tl.dot(A.to(v.dtype), v, acc=o) * scale
-    tl.store(
-        o_ptr + (offs_t * (H * V_dim) + offs_v_block),
-        o,
-        mask=mask_t,
-    )
+    for i_v in tl.static_range(V_dim // BV):
+        offs_v = i_v * BV + tl.arange(0, BV)[:, None]
+        offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
+        h = tl.load(h_ptr + (offs_v * K_dim + offs_k))
+        v = tl.load(
+            v_ptr + (offs_t * (H * V_dim) + offs_v_block), mask=mask_t, other=0.0
+        )
+        o = tl.dot(q, h.T) * exp_g[:, None]
+        o = tl.dot(A.to(v.dtype), v, acc=o) * scale
+        tl.store(o_ptr + (offs_t * (H * V_dim) + offs_v_block), o, mask=mask_t)
 
 
 def export_trace(profiler: Tensor, path: Path):
@@ -236,7 +219,7 @@ def run(
         # max N is 57 -> max BLOCK_SIZE is 64, still very small
         BLOCK_SIZE=triton.next_power_of_2(N),
     )
-    total_num_chunks = chunk_offsets[-1].item()  # CUDA sync
+    total_chunks_ptr = chunk_offsets[N:]
 
     # this kernel does multiple things:
     # - compute K @ K.T
@@ -247,7 +230,7 @@ def run(
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    mod.kkt_v1(
+    mod.kkt_v1b(
         k,
         A_log,
         a,
@@ -258,25 +241,25 @@ def run(
         A,
         cu_seqlens,
         chunk_indices,
-        total_num_chunks,
+        total_chunks_ptr,
     )
 
     # - compute Ai = inverse(I + strictTriu(A))
     # - obtain WY representation: U = Ai @ V and W = (Ai * g_cu) @ K
-    Ai = torch.empty_like(A, dtype=k.dtype)  # BF16
     u = torch.empty_like(v)
     w = k.new_empty(T, H, K_dim)
-    merge_16x16_to_64x64_inverse_kernel_v2[(total_num_chunks, H)](
+    merge_16x16_to_64x64_inverse_kernel_v2[(upper_bound_chunks, H)](
         k,
         v,
         w,
         u,
         A,
-        Ai,
+        A,
         beta,
         g_cu,
         cu_seqlens,
         chunk_indices,
+        total_chunks_ptr,
         H=H,
         Hg=Hg,
         K_dim=K_dim,
@@ -287,9 +270,9 @@ def run(
     )
 
     # padded v_new so we can use TMA store for v_new in H kernel
-    h = k.new_empty(total_num_chunks, H, V_dim, K_dim)
+    h = k.new_empty(upper_bound_chunks, H, V_dim, K_dim)
     final_state = torch.empty_like(state, dtype=torch.float32)
-    v_new = q.new_empty(total_num_chunks, BT, H, V_dim)
+    v_new = q.new_empty(upper_bound_chunks, BT, H, V_dim)
 
     # uncomment to enable profiling
     profiler = None
@@ -315,8 +298,7 @@ def run(
 
     # we only need separate o kernel if h kernel is too small?
     BV = 64
-    grid = (triton.cdiv(V_dim, BV), total_num_chunks, H)
-    chunk_fwd_kernel_o[grid](
+    chunk_fwd_kernel_o[(upper_bound_chunks, H)](
         q,
         k,
         v_new,
@@ -325,6 +307,7 @@ def run(
         o,
         cu_seqlens,
         chunk_indices,
+        total_chunks_ptr,
         scale=scale,
         H=H,
         Hg=Hg,
