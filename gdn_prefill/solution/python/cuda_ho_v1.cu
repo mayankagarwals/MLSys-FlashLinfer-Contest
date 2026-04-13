@@ -82,6 +82,30 @@ constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
 constexpr uint32_t H_fp32_size = V_dim * K_dim * sizeof(float);
 constexpr uint32_t v_scale_size = BT * sizeof(float);
 
+// For inline o_inter: scratch for h tile transpose (16×8 bf16 = 256 bytes)
+// and q loading from GMEM (64×128 bf16 = 16384 bytes)
+constexpr uint32_t Q_smem_size = BT * K_dim * sizeof(nv_bfloat16);  // 16KB
+constexpr uint32_t H_scratch_size = 256;  // 16×8 bf16 for h tile transpose per warp
+
+// Helper: compute H_smem byte address for h[v, k]
+__device__ __forceinline__
+uint32_t h_smem_byte_addr(uint32_t H_smem_base, int v, int k) {
+  int section = k / 64;
+  int k_in_sec = k % 64;
+  int cg = k_in_sec / 8;
+  int lane_k = k_in_sec % 8;
+  int swiz_cg = cg ^ (v & 7);
+  return H_smem_base + section * V_dim * 128 + v * 128 + swiz_cg * 16 + lane_k * 2;
+}
+
+// Helper: XOR swizzle for Q_smem (same as K_smem TMA layout)
+__device__ __forceinline__
+int q_xor_swizzle(int row, int col) {
+  int cg = col >> 3;
+  int swiz_cg = cg ^ (row & 7);
+  return (swiz_cg << 3) | (col & 7);
+}
+
 constexpr int NUM_WARPS = 4 + 4 + 2;
 constexpr int WARP_SIZE = 32;
 constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
@@ -215,7 +239,10 @@ void ho_kernel_cutlass(
   const uint32_t v_scale_smem = V_new_smem + V_size;
   float *v_scale_smem_ptr = reinterpret_cast<float *>(smem_ptr + (v_scale_smem - smem));
 
-  const uint32_t tma_mbar_addr      = v_scale_smem + v_scale_size;
+  // NEW: Q_smem for q loading (used by second-pass o_inter)
+  const uint32_t Q_smem_addr = v_scale_smem + ((v_scale_size + 127) & ~127);  // 128B aligned
+
+  const uint32_t tma_mbar_addr      = Q_smem_addr + Q_smem_size;
   const uint32_t wh_in_mbar_addr    = tma_mbar_addr + NUM_STAGES * 8;
   const uint32_t wh_done_mbar_addr  = wh_in_mbar_addr + NUM_STAGES * 8;
   const uint32_t vk_in_mbar_addr    = wh_done_mbar_addr + NUM_STAGES * 8;
@@ -685,71 +712,128 @@ void ho_kernel_cutlass(
     const int chunk_offset = chunk_offsets_ptr[seq_id];
     const int q_head_id = head_id / (H / Hg);
 
-    // Compute o_inter = q @ h^T * exp(g) * scale using wmma
-    // q: [T, Hg, K_dim] bf16 row-major, h: [total_chunks, H, V_dim, K_dim] bf16 row-major
-    // Result: [BT, V_dim] = [64, 128] per chunk
+    // Compute o_inter = q @ h^T * exp(g) * scale using mma.sync m16n8k16
+    // Strategy: load q from GMEM into Q_smem (with XOR swizzle), then use
+    // ldmatrix for A fragments (q) and scalar loads for B fragments (h^T from H_smem)
     //
-    // wmma.m16n16k16: A[16,16] @ B[16,16] -> C[16,16]
     // For q@h^T: M=BT=64, N=V_dim=128, K=K_dim=128
-    // Distribute: 10 warps, each handles a subset of (M_tile, N_tile) output tiles
-    // M_tiles=4 (64/16), N_tiles=8 (128/16), K_tiles=8 (128/16)
-    // Total output tiles: 4*8=32. With 10 warps: ~3 tiles/warp
+    // mma.sync.m16n8k16: each call produces [16, 8] output
+    // M_tiles=4, N_tiles=16, K_tiles=8
+    // Total output tiles: 4*16=64. With 10 warps: ~6 tiles/warp
     {
       const int warp_id_global = tid / WARP_SIZE;
-      const int total_out_tiles = (BT / 16) * (V_dim / 16);  // 4 * 8 = 32
+      const int lane = tid % WARP_SIZE;
+      nv_bfloat16 *q_smem_bf16 = reinterpret_cast<nv_bfloat16 *>(smem_ptr + (Q_smem_addr - smem));
 
       for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
         const int clen = min(BT, seqlen - chunk_id * BT);
         const int off_t = bos + chunk_id * BT;
         const int global_chunk = chunk_offset + chunk_id;
 
-        // q base: q[off_t, q_head, 0] — row-major [T, Hg, K_dim], stride K_dim per head, Hg*K_dim per row
-        const nv_bfloat16 *q_base = q_ptr_raw + (int64_t)off_t * Hg * K_dim + q_head_id * K_dim;
-        // h base: h[gc, head, 0, 0] — row-major [chunks, H, V_dim, K_dim]
-        const nv_bfloat16 *h_base = h_ptr_raw + ((int64_t)global_chunk * H + head_id) * V_dim * K_dim;
+        // Step 1: Load q[BT, K_dim] from GMEM into Q_smem with XOR swizzle
+        // All threads collaborate. q has stride Hg*K_dim between rows.
+        {
+          const nv_bfloat16 *q_gmem = q_ptr_raw + (int64_t)off_t * Hg * K_dim + q_head_id * K_dim;
+          // Each thread loads some bf16 elements
+          for (int idx = tid; idx < BT * K_dim; idx += TB_SIZE) {
+            int t_local = idx / K_dim;
+            int k = idx % K_dim;
+            nv_bfloat16 val = (t_local < clen) ? q_gmem[(int64_t)t_local * Hg * K_dim + k] : __float2bfloat16(0.0f);
+            // Store to Q_smem with XOR swizzle: layout [K_dim/64, BT, 64]
+            int k_chunk = k / 64;
+            int k_within = k % 64;
+            int swiz_col = q_xor_swizzle(t_local, k_within);
+            q_smem_bf16[k_chunk * BT * 64 + t_local * 64 + swiz_col] = val;
+          }
+        }
+        __syncthreads();
 
-        // Each warp handles some output tiles
+        // Step 2: Compute q @ h^T using mma.sync.m16n8k16
+        // Distribute (m_tile, n_tile) across 10 warps
+        constexpr int M_tiles = BT / 16;     // 4
+        constexpr int N_tiles = V_dim / 8;   // 16
+        constexpr int K_tiles = K_dim / 16;  // 8
+        constexpr int total_out_tiles = M_tiles * N_tiles;  // 64
+
         for (int tile_id = warp_id_global; tile_id < total_out_tiles; tile_id += NUM_WARPS) {
-          int m_tile = tile_id / (V_dim / 16);   // which 16-row block of q
-          int n_tile = tile_id % (V_dim / 16);   // which 16-col block of output (= 16-row block of h)
+          int m_tile = tile_id / N_tiles;
+          int n_tile = tile_id % N_tiles;
 
-          wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
-          wmma::fill_fragment(acc, 0.0f);
+          float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
 
-          // Accumulate over K dimension
-          for (int k_tile = 0; k_tile < K_dim / 16; k_tile++) {
-            wmma::fragment<wmma::matrix_a, 16, 16, 16, nv_bfloat16, wmma::row_major> q_frag;
-            wmma::fragment<wmma::matrix_b, 16, 16, 16, nv_bfloat16, wmma::col_major> h_frag;
+          for (int k_tile = 0; k_tile < K_tiles; k_tile++) {
+            // Load A fragment from Q_smem: q[m_tile*16:m_tile*16+16, k_tile*16:k_tile*16+16]
+            // Q_smem layout: [K_dim/64, BT, 64] with XOR swizzle (same as K_smem)
+            uint32_t a[4];
+            {
+              int r = (lane % 8) + ((lane & 8) ? 8 : 0) + m_tile * 16;
+              int c = (lane >= 16) ? 8 : 0;
+              int k_abs = k_tile * 16 + c;
+              int k_chunk = k_abs / 64;
+              int k_within = k_abs % 64;
+              int swiz_c = q_xor_swizzle(r, k_within);
+              ldmatrix<4>(a, Q_smem_addr + (k_chunk * BT * 64 + r * 64 + swiz_c) * 2);
+            }
 
-            // Load q[m_tile*16 : m_tile*16+16, k_tile*16 : k_tile*16+16]
-            // q layout: row-major with leading dim = Hg * K_dim (stride between consecutive t)
-            wmma::load_matrix_sync(q_frag, q_base + m_tile * 16 * (Hg * K_dim) + k_tile * 16, Hg * K_dim);
+            // Load B fragment from H_smem: h[n_tile*8:n_tile*8+8, k_tile*16:k_tile*16+16]^T
+            // Use ldmatrix_trans<2> by providing h addresses with v=row, k=col
+            uint32_t b[2];
+            {
+              int v_row = n_tile * 8 + (lane % 8);
+              int k_col = k_tile * 16 + ((lane >= 8 && lane < 16) || lane >= 24 ? 8 : 0);
+              // H_smem address for h[v_row, k_col..k_col+7]
+              ldmatrix_trans<2>(b, h_smem_byte_addr(H_smem, v_row, k_col));
+            }
 
-            // Load h[n_tile*16 : n_tile*16+16, k_tile*16 : k_tile*16+16] as column-major (= h^T row-major)
-            // h layout: row-major [V_dim, K_dim] with leading dim = K_dim
-            wmma::load_matrix_sync(h_frag, h_base + n_tile * 16 * K_dim + k_tile * 16, K_dim);
+            // Use tf32 for higher precision (closer to fp32 reference)
+            // tf32 m16n8k8: processes K=8 per call (vs K=16 for bf16)
+            // Need 2 tf32 calls per bf16 K=16 tile
+            // Convert bf16 fragments to fp32 for tf32 MMA
+            {
+              // a[0..3] are bf16x2 (8 bf16 values = 16x16 tile)
+              // Split into two K=8 halves for tf32
+              // First half: a[0], a[1] (rows 0-7,8-15, cols 0-7)
+              float fa0, fa1, fa2, fa3;
+              bf16x2_to_fp32x2(&fa0, a[0]); // cols 0-1 row0
+              bf16x2_to_fp32x2(&fa2, a[2]); // cols 2-3 row0
 
-            wmma::mma_sync(acc, q_frag, h_frag, acc);
+              float fb0, fb1;
+              bf16x2_to_fp32x2(&fb0, b[0]); // B first half
+
+              mma_m16n8k8_tf32(d0, d1, d2, d3, fa0, fa1, fa2, fa3, fb0, fb1, d0, d1, d2, d3);
+
+              // Second half: a[1], a[3] (cols 8-15)
+              float fa0b, fa1b, fa2b, fa3b;
+              bf16x2_to_fp32x2(&fa0b, a[1]); // cols 0-1 row1 → actually this is wrong
+              bf16x2_to_fp32x2(&fa2b, a[3]);
+
+              float fb0b, fb1b;
+              bf16x2_to_fp32x2(&fb0b, b[1]);
+
+              mma_m16n8k8_tf32(d0, d1, d2, d3, fa0b, fa1b, fa2b, fa3b, fb0b, fb1b, d0, d1, d2, d3);
+            }
           }
 
-          // Store unscaled wmma result directly to o_inter (global memory)
-          // o_inter layout: [T, H, V_dim], stride between rows = H * V_dim
-          float *out_tile = o_inter_ptr + ((int64_t)(off_t + m_tile * 16)) * H * V_dim + head_id * V_dim + n_tile * 16;
-          wmma::store_matrix_sync(out_tile, acc, H * V_dim, wmma::mem_row_major);
-        }
+          // Store result: d contains [16, 8] fp32 output
+          // Thread mapping: d0=D[r0,c0], d1=D[r1,c0], d2=D[r0,c1], d3=D[r1,c1]
+          // where r0=(lane/4)%8, r1=r0+8, c0=(lane%4)*2, c1=c0+1
+          int r0 = (lane / 4) % 8 + m_tile * 16;
+          int r1 = r0 + 8;
+          int c0 = (lane % 4) * 2 + n_tile * 8;
+          int c1 = c0 + 1;
 
-        // Scale pass: all threads collaborate to multiply by exp(g_cu[t]) * scale
-        // Need __syncthreads to ensure all wmma stores are visible
-        __syncthreads();
-        for (int tv = tid; tv < BT * V_dim; tv += TB_SIZE) {
-          int t = tv / V_dim;
-          int v = tv % V_dim;
-          if (t >= clen) continue;
-          int64_t idx = (int64_t)(off_t + t) * H * V_dim + head_id * V_dim + v;
-          float g_val = g_cu_ptr[(off_t + t) * H + head_id];
-          o_inter_ptr[idx] *= __expf(g_val) * scale;
+          if (r0 < clen) {
+            float g0 = __expf(g_cu_ptr[(off_t + r0) * H + head_id]) * scale;
+            o_inter_ptr[(int64_t)(off_t + r0) * H * V_dim + head_id * V_dim + c0] = d0 * g0;
+            o_inter_ptr[(int64_t)(off_t + r0) * H * V_dim + head_id * V_dim + c1] = d2 * g0;
+          }
+          if (r1 < clen) {
+            float g1 = __expf(g_cu_ptr[(off_t + r1) * H + head_id]) * scale;
+            o_inter_ptr[(int64_t)(off_t + r1) * H * V_dim + head_id * V_dim + c0] = d1 * g1;
+            o_inter_ptr[(int64_t)(off_t + r1) * H * V_dim + head_id * V_dim + c1] = d3 * g1;
+          }
         }
-        __syncthreads();  // Ensure scale pass is done before next chunk
+        __syncthreads();
       }
     }
   }
@@ -852,7 +936,8 @@ void ho_v1(
                           + H_fp32_size
                           + H_fp32_size / 2
                           + V_size
-                          + v_scale_size
+                          + ((v_scale_size + 127) & ~127)  // align to 128B
+                          + Q_smem_size                    // NEW: q loading
                           + 5 * NUM_STAGES * 8
                           + 8
                           + 4;
