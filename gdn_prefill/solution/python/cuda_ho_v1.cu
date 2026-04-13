@@ -119,6 +119,11 @@ enum ProfilerTag {
   COMPUTE_V_SCALE,
   PROCESS_V,
   PROCESS_SCALED_V,
+  // new tags for qh
+  ISSUE_QH_MMA,
+  WAIT_QH_IN,
+  WAIT_QH_MMA,
+  PROCESS_O_INTER,
   END,
 };
 
@@ -167,10 +172,11 @@ struct Profiler {
 template <int NUM_STAGES, bool DO_PROFILE>
 __global__
 __block_size__((TB_SIZE, 1, 1))
-void h_kernel_cutlass(
+void ho_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,      // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap W_tmap,      // [total_T, H, K_dim]
+  const __grid_constant__ CUtensorMap Q_tmap,      // [total_T, Hg, K_dim]  NEW
   const __grid_constant__ CUtensorMap H0_tmap,     // [N, H, V_dim, K_dim]
   const __grid_constant__ CUtensorMap HT_tmap,     // [N, H, V_dim, K_dim]
   const __grid_constant__ CUtensorMap H_tmap,      // [total_num_chunks, H, V_dim, K_dim]
@@ -178,7 +184,9 @@ void h_kernel_cutlass(
   const float       *g_cu_ptr,                     // [total_T, H]
   const int64_t     *cu_seqlens_ptr,               // [N+1]
   const int32_t     *chunk_offsets_ptr,            // [N]
-        int64_t     *profiler_ptr,                 // [NUM_SMS][NUM_WARPS][1 + num_entries * 2]
+        float       *o_inter_ptr,                  // [total_T, H, V_dim] fp32  NEW
+        float        scale,                         // NEW
+        int64_t     *profiler_ptr,
         int          num_entries
 ) {
   const int tid = threadIdx.x;
@@ -206,13 +214,21 @@ void h_kernel_cutlass(
   const uint32_t v_scale_smem = V_new_smem + V_size;
   float *v_scale_smem_ptr = reinterpret_cast<float *>(smem_ptr + (v_scale_smem - smem));
 
-  const uint32_t tma_mbar_addr      = v_scale_smem + v_scale_size;
+  // Q_smem for q loading (same 128B swizzle layout as W/K)
+  const uint32_t Q_smem = v_scale_smem + v_scale_size;
+
+  const uint32_t tma_mbar_addr      = Q_smem + Q_size;
   const uint32_t wh_in_mbar_addr    = tma_mbar_addr + NUM_STAGES * 8;
   const uint32_t wh_done_mbar_addr  = wh_in_mbar_addr + NUM_STAGES * 8;
   const uint32_t vk_in_mbar_addr    = wh_done_mbar_addr + NUM_STAGES * 8;
   const uint32_t vk_done_mbar_addr  = vk_in_mbar_addr + NUM_STAGES * 8;
 
-  const uint32_t h0_mbar_addr = vk_done_mbar_addr + NUM_STAGES * 8;
+  // NEW: barriers for q loading and qh MMA
+  const uint32_t q_mbar_addr         = vk_done_mbar_addr + NUM_STAGES * 8;
+  const uint32_t qh_in_mbar_addr     = q_mbar_addr + NUM_STAGES * 8;
+  const uint32_t qh_done_mbar_addr   = qh_in_mbar_addr + NUM_STAGES * 8;
+
+  const uint32_t h0_mbar_addr = qh_done_mbar_addr + NUM_STAGES * 8;
   const uint32_t taddr        = h0_mbar_addr + 8;
 
   // set up tmem
@@ -233,6 +249,9 @@ void h_kernel_cutlass(
         mbarrier_init(wh_done_mbar_addr + i * 8, 1);            // 1 MMA
         mbarrier_init(vk_in_mbar_addr + i * 8, WARP_SIZE * 8);  // scaled_h from H warps and scaled_v from V warps
         mbarrier_init(vk_done_mbar_addr + i * 8, 1);            // 1 MMA
+        mbarrier_init(q_mbar_addr + i * 8, 1);                  // NEW: Q TMA
+        mbarrier_init(qh_in_mbar_addr + i * 8, WARP_SIZE * 4);  // NEW: V warps (4 warps × 32 threads)
+        mbarrier_init(qh_done_mbar_addr + i * 8, 1);            // NEW: 1 MMA
       }
       mbarrier_init(h0_mbar_addr, 1);
       fence_mbarrier_init();
@@ -245,6 +264,7 @@ void h_kernel_cutlass(
       prefetch_tensormap(&W_tmap);
       prefetch_tensormap(&V_tmap);
       prefetch_tensormap(&K_tmap);
+      prefetch_tensormap(&Q_tmap);
     }
   }
   __syncthreads();
@@ -271,8 +291,9 @@ void h_kernel_cutlass(
         const uint32_t K_smem = V_smem + V_size;
         const uint32_t mbar_addr = tma_mbar_addr + stage_id * 8;
   
-        // wait MMA warp to release the buffer
+        // wait MMA warp to release the buffer (both vk and qh must be done)
         mbarrier_wait(vk_done_mbar_addr + stage_id * 8, parity);
+        mbarrier_wait(qh_done_mbar_addr + stage_id * 8, parity);
         profiler.stamp(WAIT_MMA);
 
         // issue TMA and arrive
@@ -282,6 +303,10 @@ void h_kernel_cutlass(
         tma_load_4d(V_smem, &V_tmap, 0, off_t, 0, head_id, mbar_addr, EVICT_FIRST);
         tma_load_4d(K_smem, &K_tmap, 0, off_t, 0, k_head_id, mbar_addr);
         mbarrier_arrive_expect_tx(mbar_addr, STAGE_SIZE);
+
+        // NEW: load Q into Q_smem (same layout as K)
+        tma_load_4d(Q_smem, &Q_tmap, 0, off_t, 0, k_head_id, q_mbar_addr + stage_id * 8);
+        mbarrier_arrive_expect_tx(q_mbar_addr + stage_id * 8, Q_size);
         profiler.stamp(ISSUE_TMA);
 
         // increment stage
@@ -357,6 +382,26 @@ void h_kernel_cutlass(
         }
         tcgen05_commit(vk_done_mbar_addr + stage_id * 8);
         profiler.stamp(ISSUE_VK_MMA);
+
+        // ═══ NEW: h@q^T MMA (o_inter computation) ═══
+        // Same pattern as wh MMA: A=h(h_tmem), B=q(Q_smem) → wh_tmem
+        // idesc: [V_dim, BT] without negate flag
+        constexpr uint32_t qh_idesc = make_tcgen05_idesc(V_dim, BT);
+
+        // Wait for Q_smem to be ready (TMA loaded)
+        mbarrier_wait(q_mbar_addr + stage_id * 8, parity);
+        // Wait for V warps to load zeros into wh_tmem (accumulator)
+        mbarrier_wait(qh_in_mbar_addr + stage_id * 8, parity);
+        tcgen05_fence_after_thread_sync();
+
+        // Issue h@q^T: same tile loop as wh MMA, B from Q_smem instead of W_smem
+        for (int i = 0; i < K_dim / 64; i++)
+          for (int j = 0; j < 64 / 16; j++) {
+            const int h_tmem = h_tmem_base + i * 32 + j * 8;
+            const uint64_t q_desc = w_desc_base | ((Q_smem + i * BT * 128 + j * 32) >> 4);
+            tcgen05_mma_tmem(wh_tmem, h_tmem, q_desc, qh_idesc, 1);
+          }
+        tcgen05_commit(qh_done_mbar_addr + stage_id * 8);
 
         stage_id = (stage_id + 1) % NUM_STAGES;
         if (stage_id == 0)
@@ -657,6 +702,84 @@ void h_kernel_cutlass(
         cp_async_bulk_commit_group();
       }
 
+      // ═══ NEW: Prepare qh MMA accumulator (zeros) and compute o_inter ═══
+      // Load zeros into wh_tmem as accumulator for h@q^T MMA
+      {
+        for (int i = 0; i < BT / 8; i++) {
+          float zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+          tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 +  0, wh_tmem + i * 8, zeros + 0);
+          tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 + 16, wh_tmem + i * 8, zeros + 4);
+        }
+        tcgen05_wait_st();
+        tcgen05_fence_before_thread_sync();
+        mbarrier_arrive(qh_in_mbar_addr + stage_id * 8);
+      }
+
+      // Wait for qh MMA to complete
+      if (warp_id == 2)
+        mbarrier_wait(qh_done_mbar_addr + stage_id * 8, parity);
+      // Also drain v_new TMA store before we overwrite V_new_smem
+      if (warp_id == 3 && elect_sync())
+        cp_async_bulk_wait_group_read<0>();
+      bar_sync<2>(128);
+      tcgen05_fence_after_thread_sync();
+
+      // Read h@q^T from wh_tmem, apply exp(g) BEFORE bf16 truncation, store to V_new_smem
+      // The exp(g) is applied in fp32 to avoid extra bf16 truncation error
+      // BT index for exp(g): t = i*8 + (lane_id%4)*2 and t+1
+      {
+        const int clen = min(BT, seqlen - chunk_id * BT);
+        const int off_t = bos + chunk_id * BT;
+
+        for (int i = 0; i < BT / 8; i++) {
+          float tmp[8];
+          tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 0, warp_id * 32 +  0, wh_tmem + i * 8);
+          tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 4, warp_id * 32 + 16, wh_tmem + i * 8);
+
+          // Load exp(g) for the BT positions this thread handles
+          int t0 = i * 8 + (lane_id % 4) * 2;
+          float g_exp0 = (t0 < clen) ? __expf(g_cu_ptr[(off_t + t0) * H + head_id]) : 0.0f;
+          float g_exp1 = (t0 + 1 < clen) ? __expf(g_cu_ptr[(off_t + t0 + 1) * H + head_id]) : 0.0f;
+
+          // Apply exp(g) to all 8 tmp values then pack to bf16
+          // tmp[k*2+0] has BT=t0, tmp[k*2+1] has BT=t0+1 (for all k)
+          uint32_t v_tmp[4];
+          for (int k = 0; k < 4; k++)
+            v_tmp[k] = fp32x2_to_bf16x2(tmp[k * 2 + 0] * g_exp0, tmp[k * 2 + 1] * g_exp1);
+
+          // Store to V_new_smem using stmatrix_trans (same pattern as v_new)
+          const uint32_t offset = (warp_id / 2) * BT * 128;
+          const uint32_t s_row = i * 8 + (lane_id % 8);
+          const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
+          stmatrix_trans<4>(V_new_smem + offset + s_row * 128 + s_col * 16, v_tmp);
+        }
+      }
+
+      // Store o_inter from V_new_smem to GMEM as bf16
+      // Layout matches V_new: [V_dim/64, BT, 64] with 128B swizzle
+      bar_sync<2>(128);
+      asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;");
+      // Use simple GMEM stores (later optimize with TMA)
+      {
+        const int clen = min(BT, seqlen - chunk_id * BT);
+        const int off_t = bos + chunk_id * BT;
+        for (int idx = tid; idx < BT * V_dim; idx += 128) {
+          int t_local = idx / V_dim;
+          int v = idx % V_dim;
+          if (t_local >= clen) continue;
+          int v_half = v / 64;
+          int v_within = v % 64;
+          int group = v_within / 8;
+          int lane_v = v_within % 8;
+          int swiz = group ^ (t_local % 8);
+          nv_bfloat16 val;
+          uint32_t addr = V_new_smem + v_half * BT * 128 + t_local * 128 + swiz * 16 + lane_v * 2;
+          asm volatile("ld.shared.b16 %0, [%1];" : "=h"(*reinterpret_cast<uint16_t*>(&val)) : "r"(addr));
+          // Store as fp32 to o_inter (scale applied by o_intra kernel)
+          o_inter_ptr[((int64_t)(off_t + t_local)) * H * V_dim + head_id * V_dim + v] = __bfloat162float(val);
+        }
+      }
+
       stage_id = (stage_id + 1) % NUM_STAGES;
       if (stage_id == 0)
         parity ^= 1;
@@ -720,7 +843,8 @@ CUtensorMap encode_h_tma(void *ptr, uint64_t N, CUtensorMapDataType dtype) {
   return tmap;
 }
 
-void h_v1(
+void ho_v1(
+  TensorView Q,
   TensorView K,
   TensorView V,
   TensorView W,
@@ -729,56 +853,47 @@ void h_v1(
   TensorView h,
   TensorView h0,
   TensorView ht,
+  TensorView o_inter,     // [T, H, V_dim] fp32
   TensorView cu_seqlens,
   TensorView chunk_offsets,
-  ffi::Optional<TensorView> profiler
+  double scale_d
 ) {
   const int T = K.size(0);
   const int N = h0.size(0);
+  const float scale_f = (float)scale_d;
 
   auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim);
   auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
   auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
-  auto V_new_tmap = encode_tma(V_new.data_ptr(), 100000, H, V_dim);  // padded layout
+  auto Q_tmap     = encode_tma(Q.data_ptr(), T, Hg, K_dim);  // Q has same layout as K
+  auto V_new_tmap = encode_tma(V_new.data_ptr(), 100000, H, V_dim);
   auto H0_tmap    = encode_h_tma(h0.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
   auto HT_tmap    = encode_h_tma(ht.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
   auto H_tmap     = encode_h_tma(h.data_ptr(), 100000, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
 
-  auto *V_new_ptr         = reinterpret_cast<nv_bfloat16 *>(V_new.data_ptr());
   auto *g_cu_ptr          = reinterpret_cast<const float *>(g_cu.data_ptr());
   auto *cu_seqlens_ptr    = reinterpret_cast<int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_offsets_ptr = reinterpret_cast<int32_t *>(chunk_offsets.data_ptr());
+  auto *o_inter_raw       = reinterpret_cast<float *>(o_inter.data_ptr());
 
-  // deeper pipeline is slower?
   constexpr int NUM_STAGES = 2;
   constexpr int smem_size = STAGE_SIZE * NUM_STAGES
-                          + H_fp32_size         // H0
-                          + H_fp32_size / 2     // H
-                          + V_size              // V_new
-                          + v_scale_size        // v_scale
-                          + 5 * NUM_STAGES * 8  // TMA, wh_in, wh_done, vk_in, vk_done mbar
-                          + 8                   // h0
-                          + 4;                  // tmem addr
+                          + H_fp32_size                     // H0
+                          + H_fp32_size / 2                 // H
+                          + V_size                          // V_new
+                          + ((v_scale_size + 127) & ~127)   // v_scale (128B aligned)
+                          + Q_size                          // NEW: Q_smem
+                          + 8 * NUM_STAGES * 8              // TMA, wh_in/done, vk_in/done, q, qh_in/done
+                          + 8                               // h0
+                          + 4;                              // tmem addr
 
-  if (profiler.has_value()) {
-    const int num_entries = (profiler.value().size(2) - 1) / 2;
-    auto *profiler_ptr = reinterpret_cast<int64_t *>(profiler.value().data_ptr());
-
-    auto kernel = h_kernel_cutlass<NUM_STAGES, true>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    dim3 grid(H, N);
-    kernel<<<grid, TB_SIZE, smem_size>>>(
-      K_tmap, V_tmap, W_tmap, H0_tmap, HT_tmap, H_tmap, V_new_tmap,
-      g_cu_ptr, cu_seqlens_ptr, chunk_offsets_ptr, profiler_ptr, num_entries);
-  }
-  else {
-    auto kernel = h_kernel_cutlass<NUM_STAGES, false>;
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    dim3 grid(H, N);
-    kernel<<<grid, TB_SIZE, smem_size>>>(
-      K_tmap, V_tmap, W_tmap, H0_tmap, HT_tmap, H_tmap, V_new_tmap,
-      g_cu_ptr, cu_seqlens_ptr, chunk_offsets_ptr, nullptr, 0);
-  }
+  auto kernel = ho_kernel_cutlass<NUM_STAGES, false>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+  dim3 grid(H, N);
+  kernel<<<grid, TB_SIZE, smem_size>>>(
+    K_tmap, V_tmap, W_tmap, Q_tmap, H0_tmap, HT_tmap, H_tmap, V_new_tmap,
+    g_cu_ptr, cu_seqlens_ptr, chunk_offsets_ptr,
+    o_inter_raw, scale_f, nullptr, 0);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(h_v1, h_v1);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ho_v1, ho_v1);
