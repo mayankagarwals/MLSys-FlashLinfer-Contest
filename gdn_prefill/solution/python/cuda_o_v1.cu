@@ -303,18 +303,20 @@ store_attn_column_pair(nv_bfloat16 *attn_smem_ptr, const float *g_neg_smem_ptr,
                              col_hi < row_hi_limit)));
 }
 
-__device__ __forceinline__ void materialize_attn_stage(
-    char *smem_ptr, uint32_t smem, uint32_t attn_stage_smem,
-    const float *g_neg_head_ptr, float g_row_base, float g_row_hi,
-    uint32_t row_base, uint32_t row_hi, uint32_t row_base_limit,
-    uint32_t row_hi_limit, uint32_t lane_col) {
-  nv_bfloat16 *attn_smem_ptr =
-      reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_stage_smem - smem));
-  float qk_reg_lo[REGS_PER_FRAGMENT];
-  float qk_reg_hi[REGS_PER_FRAGMENT];
+__device__ __forceinline__ void load_qk_fragment(float *qk_reg_lo,
+                                                 float *qk_reg_hi) {
   tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_lo, 0, 0);
   tcgen05_ld<SHAPE::_16x256b, 4>(qk_reg_hi, 0, COLS_PER_FRAGMENT);
   tcgen05_wait_ld();
+}
+
+__device__ __forceinline__ void materialize_attn_stage_from_regs(
+    char *smem_ptr, uint32_t smem, uint32_t attn_stage_smem,
+    const float *qk_reg_lo, const float *qk_reg_hi, const float *g_neg_head_ptr,
+    float g_row_base, float g_row_hi, uint32_t row_base, uint32_t row_hi,
+    uint32_t row_base_limit, uint32_t row_hi_limit, uint32_t lane_col) {
+  nv_bfloat16 *attn_smem_ptr =
+      reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_stage_smem - smem));
 #pragma unroll
   for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
     const uint32_t col_lo = step_pair * 8U + 2U * lane_col;
@@ -697,12 +699,17 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
       tcgen05_fence_after_thread_sync();
 
+      float qk_reg_lo[REGS_PER_FRAGMENT];
+      float qk_reg_hi[REGS_PER_FRAGMENT];
+      load_qk_fragment(qk_reg_lo, qk_reg_hi);
+
       const float *head0_g_pos_ptr = g_pos_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T;
       const float *head0_g_neg_ptr = g_neg_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T;
-      materialize_attn_stage(
+      materialize_attn_stage_from_regs(
           smem_ptr, smem, attn_smem + HEAD0_STAGE_INDEX * ATTN_SMEM_SIZE,
-          head0_g_neg_ptr, head0_g_pos_ptr[row_base], head0_g_pos_ptr[row_hi],
-          row_base, row_hi, row_base_limit, row_hi_limit, lane_col);
+          qk_reg_lo, qk_reg_hi, head0_g_neg_ptr, head0_g_pos_ptr[row_base],
+          head0_g_pos_ptr[row_hi], row_base, row_hi, row_base_limit,
+          row_hi_limit, lane_col);
       fence_proxy_async_shared_cta();
       __syncwarp();
       if (elect_sync()) {
@@ -724,10 +731,11 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
               g_pos_smem_ptr + next_head_offset * BLOCK_T;
           const float *next_g_neg_ptr =
               g_neg_smem_ptr + next_head_offset * BLOCK_T;
-          materialize_attn_stage(
+          materialize_attn_stage_from_regs(
               smem_ptr, smem, attn_smem + next_head_offset * ATTN_SMEM_SIZE,
-              next_g_neg_ptr, next_g_pos_ptr[row_base], next_g_pos_ptr[row_hi],
-              row_base, row_hi, row_base_limit, row_hi_limit, lane_col);
+              qk_reg_lo, qk_reg_hi, next_g_neg_ptr, next_g_pos_ptr[row_base],
+              next_g_pos_ptr[row_hi], row_base, row_hi, row_base_limit,
+              row_hi_limit, lane_col);
           fence_proxy_async_shared_cta();
           __syncwarp();
           if (elect_sync()) {
