@@ -17,26 +17,9 @@ CURRENT_DIR = Path(__file__).parent
 
 from .chunk_v6c import (
     merge_16x16_to_64x64_inverse_kernel_v2,
-    _unit_lower_inverse_16x16_bf16_corr1,
     mod as kkt_mod,
 )
-
-# Compile the fused H+O kernel
-fused_lib_path = tvm_ffi.cpp.build(
-    name="gdn_prefill_cuda_fused_ho",
-    cuda_files=[
-        str(CURRENT_DIR / "cuda_fused_ho.cu"),
-    ],
-    extra_cflags=["-O3"],
-    extra_cuda_cflags=[
-        "-O3",
-        "--use_fast_math",
-        "-lineinfo",
-    ],
-    extra_ldflags=["-lcuda"],
-)
-
-fused_mod = tvm_ffi.load_module(fused_lib_path)
+from .triton_fused_ho import fused_ho_kernel
 
 
 def run(
@@ -79,14 +62,18 @@ def run(
         num_warps=2,
     )
 
-    # Fused H+O kernel — processes all chunks sequentially per (seq, head)
-    # Computes h recurrence AND output in one pass, no intermediate h/v_new tensors
+    # Fused H+O Triton kernel — V-tiled, processes all chunks sequentially
     o = torch.empty_like(v)
     new_state = torch.empty_like(state, dtype=torch.float32)
-    fused_mod.fused_ho(
-        q, k, v, w, u, g_cu,
-        state, cu_seqlens, scale,
+    BV = 64  # V-tile size (halves h state to [64, 128] = 32KB)
+    grid = (N * H, V_dim // BV)
+    fused_ho_kernel[grid](
+        q, k, w, u, g_cu,
+        state, cu_seqlens,
         o, new_state,
+        scale,
+        H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, BV=BV,
+        num_warps=4,
     )
 
     return o, new_state
