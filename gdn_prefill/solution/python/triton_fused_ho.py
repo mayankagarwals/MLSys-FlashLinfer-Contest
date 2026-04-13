@@ -3,7 +3,7 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def fused_ho_kernel(
+def fused_ho_kernel_v2(
     q_ptr, k_ptr, w_ptr, u_ptr, g_cu_ptr,
     state_ptr, cu_seqlens_ptr,
     output_ptr, new_state_ptr,
@@ -48,7 +48,7 @@ def fused_ho_kernel(
         o_inter = qh * tl.exp(g_cu)[:, None]
         A = tl.dot(q, tl.trans(k)) * tl.exp(g_cu[:, None] - g_cu[None, :])
         A = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], A, 0.0)
-        o_intra = tl.dot(A.to(v_new.dtype), v_new)
+        o_intra = tl.dot(A.to(tl.bfloat16), v_new.to(tl.bfloat16))
         o = (o_inter + o_intra) * scale
         tl.store(output_ptr + (cstart * H + head_id) * V_dim + v_start + offs_t * H * V_dim + offs_bv, o.to(tl.bfloat16), mask=mask_t)
         last_idx = tl.minimum(clen - 1, BT - 1)

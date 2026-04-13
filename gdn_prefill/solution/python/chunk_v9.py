@@ -7,7 +7,7 @@ os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 import tvm_ffi
 CURRENT_DIR = Path(__file__).parent
 from .chunk_v6c import merge_16x16_to_64x64_inverse_kernel_v2, mod as kkt_mod
-from .triton_fused_ho import fused_ho_kernel
+from .triton_fused_ho import fused_ho_kernel_v2 as fused_ho_kernel
 
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     T, Hg, K_dim = k.shape; N, H, V_dim, _ = state.shape; BT = 64
