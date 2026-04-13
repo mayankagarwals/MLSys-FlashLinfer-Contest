@@ -40,8 +40,9 @@ def _unit_lower_inverse_16x16_bf16_corr1(A_orig):
     m_I = tl.where(o_i[:, None] == o_i[None, :], 1.0, 0.0)
     m_I_bf16 = m_I.to(tl.bfloat16)
 
-    # Experiment: use bf16-input MMAs for the 6-dot Neumann path, then recover
-    # accuracy with a single residual correction factor: (I + R)^-1 ~= I - R.
+    # 2-iteration Neumann: covers A through A^4 exactly, missing A^5..A^15.
+    # Correction step recovers most of the remaining error.
+    # Saves 2 bf16 dots (4 mma) per block vs 3-iteration version.
     A = A_orig.to(tl.bfloat16)
     Ai = m_I_bf16 - A
 
@@ -53,10 +54,7 @@ def _unit_lower_inverse_16x16_bf16_corr1(A_orig):
     A_pow_bf16 = A_pow.to(tl.bfloat16)
     Ai = tl.dot(Ai.to(tl.bfloat16), m_I_bf16 + A_pow_bf16)
 
-    A_pow = tl.dot(A_pow_bf16, A_pow_bf16)
-    A_pow_bf16 = A_pow.to(tl.bfloat16)
-    Ai = tl.dot(Ai.to(tl.bfloat16), m_I_bf16 + A_pow_bf16)
-
+    # Correction: compute residual R = (I+A)@Ai - I, then Ai = Ai @ (I - R)
     MAi = Ai + tl.dot(A_orig, Ai, input_precision="tf32")
     R = MAi - m_I
     Ai = tl.dot(Ai, m_I - R, input_precision="tf32")
