@@ -35,7 +35,7 @@ def run(
         else:
             return chunk_v7b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA v4 for medium workloads
+    # CUDA v4 for medium workloads — use CUDA graph for launch overhead reduction
     if T >= 64 or (N == 1 and T >= 46):
         return cuda_v4(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
