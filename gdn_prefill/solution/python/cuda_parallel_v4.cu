@@ -2233,10 +2233,93 @@
        scale_f, out_p, nullptr, num_seqs);
  }
 
+ // GPU-side prep_meta kernel for chunk metadata
+ __global__ void prep_meta_kernel_v4(
+     const int64_t *cu_seqlens,
+     int32_t *chunk_indices,
+     int32_t *chunk_offsets,
+     int32_t *total_chunks_out,
+     int64_t num_seqs
+ ) {
+   const int tid = threadIdx.x;
+   if (tid == 0) {
+     int32_t total = 0;
+     chunk_offsets[0] = 0;
+     for (int64_t i = 0; i < num_seqs; i++) {
+       int64_t slen = cu_seqlens[i + 1] - cu_seqlens[i];
+       int32_t nc = (int32_t)((slen + kBT - 1) / kBT);
+       total += nc;
+       chunk_offsets[i + 1] = total;
+     }
+     total_chunks_out[0] = total;
+   }
+   __syncthreads();
+   if (tid < num_seqs) {
+     int32_t offset = chunk_offsets[tid];
+     int64_t slen = cu_seqlens[tid + 1] - cu_seqlens[tid];
+     int32_t nc = (int32_t)((slen + kBT - 1) / kBT);
+     for (int32_t c = 0; c < nc; c++) {
+       chunk_indices[(offset + c) * 2] = (int32_t)tid;
+       chunk_indices[(offset + c) * 2 + 1] = c;
+     }
+   }
+ }
+
+ // Standalone FusedPrep: replaces separate KKT + inverse for v7b pipeline
+ void RunFusedPrepStandalone(
+     TensorView k, TensorView v, TensorView A_log, TensorView a,
+     TensorView dt_bias, TensorView b, TensorView cu_seqlens,
+     TensorView g_cu_out, TensorView w_out, TensorView u_out,
+     TensorView chunk_indices, TensorView chunk_offsets
+ ) {
+   const int64_t T = k.size(0);
+   const int64_t num_seqs = cu_seqlens.size(0) - 1;
+   const int64_t max_chunks = (num_seqs - 1) + ((T - (num_seqs - 1) + kBT - 1) / kBT);
+
+   auto *k_p = reinterpret_cast<const __nv_bfloat16 *>(k.data_ptr());
+   auto *v_p = reinterpret_cast<const __nv_bfloat16 *>(v.data_ptr());
+   auto *a_p = reinterpret_cast<const __nv_bfloat16 *>(a.data_ptr());
+   auto *b_p = reinterpret_cast<const __nv_bfloat16 *>(b.data_ptr());
+   auto *Alog_p = reinterpret_cast<const float *>(A_log.data_ptr());
+   auto *dtb_p = reinterpret_cast<const float *>(dt_bias.data_ptr());
+   auto *cusl_p = reinterpret_cast<const int64_t *>(cu_seqlens.data_ptr());
+   auto *g_p = reinterpret_cast<float *>(g_cu_out.data_ptr());
+   auto *w_p = reinterpret_cast<__nv_bfloat16 *>(w_out.data_ptr());
+   auto *u_p = reinterpret_cast<__nv_bfloat16 *>(u_out.data_ptr());
+   auto *ci_p = reinterpret_cast<int32_t *>(chunk_indices.data_ptr());
+   auto *co_p = reinterpret_cast<int32_t *>(chunk_offsets.data_ptr());
+   auto *tc_p = co_p + num_seqs;
+
+   ffi::CUDADeviceGuard guard(k.device().device_id);
+   const cudaStream_t stream = get_cuda_stream(k.device());
+
+   // 1. GPU-side prep metadata
+   prep_meta_kernel_v4<<<1, 128, 0, stream>>>(cusl_p, ci_p, co_p, tc_p, num_seqs);
+
+   // 2. FusedPrepKernel — KKT + inverse + W/U
+   CUtensorMap k_tmap_128, k_tmap_64;
+   init_tma_desc_3d(&k_tmap_128, k_p, (uint64_t)T, (uint64_t)(kHk * kK), 128, kK);
+   init_tma_desc_3d(&k_tmap_64,  k_p, (uint64_t)T, (uint64_t)(kHk * kK), 64,  kK);
+
+   static bool s_fp_attrs_set = false;
+   int smem_FP = (128*128*2 + 64*128*2 + 256 + 64*64*4 + 64*64*4 + 64*4 + 64*4 + 64*4 + 1023) & ~1023;
+   if (!s_fp_attrs_set) {
+     s_fp_attrs_set = true;
+     cudaFuncSetAttribute(FusedPrepKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_FP);
+   }
+
+   FusedPrepKernel<<<dim3(max_chunks, kHv), 128, smem_FP, stream>>>(
+       k_tmap_128, k_tmap_64, k_p, v_p,
+       a_p, b_p, Alog_p, dtb_p, g_p,
+       cusl_p, ci_p,
+       w_p, u_p, tc_p, max_chunks, num_seqs);
+ }
+
  } // namespace
 
  TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_prefill_tcgen05, RunGdnPrefillTcgen05);
  TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_o_kernel, RunOKernelStandalone);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fused_prep, RunFusedPrepStandalone);
  
  
  
