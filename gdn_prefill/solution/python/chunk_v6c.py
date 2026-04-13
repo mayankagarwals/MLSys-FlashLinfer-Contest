@@ -42,7 +42,6 @@ def _unit_lower_inverse_16x16_bf16_corr1(A_orig):
 
     # 2-iteration Neumann: covers A through A^4 exactly, missing A^5..A^15.
     # Correction step recovers most of the remaining error.
-    # Saves 2 bf16 dots (4 mma) per block vs 3-iteration version.
     A = A_orig.to(tl.bfloat16)
     Ai = m_I_bf16 - A
 
