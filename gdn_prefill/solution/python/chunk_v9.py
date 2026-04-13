@@ -65,7 +65,7 @@ def run(
     # Fused H+O Triton kernel — V-tiled, processes all chunks sequentially
     o = torch.empty_like(v)
     new_state = torch.empty_like(state, dtype=torch.float32)
-    BV = 64  # V-tile size (halves h state to [64, 128] = 32KB)
+    BV = 128  # Full V (no tiling — avoids redundant Q@K^T)
     grid = (N * H, V_dim // BV)
     fused_ho_kernel[grid](
         q, k, w, u, g_cu,
@@ -73,7 +73,7 @@ def run(
         o, new_state,
         scale,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, BV=BV,
-        num_warps=4,
+        num_warps=8, num_stages=1,
     )
 
     return o, new_state
