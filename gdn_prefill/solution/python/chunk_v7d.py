@@ -57,8 +57,8 @@ def compute_o_inter_kernel(
         offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
         h = tl.load(h_ptr + (offs_v * K_dim + offs_k))
         o_inter = tl.dot(q, h.T) * exp_g[:, None] * scale
-        # Store as fp32 to scratch buffer (o_ptr points to fp32 tensor)
-        tl.store(o_ptr + (offs_t * (H * V_dim) + offs_v_block), o_inter, mask=mask_t)
+        # Store to scratch buffer (bf16 or fp32 depending on tensor dtype)
+        tl.store(o_ptr + (offs_t * (H * V_dim) + offs_v_block), o_inter.to(tl.bfloat16), mask=mask_t)
 
 
 @triton.jit
@@ -153,8 +153,8 @@ def run(
     mod.h_v1(k, u, w, v_new, g_cu, h, state, final_state, cu_seqlens, chunk_offsets, None)
 
     # Split O into: o_inter (q@h^T) + o_intra (A@v_new)
-    # Use fp32 scratch for o_inter to avoid bf16 precision loss
-    o_scratch = torch.empty(T, H, V_dim, device=v.device, dtype=torch.float32)
+    # Use bf16 scratch — saves 16MB vs fp32
+    o_scratch = torch.empty(T, H, V_dim, device=v.device, dtype=torch.bfloat16)
 
     # Step 1: o_inter = q @ h^T * exp(g) (fp32, no scale yet)
     BV = 64
