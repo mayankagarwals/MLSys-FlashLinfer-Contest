@@ -8,16 +8,12 @@ from torch import Tensor
 
 from . import chunk_v7 as _chunk_v7
 from .chunk_v6c import (
-    compute_chunks_kernel,
     merge_16x16_to_64x64_inverse_kernel_v2,
 )
 
 chunk_fwd_kernel_o = _chunk_v7.chunk_fwd_kernel_o
 export_trace = _chunk_v7.export_trace
 mod = _chunk_v7.mod
-
-_FLAG = None
-
 
 def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
@@ -34,43 +30,18 @@ def run(
     T, Hg, K_dim = k.shape
     N, H, V_dim, _ = state.shape
 
-    # prepare chunk metadata
     BT = 64
 
-    # Triton version
-    # flag for grid sync
-    global _FLAG
-    if _FLAG is None:
-        _FLAG = q.new_zeros(1, dtype=torch.int32)
-
-    # we allocate more than enough for chunk_indices so that we don't need to know
-    # the value of total_num_chunks before calling the kernel.
     upper_bound_chunks = (N - 1) + triton.cdiv(T - (N - 1), BT)
-    num_chunks = q.new_empty(N, dtype=torch.int32)
     chunk_offsets = q.new_empty(N + 1, dtype=torch.int32)
     chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
-    compute_chunks_kernel[(N,)](
-        cu_seqlens,
-        num_chunks,
-        chunk_offsets,
-        chunk_indices,
-        _FLAG,
-        N=N,
-        BT=BT,
-        # max N is 57 -> max BLOCK_SIZE is 64, still very small
-        BLOCK_SIZE=triton.next_power_of_2(N),
-    )
     total_chunks_ptr = chunk_offsets[N:]
 
-    # this kernel does multiple things:
-    # - compute K @ K.T
-    # - compute g and its chunk local cumsum
-    # - compute beta
-    # - compute strictLower(beta * Gamma * (K @ K.T))
+    # Combined: compute chunk metadata + K@K.T + gating → A, g_cu, beta
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    mod.kkt_v1b(
+    mod.kkt_v1b_with_meta(
         k,
         A_log,
         a,
@@ -81,7 +52,7 @@ def run(
         A,
         cu_seqlens,
         chunk_indices,
-        total_chunks_ptr,
+        chunk_offsets,
     )
 
     # - compute Ai = inverse(I + strictTriu(A))

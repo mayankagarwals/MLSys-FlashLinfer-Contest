@@ -11,7 +11,6 @@ from torch import Tensor
 
 from .triton_v4 import (
     chunk_gated_delta_rule_fwd_kernel_h,
-    compute_chunks_kernel,
 )
 
 os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
@@ -329,9 +328,6 @@ def chunk_fwd_kernel_o(
         tl.store(o_ptr + (offs_t * (H * V_dim) + offs_v_block), o, mask=mask_t)
 
 
-_FLAG = None
-
-
 def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
     k: Tensor,  # (total_seqlen, num_k_heads, head_dim)
@@ -349,30 +345,15 @@ def run(
 
     BT = 64
 
-    global _FLAG
-    if _FLAG is None:
-        _FLAG = q.new_zeros(1, dtype=torch.int32)
-
     upper_bound_chunks = (N - 1) + triton.cdiv(T - (N - 1), BT)
-    num_chunks = q.new_empty(N, dtype=torch.int32)
     chunk_offsets = q.new_empty(N + 1, dtype=torch.int32)
-    chunk_indices = q.new_zeros((upper_bound_chunks, 2), dtype=torch.int32)
-    compute_chunks_kernel[(N,)](
-        cu_seqlens,
-        num_chunks,
-        chunk_offsets,
-        chunk_indices,
-        _FLAG,
-        N=N,
-        BT=BT,
-        BLOCK_SIZE=triton.next_power_of_2(N),
-    )
+    chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
     total_chunks_ptr = chunk_offsets[N:]
 
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    mod.kkt_v1b(
+    mod.kkt_v1b_with_meta(
         k,
         A_log,
         a,
@@ -383,7 +364,7 @@ def run(
         A,
         cu_seqlens,
         chunk_indices,
-        total_chunks_ptr,
+        chunk_offsets,
     )
 
     u = torch.empty_like(v)
