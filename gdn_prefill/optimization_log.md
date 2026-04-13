@@ -90,10 +90,28 @@
 - BV=8: worse (43-66 us) despite better SM utilization — per-TB overhead dominates
 - BV=32: worse (51-70 us) — too few TBs
 
-## Current Result
-- Optimized total: 8721.8 us
-- Improvement: 115.8 us (1.31%)
-- Remaining target: ~768 us more needed
+### 14. Fuse chunk metadata into kkt kernel (APPLIED)
+- Added prep_meta_kernel (128 threads, parallel per-seq) + kkt_v1b_with_meta to cuda_kkt_v1b.cu
+- Eliminates Triton compute_chunks_kernel launch and Python-side setup
+- Saves ~1 Python function call + 1 Triton kernel launch + tensor allocations
+- prep_meta takes 7.3 us (vs Triton's 6.6 us) — slower kernel but fewer launches
+- Net savings: ~38 us over 40 chunk workloads
+
+## Current Result (after all optimizations)
+- Optimized total: 8683.8 us
+- Total improvement: 153.9 us (1.74% from baseline 8837.7 us)
+- Chunk path: 6208.6 → 6048.5 us (+2.6%)
+- v4 path: unchanged
+- Recurrent: unchanged
+
+## Remaining Gap to 10%
+- Need: ~883 us more savings (current: 154 us / target: 884 us)
+- The remaining gap requires fundamentally different approaches:
+  1. CUDA graphs (blocked by mixed Triton+CUDA)
+  2. torch.compile (blocked by TVM FFI correctness issues)
+  3. Hand-tuned PTX kernels (very complex, uncertain gain)
+  4. Algorithmic changes (different chunk sizes, math reformulations)
+  5. Full pipeline in C++ (eliminates ~34 us Python overhead per call)
 
 ## Key Findings
 1. The Triton compiler generates excellent code on B200 Blackwell — hand-written CUDA is NOT faster
