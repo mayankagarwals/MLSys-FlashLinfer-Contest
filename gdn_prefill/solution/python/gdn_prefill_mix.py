@@ -8,7 +8,7 @@ from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
 from .chunk_v6c import run as chunk_v6c
-from .chunk_v7b import run as chunk_v7b
+from .chunk_v7b import run as chunk_v7b  # Optimal: 8599 us, 100/100
 from .cuda_parallel_v4 import run as cuda_v4
 
 
