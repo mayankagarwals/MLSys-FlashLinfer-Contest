@@ -2196,9 +2196,47 @@
          << "GdnPrefillTcgen05 failed: " << cudaGetErrorString(err);
  }
  
+ // Standalone O kernel export for use in chunk pipeline (v6c/v7b paths)
+ void RunOKernelStandalone(
+     TensorView q,          // [T, Hq, K] bf16
+     TensorView k,          // [T, Hk, K] bf16
+     TensorView v_new,      // [T, Hv, V] bf16
+     TensorView h,          // [total_chunks, Hv, V, K] bf16
+     TensorView g_cumsum,   // [T, Hv] fp32
+     TensorView cu_seqlens, // [N+1] int64
+     double scale,
+     TensorView output,     // [T, Hv, V] bf16
+     int64_t max_chunks
+ ) {
+   const float scale_f = (float)scale;
+   const int64_t num_seqs = cu_seqlens.size(0) - 1;
+
+   auto *q_p    = reinterpret_cast<const __nv_bfloat16 *>(q.data_ptr());
+   auto *k_p    = reinterpret_cast<const __nv_bfloat16 *>(k.data_ptr());
+   auto *u_p    = reinterpret_cast<const __nv_bfloat16 *>(v_new.data_ptr());
+   auto *h_p    = reinterpret_cast<const __nv_bfloat16 *>(h.data_ptr());
+   auto *g_p    = reinterpret_cast<const float *>(g_cumsum.data_ptr());
+   auto *cusl_p = reinterpret_cast<const int64_t *>(cu_seqlens.data_ptr());
+   auto *out_p  = reinterpret_cast<__nv_bfloat16 *>(output.data_ptr());
+
+   int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
+
+   static bool s_o_attrs_set = false;
+   if (!s_o_attrs_set) {
+     s_o_attrs_set = true;
+     cudaFuncSetAttribute(OOutputKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_O);
+   }
+
+   // OOutputKernel uses inline chunk mapping — no chunk_indices needed
+   OOutputKernel<<<dim3(kNVT_O, max_chunks, kHv), 256, smem_O>>>(
+       q_p, k_p, u_p, h_p, g_p, cusl_p, nullptr,
+       scale_f, out_p, nullptr, num_seqs);
+ }
+
  } // namespace
- 
+
  TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_prefill_tcgen05, RunGdnPrefillTcgen05);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_o_kernel, RunOKernelStandalone);
  
  
  
