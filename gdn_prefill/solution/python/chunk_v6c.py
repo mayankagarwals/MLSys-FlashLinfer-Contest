@@ -125,18 +125,18 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     A_42 = tl.load(A_ptr + (offsets + (48 * H * BT + 16)), mask=offs_t < seqlen - 48)
     A_43 = tl.load(A_ptr + (offsets + (48 * H * BT + 32)), mask=offs_t < seqlen - 48)
 
-    tmp = tl.dot(Ai_22, A_21, input_precision="tf32x3")
-    Ai_21 = -tl.dot(tmp, Ai_11, input_precision="tf32x3")
-    tmp = tl.dot(Ai_33, A_32, input_precision="tf32x3")
-    Ai_32 = -tl.dot(tmp, Ai_22, input_precision="tf32x3")
-    tmp = tl.dot(Ai_44, A_43, input_precision="tf32x3")
-    Ai_43 = -tl.dot(tmp, Ai_33, input_precision="tf32x3")
-    tmp = tl.dot(A_31, Ai_11, input_precision="tf32x3")
-    tmp = tl.dot(A_32, Ai_21, acc=tmp, input_precision="tf32x3")
-    Ai_31 = -tl.dot(Ai_33, tmp, input_precision="tf32x3")
-    tmp = tl.dot(A_42, Ai_22, input_precision="tf32x3")
-    tmp = tl.dot(A_43, Ai_32, acc=tmp, input_precision="tf32x3")
-    Ai_42 = -tl.dot(Ai_44, tmp, input_precision="tf32x3")
+    tmp = tl.dot(Ai_22, A_21, input_precision="tf32")
+    Ai_21 = -tl.dot(tmp, Ai_11, input_precision="tf32")
+    tmp = tl.dot(Ai_33, A_32, input_precision="tf32")
+    Ai_32 = -tl.dot(tmp, Ai_22, input_precision="tf32")
+    tmp = tl.dot(Ai_44, A_43, input_precision="tf32")
+    Ai_43 = -tl.dot(tmp, Ai_33, input_precision="tf32")
+    tmp = tl.dot(A_31, Ai_11, input_precision="tf32")
+    tmp = tl.dot(A_32, Ai_21, acc=tmp, input_precision="tf32")
+    Ai_31 = -tl.dot(Ai_33, tmp, input_precision="tf32")
+    tmp = tl.dot(A_42, Ai_22, input_precision="tf32")
+    tmp = tl.dot(A_43, Ai_32, acc=tmp, input_precision="tf32")
+    Ai_42 = -tl.dot(Ai_44, tmp, input_precision="tf32")
     tmp = tl.dot(A_41, Ai_11, input_precision="tf32x3")
     tmp = tl.dot(A_42, Ai_21, acc=tmp, input_precision="tf32x3")
     tmp = tl.dot(A_43, Ai_31, acc=tmp, input_precision="tf32x3")
@@ -453,7 +453,7 @@ def run(
         V_dim=V_dim,
         BT=BT,
         BV=BV,
-        num_warps=8,
+        num_warps=4,
     )
 
     return o, final_state

@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .chunk_v6b import run as chunk_v6c
+from .chunk_v6c import run as chunk_v6c
 from .chunk_v7b import run as chunk_v7b
 from .cuda_parallel_v4 import run as cuda_v4
 
@@ -27,11 +27,10 @@ def run(
     T = q.shape[0]
     N = cu_seqlens.shape[0] - 1
 
-    # chunk_v6b/v7b for T>=525 (beats v4 on all these workloads)
+    # chunk_v7b for T>=525 (CUDA H kernel, beats Triton H for most workloads)
+    # v6b (Triton H) only for very large T with N<=2 where CUDA H has poor SM utilization
     if T >= 525:
-        # CUDA H kernel (chunk_v7b) performs slightly worse when there are not enough
-        # active threadblocks
-        if N <= 2:
+        if N <= 2 and T >= 2500:
             return chunk_v6c(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
         else:
             return chunk_v7b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)

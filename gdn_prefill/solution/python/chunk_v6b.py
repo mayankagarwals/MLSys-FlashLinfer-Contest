@@ -295,7 +295,7 @@ def run(
         cu_seqlens, chunk_indices, total_chunks_ptr,
         scale=scale,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, BV=BV,
-        num_warps=8,
+        num_warps=4,
     )
 
     return o, final_state

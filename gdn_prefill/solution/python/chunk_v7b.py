@@ -153,7 +153,7 @@ def run(
         V_dim=V_dim,
         BT=BT,
         BV=BV,
-        num_warps=8,
+        num_warps=4,
     )
 
     return o, final_state
