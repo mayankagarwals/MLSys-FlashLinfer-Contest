@@ -46,10 +46,7 @@
 #include <cuda_bf16.h>
 #include <cudaTypedefs.h>
 #include <cstdint>
-#include <mma.h>
 #include "cuda_utils.h"
-
-using namespace nvcuda;
 
 __device__ inline
 int cdiv(int a, int b) { return (a + b - 1) / b; }
@@ -77,34 +74,11 @@ constexpr int V_dim = 128;
 constexpr uint32_t W_size = BT * K_dim * sizeof(nv_bfloat16);
 constexpr uint32_t V_size = BT * V_dim * sizeof(nv_bfloat16);
 constexpr uint32_t K_size = BT * K_dim * sizeof(nv_bfloat16);
+constexpr uint32_t Q_size = BT * K_dim * sizeof(nv_bfloat16);  // NEW: q loading (same size as K)
 constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
 
 constexpr uint32_t H_fp32_size = V_dim * K_dim * sizeof(float);
 constexpr uint32_t v_scale_size = BT * sizeof(float);
-
-// For inline o_inter: scratch for h tile transpose (16×8 bf16 = 256 bytes)
-// and q loading from GMEM (64×128 bf16 = 16384 bytes)
-constexpr uint32_t Q_smem_size = BT * K_dim * sizeof(nv_bfloat16);  // 16KB
-constexpr uint32_t H_scratch_size = 256;  // 16×8 bf16 for h tile transpose per warp
-
-// Helper: compute H_smem byte address for h[v, k]
-__device__ __forceinline__
-uint32_t h_smem_byte_addr(uint32_t H_smem_base, int v, int k) {
-  int section = k / 64;
-  int k_in_sec = k % 64;
-  int cg = k_in_sec / 8;
-  int lane_k = k_in_sec % 8;
-  int swiz_cg = cg ^ (v & 7);
-  return H_smem_base + section * V_dim * 128 + v * 128 + swiz_cg * 16 + lane_k * 2;
-}
-
-// Helper: XOR swizzle for Q_smem (same as K_smem TMA layout)
-__device__ __forceinline__
-int q_xor_swizzle(int row, int col) {
-  int cg = col >> 3;
-  int swiz_cg = cg ^ (row & 7);
-  return (swiz_cg << 3) | (col & 7);
-}
 
 constexpr int NUM_WARPS = 4 + 4 + 2;
 constexpr int WARP_SIZE = 32;
@@ -190,13 +164,10 @@ struct Profiler {
   }
 };
 
-// Fused H+O: H kernel + o_inter second pass
-// After H recurrence, all warps compute o_inter = q@h^T * exp(g) * scale using h from GMEM
-
 template <int NUM_STAGES, bool DO_PROFILE>
 __global__
 __block_size__((TB_SIZE, 1, 1))
-void ho_kernel_cutlass(
+void h_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,      // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap W_tmap,      // [total_T, H, K_dim]
@@ -205,13 +176,9 @@ void ho_kernel_cutlass(
   const __grid_constant__ CUtensorMap H_tmap,      // [total_num_chunks, H, V_dim, K_dim]
   const __grid_constant__ CUtensorMap V_new_tmap,  // [total_num_chunks, BT, H, V_dim]
   const float       *g_cu_ptr,                     // [total_T, H]
-  const nv_bfloat16 *q_ptr_raw,                    // [total_T, Hg, K_dim]
-  const nv_bfloat16 *h_ptr_raw,                    // [total_chunks, H, V_dim, K_dim] bf16
   const int64_t     *cu_seqlens_ptr,               // [N+1]
   const int32_t     *chunk_offsets_ptr,            // [N]
-        float       *o_inter_ptr,                  // [total_T, H, V_dim] fp32 scratch
-        float        scale,
-        int64_t     *profiler_ptr,
+        int64_t     *profiler_ptr,                 // [NUM_SMS][NUM_WARPS][1 + num_entries * 2]
         int          num_entries
 ) {
   const int tid = threadIdx.x;
@@ -239,10 +206,7 @@ void ho_kernel_cutlass(
   const uint32_t v_scale_smem = V_new_smem + V_size;
   float *v_scale_smem_ptr = reinterpret_cast<float *>(smem_ptr + (v_scale_smem - smem));
 
-  // NEW: Q_smem for q loading (used by second-pass o_inter)
-  const uint32_t Q_smem_addr = v_scale_smem + ((v_scale_size + 127) & ~127);  // 128B aligned
-
-  const uint32_t tma_mbar_addr      = Q_smem_addr + Q_smem_size;
+  const uint32_t tma_mbar_addr      = v_scale_smem + v_scale_size;
   const uint32_t wh_in_mbar_addr    = tma_mbar_addr + NUM_STAGES * 8;
   const uint32_t wh_done_mbar_addr  = wh_in_mbar_addr + NUM_STAGES * 8;
   const uint32_t vk_in_mbar_addr    = wh_done_mbar_addr + NUM_STAGES * 8;
@@ -698,146 +662,6 @@ void ho_kernel_cutlass(
         parity ^= 1;
     }
   }
-  // ═══ SECOND PASS: Compute o_inter = q @ h^T * exp(g) * scale ═══
-  // All warps synchronize after the H loop, then collaborate on o_inter.
-  // h is now in GMEM (stored by H warps via TMA), q is in GMEM.
-  __syncthreads();  // All warps finish their main loop work
-
-  // Each thread waits for its own pending TMA/async ops to complete
-  // (H warps wait for h TMA stores, V warps wait for v_new TMA stores)
-  asm volatile("cp.async.bulk.wait_group 0;");
-  __syncthreads();  // Now all TMA stores are complete and visible
-
-  {
-    const int chunk_offset = chunk_offsets_ptr[seq_id];
-    const int q_head_id = head_id / (H / Hg);
-
-    // Compute o_inter = q @ h^T * exp(g) * scale using mma.sync m16n8k16
-    // Strategy: load q from GMEM into Q_smem (with XOR swizzle), then use
-    // ldmatrix for A fragments (q) and scalar loads for B fragments (h^T from H_smem)
-    //
-    // For q@h^T: M=BT=64, N=V_dim=128, K=K_dim=128
-    // mma.sync.m16n8k16: each call produces [16, 8] output
-    // M_tiles=4, N_tiles=16, K_tiles=8
-    // Total output tiles: 4*16=64. With 10 warps: ~6 tiles/warp
-    {
-      const int warp_id_global = tid / WARP_SIZE;
-      const int lane = tid % WARP_SIZE;
-      nv_bfloat16 *q_smem_bf16 = reinterpret_cast<nv_bfloat16 *>(smem_ptr + (Q_smem_addr - smem));
-
-      for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
-        const int clen = min(BT, seqlen - chunk_id * BT);
-        const int off_t = bos + chunk_id * BT;
-        const int global_chunk = chunk_offset + chunk_id;
-
-        // Step 1: Load q[BT, K_dim] from GMEM into Q_smem with XOR swizzle
-        // All threads collaborate. q has stride Hg*K_dim between rows.
-        {
-          const nv_bfloat16 *q_gmem = q_ptr_raw + (int64_t)off_t * Hg * K_dim + q_head_id * K_dim;
-          // Each thread loads some bf16 elements
-          for (int idx = tid; idx < BT * K_dim; idx += TB_SIZE) {
-            int t_local = idx / K_dim;
-            int k = idx % K_dim;
-            nv_bfloat16 val = (t_local < clen) ? q_gmem[(int64_t)t_local * Hg * K_dim + k] : __float2bfloat16(0.0f);
-            // Store to Q_smem with XOR swizzle: layout [K_dim/64, BT, 64]
-            int k_chunk = k / 64;
-            int k_within = k % 64;
-            int swiz_col = q_xor_swizzle(t_local, k_within);
-            q_smem_bf16[k_chunk * BT * 64 + t_local * 64 + swiz_col] = val;
-          }
-        }
-        __syncthreads();
-
-        // Step 2: Compute q @ h^T using mma.sync.m16n8k16
-        // Distribute (m_tile, n_tile) across 10 warps
-        constexpr int M_tiles = BT / 16;     // 4
-        constexpr int N_tiles = V_dim / 8;   // 16
-        constexpr int K_tiles = K_dim / 16;  // 8
-        constexpr int total_out_tiles = M_tiles * N_tiles;  // 64
-
-        for (int tile_id = warp_id_global; tile_id < total_out_tiles; tile_id += NUM_WARPS) {
-          int m_tile = tile_id / N_tiles;
-          int n_tile = tile_id % N_tiles;
-
-          float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
-
-          for (int k_tile = 0; k_tile < K_tiles; k_tile++) {
-            // Load A fragment from Q_smem: q[m_tile*16:m_tile*16+16, k_tile*16:k_tile*16+16]
-            // Q_smem layout: [K_dim/64, BT, 64] with XOR swizzle (same as K_smem)
-            uint32_t a[4];
-            {
-              int r = (lane % 8) + ((lane & 8) ? 8 : 0) + m_tile * 16;
-              int c = (lane >= 16) ? 8 : 0;
-              int k_abs = k_tile * 16 + c;
-              int k_chunk = k_abs / 64;
-              int k_within = k_abs % 64;
-              int swiz_c = q_xor_swizzle(r, k_within);
-              ldmatrix<4>(a, Q_smem_addr + (k_chunk * BT * 64 + r * 64 + swiz_c) * 2);
-            }
-
-            // Load B fragment from H_smem: h[n_tile*8:n_tile*8+8, k_tile*16:k_tile*16+16]^T
-            // Use ldmatrix_trans<2> by providing h addresses with v=row, k=col
-            uint32_t b[2];
-            {
-              int v_row = n_tile * 8 + (lane % 8);
-              int k_col = k_tile * 16 + ((lane >= 8 && lane < 16) || lane >= 24 ? 8 : 0);
-              // H_smem address for h[v_row, k_col..k_col+7]
-              ldmatrix_trans<2>(b, h_smem_byte_addr(H_smem, v_row, k_col));
-            }
-
-            // Use tf32 for higher precision (closer to fp32 reference)
-            // tf32 m16n8k8: processes K=8 per call (vs K=16 for bf16)
-            // Need 2 tf32 calls per bf16 K=16 tile
-            // Convert bf16 fragments to fp32 for tf32 MMA
-            {
-              // a[0..3] are bf16x2 (8 bf16 values = 16x16 tile)
-              // Split into two K=8 halves for tf32
-              // First half: a[0], a[1] (rows 0-7,8-15, cols 0-7)
-              float fa0, fa1, fa2, fa3;
-              bf16x2_to_fp32x2(&fa0, a[0]); // cols 0-1 row0
-              bf16x2_to_fp32x2(&fa2, a[2]); // cols 2-3 row0
-
-              float fb0, fb1;
-              bf16x2_to_fp32x2(&fb0, b[0]); // B first half
-
-              mma_m16n8k8_tf32(d0, d1, d2, d3, fa0, fa1, fa2, fa3, fb0, fb1, d0, d1, d2, d3);
-
-              // Second half: a[1], a[3] (cols 8-15)
-              float fa0b, fa1b, fa2b, fa3b;
-              bf16x2_to_fp32x2(&fa0b, a[1]); // cols 0-1 row1 → actually this is wrong
-              bf16x2_to_fp32x2(&fa2b, a[3]);
-
-              float fb0b, fb1b;
-              bf16x2_to_fp32x2(&fb0b, b[1]);
-
-              mma_m16n8k8_tf32(d0, d1, d2, d3, fa0b, fa1b, fa2b, fa3b, fb0b, fb1b, d0, d1, d2, d3);
-            }
-          }
-
-          // Store result: d contains [16, 8] fp32 output
-          // Thread mapping: d0=D[r0,c0], d1=D[r1,c0], d2=D[r0,c1], d3=D[r1,c1]
-          // where r0=(lane/4)%8, r1=r0+8, c0=(lane%4)*2, c1=c0+1
-          int r0 = (lane / 4) % 8 + m_tile * 16;
-          int r1 = r0 + 8;
-          int c0 = (lane % 4) * 2 + n_tile * 8;
-          int c1 = c0 + 1;
-
-          if (r0 < clen) {
-            float g0 = __expf(g_cu_ptr[(off_t + r0) * H + head_id]) * scale;
-            o_inter_ptr[(int64_t)(off_t + r0) * H * V_dim + head_id * V_dim + c0] = d0 * g0;
-            o_inter_ptr[(int64_t)(off_t + r0) * H * V_dim + head_id * V_dim + c1] = d2 * g0;
-          }
-          if (r1 < clen) {
-            float g1 = __expf(g_cu_ptr[(off_t + r1) * H + head_id]) * scale;
-            o_inter_ptr[(int64_t)(off_t + r1) * H * V_dim + head_id * V_dim + c0] = d1 * g1;
-            o_inter_ptr[(int64_t)(off_t + r1) * H * V_dim + head_id * V_dim + c1] = d3 * g1;
-          }
-        }
-        __syncthreads();
-      }
-    }
-  }
-
   if (elect_sync()) profiler.flush();
 }
 
@@ -896,59 +720,65 @@ CUtensorMap encode_h_tma(void *ptr, uint64_t N, CUtensorMapDataType dtype) {
   return tmap;
 }
 
-// Fused H+O host function
-void ho_v1(
-  TensorView Q,            // [T, Hg, K_dim] bf16
+void h_v1(
   TensorView K,
   TensorView V,
   TensorView W,
   TensorView V_new,
   TensorView g_cu,
-  TensorView h,            // [total_chunks, H, V_dim, K_dim] bf16 (still stored for now)
+  TensorView h,
   TensorView h0,
   TensorView ht,
-  TensorView o_inter,      // [T, H, V_dim] fp32 scratch for o_inter output
   TensorView cu_seqlens,
   TensorView chunk_offsets,
-  double scale_d
+  ffi::Optional<TensorView> profiler
 ) {
   const int T = K.size(0);
   const int N = h0.size(0);
-  const float scale_f = (float)scale_d;
 
   auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim);
   auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
   auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
-  auto V_new_tmap = encode_tma(V_new.data_ptr(), 100000, H, V_dim);
+  auto V_new_tmap = encode_tma(V_new.data_ptr(), 100000, H, V_dim);  // padded layout
   auto H0_tmap    = encode_h_tma(h0.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
   auto HT_tmap    = encode_h_tma(ht.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
   auto H_tmap     = encode_h_tma(h.data_ptr(), 100000, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
 
-  auto *q_ptr_raw         = reinterpret_cast<const nv_bfloat16 *>(Q.data_ptr());
-  auto *h_ptr_raw         = reinterpret_cast<const nv_bfloat16 *>(h.data_ptr());
+  auto *V_new_ptr         = reinterpret_cast<nv_bfloat16 *>(V_new.data_ptr());
   auto *g_cu_ptr          = reinterpret_cast<const float *>(g_cu.data_ptr());
   auto *cu_seqlens_ptr    = reinterpret_cast<int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_offsets_ptr = reinterpret_cast<int32_t *>(chunk_offsets.data_ptr());
-  auto *o_inter_ptr       = reinterpret_cast<float *>(o_inter.data_ptr());
 
+  // deeper pipeline is slower?
   constexpr int NUM_STAGES = 2;
   constexpr int smem_size = STAGE_SIZE * NUM_STAGES
-                          + H_fp32_size
-                          + H_fp32_size / 2
-                          + V_size
-                          + ((v_scale_size + 127) & ~127)  // align to 128B
-                          + Q_smem_size                    // NEW: q loading
-                          + 5 * NUM_STAGES * 8
-                          + 8
-                          + 4;
+                          + H_fp32_size         // H0
+                          + H_fp32_size / 2     // H
+                          + V_size              // V_new
+                          + v_scale_size        // v_scale
+                          + 5 * NUM_STAGES * 8  // TMA, wh_in, wh_done, vk_in, vk_done mbar
+                          + 8                   // h0
+                          + 4;                  // tmem addr
 
-  auto kernel = ho_kernel_cutlass<NUM_STAGES, false>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-  dim3 grid(H, N);
-  kernel<<<grid, TB_SIZE, smem_size>>>(
-    K_tmap, V_tmap, W_tmap, H0_tmap, HT_tmap, H_tmap, V_new_tmap,
-    g_cu_ptr, q_ptr_raw, h_ptr_raw, cu_seqlens_ptr, chunk_offsets_ptr,
-    o_inter_ptr, scale_f, nullptr, 0);
+  if (profiler.has_value()) {
+    const int num_entries = (profiler.value().size(2) - 1) / 2;
+    auto *profiler_ptr = reinterpret_cast<int64_t *>(profiler.value().data_ptr());
+
+    auto kernel = h_kernel_cutlass<NUM_STAGES, true>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    dim3 grid(H, N);
+    kernel<<<grid, TB_SIZE, smem_size>>>(
+      K_tmap, V_tmap, W_tmap, H0_tmap, HT_tmap, H_tmap, V_new_tmap,
+      g_cu_ptr, cu_seqlens_ptr, chunk_offsets_ptr, profiler_ptr, num_entries);
+  }
+  else {
+    auto kernel = h_kernel_cutlass<NUM_STAGES, false>;
+    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
+    dim3 grid(H, N);
+    kernel<<<grid, TB_SIZE, smem_size>>>(
+      K_tmap, V_tmap, W_tmap, H0_tmap, HT_tmap, H_tmap, V_new_tmap,
+      g_cu_ptr, cu_seqlens_ptr, chunk_offsets_ptr, nullptr, 0);
+  }
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(ho_v1, ho_v1);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(h_v1, h_v1);

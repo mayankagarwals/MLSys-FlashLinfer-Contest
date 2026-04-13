@@ -71,6 +71,8 @@ def run(
     v_new = q.new_empty(upper_bound_chunks, BT, H, V_dim)
     o_inter = torch.empty(T, H, V_dim, device=k.device, dtype=torch.float32)
 
+    # ho_v1 computes: H recurrence + o_inter = h@q^T * exp(g) [NO scale]
+    # Scale is applied by add_o_intra_kernel: o = (o_inter + A@v_new) * scale
     ho_mod.ho_v1(
         q, k, u, w, v_new, g_cu, h, state, final_state,
         o_inter, cu_seqlens, chunk_offsets, scale,
