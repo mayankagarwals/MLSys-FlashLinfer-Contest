@@ -1,4 +1,4 @@
-# chunk_v9: kkt + inverse + fused H+O (Triton, BV=64, tf32 o_intra)
+# chunk_v10: kkt + inverse + fused H+O v3 (tf32 precision, BV=32)
 import os
 from pathlib import Path
 import torch, triton
@@ -7,7 +7,7 @@ os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 import tvm_ffi
 CURRENT_DIR = Path(__file__).parent
 from .chunk_v6c import merge_16x16_to_64x64_inverse_kernel_v2, mod as kkt_mod
-from .triton_fused_ho import fused_ho_kernel
+from .triton_fused_ho_v3 import fused_ho_kernel_v3 as fused_ho_kernel
 
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     T, Hg, K_dim = k.shape; N, H, V_dim, _ = state.shape; BT = 64
@@ -25,7 +25,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, num_warps=2)
     o = torch.empty_like(v)
     ns = torch.empty_like(state, dtype=torch.float32)
-    BV = 64
+    BV = 32
     fused_ho_kernel[(N * H, V_dim // BV)](
         q, k, w, u, g_cu, state, cu_seqlens, o, ns, scale,
         H=H, Hg=Hg, K_dim=K_dim, V_dim=V_dim, BT=BT, BV=BV, num_warps=4)

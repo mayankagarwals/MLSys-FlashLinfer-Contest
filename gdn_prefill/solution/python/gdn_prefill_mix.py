@@ -27,15 +27,15 @@ def run(
     T = q.shape[0]
     N = cu_seqlens.shape[0] - 1
 
-    # chunk_v7b for T>=525 (chunk pipeline beats v4 FusedPrep)
-    # v6c (Triton H) for very large T with N<=2 where CUDA H has poor SM utilization
+    # chunk pipeline for T>=525
+    # v6c (Triton H) for N<=2 — better SM utilization than CUDA H for few sequences
     if T >= 525:
-        if N <= 2 and T >= 2500:
+        if N <= 2:
             return chunk_v6c(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
         else:
             return chunk_v7b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA v4 for medium workloads — use CUDA graph for launch overhead reduction
+    # CUDA v4 for medium workloads
     if T >= 64 or (N == 1 and T >= 46):
         return cuda_v4(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
