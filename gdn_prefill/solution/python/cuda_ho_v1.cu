@@ -392,6 +392,7 @@ void ho_kernel_cutlass(
         mbarrier_wait(q_mbar_addr + stage_id * 8, parity);
         // Wait for V warps to load zeros into wh_tmem (accumulator)
         mbarrier_wait(qh_in_mbar_addr + stage_id * 8, parity);
+        profiler.stamp(WAIT_QH_IN);
         tcgen05_fence_after_thread_sync();
 
         // Issue h@q^T: same tile loop as wh MMA, B from Q_smem instead of W_smem
@@ -402,6 +403,7 @@ void ho_kernel_cutlass(
             tcgen05_mma_tmem(wh_tmem, h_tmem, q_desc, qh_idesc, 1);
           }
         tcgen05_commit(qh_done_mbar_addr + stage_id * 8);
+        profiler.stamp(ISSUE_QH_MMA);
 
         stage_id = (stage_id + 1) % NUM_STAGES;
         if (stage_id == 0)
@@ -702,83 +704,89 @@ void ho_kernel_cutlass(
         cp_async_bulk_commit_group();
       }
 
-      // ═══ NEW: Prepare qh MMA accumulator (zeros) and compute o_inter ═══
+      // ═══ qh MMA phase: load zeros as acc, wait for result, store to global ═══
       // Load zeros into wh_tmem as accumulator for h@q^T MMA
-      {
-        for (int i = 0; i < BT / 8; i++) {
-          float zeros[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-          tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 +  0, wh_tmem + i * 8, zeros + 0);
-          tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 + 16, wh_tmem + i * 8, zeros + 4);
-        }
-        tcgen05_wait_st();
-        tcgen05_fence_before_thread_sync();
-        mbarrier_arrive(qh_in_mbar_addr + stage_id * 8);
+      for (int i = 0; i < BT / 8; i++) {
+        float zeros[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 +  0, wh_tmem + i * 8, zeros);
+        tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 + 16, wh_tmem + i * 8, zeros);
+      }
+      tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
+      mbarrier_arrive(qh_in_mbar_addr + stage_id * 8);
+
+      // Compute o_scale[t] = exp(g_cu[t]) * scale while waiting for qh MMA
+      bar_sync<2>(128);
+      if (tid < BT) {
+        const int t = bos + chunk_id * BT + tid;
+        float o_scale = 0.0f;
+        if (t < eos)
+          o_scale = __expf(g_cu_ptr[t * H + head_id]) * scale;
+        v_scale_smem_ptr[tid] = o_scale;
       }
 
       // Wait for qh MMA to complete
       if (warp_id == 2)
         mbarrier_wait(qh_done_mbar_addr + stage_id * 8, parity);
-      // Also drain v_new TMA store before we overwrite V_new_smem
-      if (warp_id == 3 && elect_sync())
-        cp_async_bulk_wait_group_read<0>();
       bar_sync<2>(128);
       tcgen05_fence_after_thread_sync();
+      if (elect_sync()) profiler.stamp(WAIT_QH_MMA);
 
-      // Read h@q^T from wh_tmem, apply exp(g) BEFORE bf16 truncation, store to V_new_smem
-      // The exp(g) is applied in fp32 to avoid extra bf16 truncation error
-      // BT index for exp(g): t = i*8 + (lane_id%4)*2 and t+1
+      // Read qh result from wh_tmem and store to output_ptr as fp32
+      // wh_tmem[v, t] = h@q^T[v, t] = (q@h^T)[t, v]
+      // output: o_inter[t, H, V_dim] = wh_tmem[v, t] * exp(g_cu[t]) * scale
+      //
+      // tcgen05 16x256b x1 register mapping (4 regs per thread):
+      //   reg[0]: row = lane_id/4,     col = (lane_id%4)*2
+      //   reg[1]: row = lane_id/4,     col = (lane_id%4)*2 + 1
+      //   reg[2]: row = lane_id/4 + 8, col = (lane_id%4)*2
+      //   reg[3]: row = lane_id/4 + 8, col = (lane_id%4)*2 + 1
       {
-        const int clen = min(BT, seqlen - chunk_id * BT);
         const int off_t = bos + chunk_id * BT;
+        const int r0 = lane_id / 4;
+        const int r1 = r0 + 8;
+        const int c0 = (lane_id % 4) * 2;
+        const int c1 = c0 + 1;
 
         for (int i = 0; i < BT / 8; i++) {
           float tmp[8];
           tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 0, warp_id * 32 +  0, wh_tmem + i * 8);
           tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 4, warp_id * 32 + 16, wh_tmem + i * 8);
 
-          // Load exp(g) for the BT positions this thread handles
-          int t0 = i * 8 + (lane_id % 4) * 2;
-          float g_exp0 = (t0 < clen) ? __expf(g_cu_ptr[(off_t + t0) * H + head_id]) : 0.0f;
-          float g_exp1 = (t0 + 1 < clen) ? __expf(g_cu_ptr[(off_t + t0 + 1) * H + head_id]) : 0.0f;
+          // Apply per-t scaling from v_scale_smem_ptr
+          float2 o_sc = reinterpret_cast<float2 *>(v_scale_smem_ptr + (i * 8 + c0))[0];
+          tmp[0] *= o_sc.x; tmp[1] *= o_sc.y;
+          tmp[2] *= o_sc.x; tmp[3] *= o_sc.y;
+          tmp[4] *= o_sc.x; tmp[5] *= o_sc.y;
+          tmp[6] *= o_sc.x; tmp[7] *= o_sc.y;
 
-          // Apply exp(g) to all 8 tmp values then pack to bf16
-          // tmp[k*2+0] has BT=t0, tmp[k*2+1] has BT=t0+1 (for all k)
-          uint32_t v_tmp[4];
-          for (int k = 0; k < 4; k++)
-            v_tmp[k] = fp32x2_to_bf16x2(tmp[k * 2 + 0] * g_exp0, tmp[k * 2 + 1] * g_exp1);
+          // v-rows for each register group:
+          const int v_a = warp_id * 32 + r0;       // first load, low 8 rows
+          const int v_b = warp_id * 32 + r1;       // first load, high 8 rows
+          const int v_c = warp_id * 32 + 16 + r0;  // second load, low 8 rows
+          const int v_d = warp_id * 32 + 16 + r1;  // second load, high 8 rows
 
-          // Store to V_new_smem using stmatrix_trans (same pattern as v_new)
-          const uint32_t offset = (warp_id / 2) * BT * 128;
-          const uint32_t s_row = i * 8 + (lane_id % 8);
-          const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
-          stmatrix_trans<4>(V_new_smem + offset + s_row * 128 + s_col * 16, v_tmp);
+          const int t0 = i * 8 + c0;
+          const int t1 = i * 8 + c1;
+          const int gt0 = off_t + t0;
+          const int gt1 = off_t + t1;
+
+          // Store to o_inter_ptr[t, head_id, v] as fp32
+          if (gt0 < eos) {
+            o_inter_ptr[gt0 * H * V_dim + head_id * V_dim + v_a] = tmp[0];
+            o_inter_ptr[gt0 * H * V_dim + head_id * V_dim + v_b] = tmp[2];
+            o_inter_ptr[gt0 * H * V_dim + head_id * V_dim + v_c] = tmp[4];
+            o_inter_ptr[gt0 * H * V_dim + head_id * V_dim + v_d] = tmp[6];
+          }
+          if (gt1 < eos) {
+            o_inter_ptr[gt1 * H * V_dim + head_id * V_dim + v_a] = tmp[1];
+            o_inter_ptr[gt1 * H * V_dim + head_id * V_dim + v_b] = tmp[3];
+            o_inter_ptr[gt1 * H * V_dim + head_id * V_dim + v_c] = tmp[5];
+            o_inter_ptr[gt1 * H * V_dim + head_id * V_dim + v_d] = tmp[7];
+          }
         }
       }
-
-      // Store o_inter from V_new_smem to GMEM as bf16
-      // Layout matches V_new: [V_dim/64, BT, 64] with 128B swizzle
-      bar_sync<2>(128);
-      asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;");
-      // Use simple GMEM stores (later optimize with TMA)
-      {
-        const int clen = min(BT, seqlen - chunk_id * BT);
-        const int off_t = bos + chunk_id * BT;
-        for (int idx = tid; idx < BT * V_dim; idx += 128) {
-          int t_local = idx / V_dim;
-          int v = idx % V_dim;
-          if (t_local >= clen) continue;
-          int v_half = v / 64;
-          int v_within = v % 64;
-          int group = v_within / 8;
-          int lane_v = v_within % 8;
-          int swiz = group ^ (t_local % 8);
-          nv_bfloat16 val;
-          uint32_t addr = V_new_smem + v_half * BT * 128 + t_local * 128 + swiz * 16 + lane_v * 2;
-          asm volatile("ld.shared.b16 %0, [%1];" : "=h"(*reinterpret_cast<uint16_t*>(&val)) : "r"(addr));
-          // Store as fp32 to o_inter (scale applied by o_intra kernel)
-          o_inter_ptr[((int64_t)(off_t + t_local)) * H * V_dim + head_id * V_dim + v] = __bfloat162float(val);
-        }
-      }
+      if (elect_sync()) profiler.stamp(PROCESS_O_INTER);
 
       stage_id = (stage_id + 1) % NUM_STAGES;
       if (stage_id == 0)
@@ -878,14 +886,14 @@ void ho_v1(
 
   constexpr int NUM_STAGES = 2;
   constexpr int smem_size = STAGE_SIZE * NUM_STAGES
-                          + H_fp32_size                     // H0
-                          + H_fp32_size / 2                 // H
-                          + V_size                          // V_new
-                          + ((v_scale_size + 127) & ~127)   // v_scale (128B aligned)
-                          + Q_size                          // NEW: Q_smem
-                          + 8 * NUM_STAGES * 8              // TMA, wh_in/done, vk_in/done, q, qh_in/done
-                          + 8                               // h0
-                          + 4;                              // tmem addr
+                          + H_fp32_size         // H0
+                          + H_fp32_size / 2     // H
+                          + V_size              // V_new
+                          + v_scale_size        // v_scale / o_scale
+                          + Q_size              // Q smem (16KB)
+                          + 8 * NUM_STAGES * 8  // tma, q, wh_in, wh_done, vk_in, vk_done, qh_in, qh_done
+                          + 8                   // h0
+                          + 4;                  // tmem addr
 
   auto kernel = ho_kernel_cutlass<NUM_STAGES, false>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
