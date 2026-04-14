@@ -28,8 +28,9 @@ def run(
     N = cu_seqlens.shape[0] - 1
 
     # chunk pipeline for T>=525 (Triton prep — must match reference precision)
+    # v6c (Triton H) for N<=2 T>=600, v7b (CUDA H) for N>2 or T<600
     if T >= 525:
-        if N <= 2:
+        if N <= 2 and T >= 600:
             return chunk_v6c(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
         else:
             return chunk_v7b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
