@@ -28,9 +28,15 @@ def run(
     N = cu_seqlens.shape[0] - 1
 
     # chunk pipeline for T>=525 (Triton prep — must match reference precision)
-    # v6c (Triton H) for N<=2 T>=600, v7b (CUDA H) for N>2 or T<600
+    # v6c (Triton H, BV=16, more blocks) wins for low N + large T
+    # v7b (CUDA H, tcgen05) wins for high N or small T
     if T >= 525:
-        if N <= 2 and T >= 600:
+        # v6c is faster when sequence count is low and seqs are long:
+        # - N<=2 with T>=600: always v6c
+        # - N=3 with T>=1500: v6c (24 CUDA-H blocks underutilize 192 SMs)
+        # - N=5 with T>=3000: v6c
+        use_v6c = (N <= 2 and T >= 600) or (N == 3 and T >= 1500) or (N <= 5 and T >= 3000)
+        if use_v6c:
             return chunk_v6c(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
         else:
             return chunk_v7b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
