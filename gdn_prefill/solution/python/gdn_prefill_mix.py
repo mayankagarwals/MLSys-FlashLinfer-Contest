@@ -34,11 +34,12 @@ def run(
         else:
             return chunk_v7b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA v5 for medium workloads
-    if T >= 64 or (N == 1 and T >= 46):
+    # CUDA v5 for medium workloads (T>=67 for N=1, T>=64 for N>=3)
+    # Recurrent is faster for T<64 N>=2 and T<67 N=1 (profiled threshold)
+    if T >= 64 and (N >= 3 or T >= 67):
         return cuda_v5(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA recurrent for tiny workloads
+    # CUDA recurrent for tiny/small workloads
     o = torch.empty_like(v)
     new_state = torch.empty_like(state)
     cuda_recurrent_v1(
