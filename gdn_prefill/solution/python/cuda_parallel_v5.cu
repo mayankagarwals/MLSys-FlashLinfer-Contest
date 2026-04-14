@@ -41,6 +41,7 @@
  */
 
  #include "cuda_utils.h"
+ #include "cuda_h_kernel.h"
 
  #include <cstdint>
  #include <math.h>
@@ -2049,6 +2050,11 @@
    return (s == 0.0f) ? (1.0f / sqrtf((float)kK)) : s;
  }
  
+ // Forward declaration
+ __global__ void prep_meta_kernel_v4(
+     const int64_t *cu_seqlens, int32_t *chunk_indices,
+     int32_t *chunk_offsets, int32_t *total_chunks_out, int64_t num_seqs);
+
  // Persistent scratch buffer (survives across calls)
  static char *g_scratch = nullptr;
  static size_t g_scratch_size = 0;
@@ -2090,7 +2096,11 @@
    const size_t sz_h    = align256((size_t)max_chunks * kHv * kV * kK * sizeof(__nv_bfloat16));
    const size_t sz_ci   = align256(max_chunks * 2 * sizeof(int32_t));
    const size_t sz_tc   = align256(sizeof(int32_t));
-   const size_t total_sz = sz_g + sz_w + sz_u + sz_h + sz_ci + sz_tc;
+   // V_new buffer for h_kernel_v5 (token-indexed, padded by BT)
+   const size_t sz_vnew = align256((size_t)(T + kBT) * kHv * kV * sizeof(__nv_bfloat16));
+   // chunk_offsets for h_kernel_v5 (num_seqs + 1 entries)
+   const size_t sz_co   = align256((size_t)(num_seqs + 1) * sizeof(int32_t));
+   const size_t total_sz = sz_g + sz_w + sz_u + sz_h + sz_ci + sz_tc + sz_vnew + sz_co;
  
    // Grow persistent scratch if needed (never shrinks)
    if (total_sz > g_scratch_size) {
@@ -2109,7 +2119,9 @@
    __nv_bfloat16 *d_u = (__nv_bfloat16 *)p; p += sz_u;
    __nv_bfloat16 *d_h = (__nv_bfloat16 *)p; p += sz_h;
    int32_t *d_ci = (int32_t *)p; p += sz_ci;  // unused (kept for API compat)
-   int32_t *d_tc = (int32_t *)p;
+   int32_t *d_tc = (int32_t *)p; p += sz_tc;
+   __nv_bfloat16 *d_vnew = (__nv_bfloat16 *)p; p += sz_vnew;
+   int32_t *d_co = (int32_t *)p;  // chunk_offsets for h_kernel_v5
  
    auto *q_p = static_cast<const __nv_bfloat16 *>(q.data_ptr());
    auto *k_p = static_cast<const __nv_bfloat16 *>(k.data_ptr());
@@ -2136,6 +2148,9 @@
      // OOutputKernel v9 (tcgen05 swizzled, inline q@k^T): s_q(16KB) + s_h(16KB) + s_attn(8KB) + s_vnew(8KB) + s_gc(256B) + mbars(24B) + tmem(4B) ≈ 49KB
      int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
      cudaFuncSetAttribute(OOutputKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_O);
+     // h_kernel_v5 (tcgen05 H kernel for T>=525): ~208KB smem
+     int smem_hv1 = hv1::smem_size_for(2);
+     cudaFuncSetAttribute(hv1::h_kernel_v5<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_hv1);
    }
  
    // Create TMA descriptors (PrepMeta eliminated — inline chunk mapping)
@@ -2167,25 +2182,17 @@
        cusl_p, d_ci,
        d_w, d_u, d_tc, total_chunks, num_seqs);
  
-   // H/O split path — V5: use v4 H for small T, v1 tcgen05 H for large T
+   // H/O split path — v4 H kernel for T<525 (FusedPrep precision matches)
+   // For T>=525, use RunHAndO with Triton-prepped tensors (called from Python)
    {
-     if (T < 525) {
-       // Small T: v4 H kernel (mma.sync, tile-format)
-       if (T >= 1024) {
-         HRecurrenceKernelV3<<<dim3(kNVT_H, num_seqs * kHv), 128, smem_H_v3, stream>>>(
-             d_w, k_p, d_u, d_g, state_ptr, cusl_p, d_h, ns_p, num_seqs);
-       } else {
-         HRecurrenceKernel<<<dim3(kNVT_H, num_seqs * kHv), 128, smem_H_v4, stream>>>(
-             k_tmap_64, d_w, k_p, d_u, d_g, state_ptr, cusl_p, d_h, ns_p, num_seqs);
-       }
-     } else {
-       // Large T (>=525): use tcgen05 h_kernel from cuda_h_v1
-       // This requires: TMA descriptors, chunk_offsets, V_new tensor
-       // For now, fall back to V3 (TODO: integrate h_kernel_cutlass)
+     if (T >= 1024) {
        HRecurrenceKernelV3<<<dim3(kNVT_H, num_seqs * kHv), 128, smem_H_v3, stream>>>(
            d_w, k_p, d_u, d_g, state_ptr, cusl_p, d_h, ns_p, num_seqs);
+     } else {
+       HRecurrenceKernel<<<dim3(kNVT_H, num_seqs * kHv), 128, smem_H_v4, stream>>>(
+           k_tmap_64, d_w, k_p, d_u, d_g, state_ptr, cusl_p, d_h, ns_p, num_seqs);
      }
- 
+
      OOutputKernel<<<dim3(kNVT_O, total_chunks, kHv), 256, smem_O, stream>>>(
          q_p, k_p,
          d_u, d_h, d_g, cusl_p, d_ci,
@@ -2317,11 +2324,105 @@
        w_p, u_p, tc_p, max_chunks, num_seqs);
  }
 
+ // Combined H+O for T>=525: takes Triton-prepped W, U, g_cu and runs h_kernel_v5 + OOutputKernel
+ // This eliminates Python inter-kernel gaps between H and O launches.
+ // Persistent scratch for H+O path
+ static char *g_ho_scratch = nullptr;
+ static size_t g_ho_scratch_size = 0;
+ static bool g_ho_attrs_set = false;
+
+ void RunHAndO(
+     TensorView q, TensorView k,   // raw inputs
+     TensorView w, TensorView u,   // from Triton prep (W = decay*k transformed, U = A_inv @ beta*v)
+     TensorView g_cu,              // from Triton prep (cumulative gating)
+     ffi::Optional<TensorView> state_opt,  // initial state
+     TensorView cu_seqlens,
+     TensorView chunk_offsets_in,  // from prep_meta_kernel [N+1] int32
+     double scale,
+     TensorView output,
+     TensorView new_state
+ ) {
+   const int64_t T = q.size(0);
+   const int64_t num_seqs = cu_seqlens.size(0) - 1;
+   const int64_t max_chunks = num_seqs + (T + kBT - 1) / kBT;
+
+   const float scale_f = (float)scale == 0.0f ? (1.0f / sqrtf((float)kK)) : (float)scale;
+   ffi::CUDADeviceGuard guard(q.device().device_id);
+   const cudaStream_t stream = get_cuda_stream(q.device());
+
+   // Scratch: d_h (per-chunk H states) + d_vnew (token-indexed V_new)
+   auto align256 = [](size_t x) -> size_t { return (x + 255) & ~255ULL; };
+   const size_t sz_h    = align256((size_t)max_chunks * kHv * kV * kK * sizeof(__nv_bfloat16));
+   const size_t sz_vnew = align256((size_t)(T + kBT) * kHv * kV * sizeof(__nv_bfloat16));
+   const size_t total_sz = sz_h + sz_vnew;
+
+   if (total_sz > g_ho_scratch_size) {
+     if (g_ho_scratch) cudaFree(g_ho_scratch);
+     cudaMalloc(&g_ho_scratch, total_sz);
+     g_ho_scratch_size = total_sz;
+   }
+
+   __nv_bfloat16 *d_h = (__nv_bfloat16 *)g_ho_scratch;
+   __nv_bfloat16 *d_vnew = (__nv_bfloat16 *)(g_ho_scratch + sz_h);
+
+   auto *q_p    = reinterpret_cast<const __nv_bfloat16 *>(q.data_ptr());
+   auto *k_p    = reinterpret_cast<const __nv_bfloat16 *>(k.data_ptr());
+   auto *w_p    = reinterpret_cast<const __nv_bfloat16 *>(w.data_ptr());
+   auto *u_p    = reinterpret_cast<const __nv_bfloat16 *>(u.data_ptr());
+   auto *g_p    = reinterpret_cast<const float *>(g_cu.data_ptr());
+   auto *cusl_p = reinterpret_cast<const int64_t *>(cu_seqlens.data_ptr());
+   auto *co_p   = reinterpret_cast<const int32_t *>(chunk_offsets_in.data_ptr());
+   auto *out_p  = reinterpret_cast<__nv_bfloat16 *>(output.data_ptr());
+   auto *ns_p   = reinterpret_cast<float *>(new_state.data_ptr());
+
+   const float *state_ptr = nullptr;
+   if (state_opt.has_value()) {
+     state_ptr = static_cast<const float *>(state_opt.value().data_ptr());
+   }
+
+   if (!g_ho_attrs_set) {
+     g_ho_attrs_set = true;
+     int smem_hv1 = hv1::smem_size_for(2);
+     cudaFuncSetAttribute(hv1::h_kernel_v5<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_hv1);
+     int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
+     cudaFuncSetAttribute(OOutputKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_O);
+   }
+
+   // Clear stale errors
+   cudaGetLastError();
+
+   // 1. h_kernel_v5: tcgen05 H recurrence
+   // V parameter = u (Triton A_inv @ beta*v), NOT raw v
+   auto hv1_K_tmap     = hv1::encode_tma((void *)k_p, (uint64_t)T, (uint64_t)kHk, (uint64_t)kK);
+   auto hv1_V_tmap     = hv1::encode_tma((void *)u_p, (uint64_t)T, (uint64_t)kHv, (uint64_t)kV);
+   auto hv1_W_tmap     = hv1::encode_tma((void *)w_p, (uint64_t)T, (uint64_t)kHv, (uint64_t)kK);
+   auto hv1_Vnew_tmap  = hv1::encode_tma((void *)d_vnew, (uint64_t)(T + kBT), (uint64_t)kHv, (uint64_t)kV);
+   auto hv1_H0_tmap    = hv1::encode_h_tma(const_cast<float *>(state_ptr), (uint64_t)num_seqs, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
+   auto hv1_HT_tmap    = hv1::encode_h_tma((void *)ns_p, (uint64_t)num_seqs, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
+   auto hv1_H_tmap     = hv1::encode_h_tma((void *)d_h, (uint64_t)max_chunks, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
+
+   int smem_hv1 = hv1::smem_size_for(2);
+   hv1::h_kernel_v5<2><<<dim3(kHv, num_seqs), hv1::TB_SIZE, smem_hv1, stream>>>(
+       hv1_K_tmap, hv1_V_tmap, hv1_W_tmap, hv1_H0_tmap, hv1_HT_tmap, hv1_H_tmap, hv1_Vnew_tmap,
+       g_p, cusl_p, co_p);
+
+   // 2. OOutputKernel: uses d_vnew (from h_kernel_v5) and d_h
+   int smem_O = (16384 + 16384 + 8192 + 8192 + 256 + 24 + 4 + 1023) & ~1023;
+   OOutputKernel<<<dim3(kNVT_O, max_chunks, kHv), 256, smem_O, stream>>>(
+       q_p, k_p, d_vnew, d_h, g_p, cusl_p, nullptr,
+       scale_f, out_p, nullptr, num_seqs);
+
+   const cudaError_t err = cudaGetLastError();
+   if (err != cudaSuccess)
+     TVM_FFI_THROW(RuntimeError) << "RunHAndO failed: " << cudaGetErrorString(err);
+ }
+
  } // namespace
 
  TVM_FFI_DLL_EXPORT_TYPED_FUNC(gdn_prefill_v5, RunGdnPrefillTcgen05);
  TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_o_kernel_v5, RunOKernelStandalone);
  TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_fused_prep, RunFusedPrepStandalone);
+ TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_h_and_o, RunHAndO);
  
  
  

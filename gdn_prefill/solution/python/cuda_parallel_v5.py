@@ -22,6 +22,7 @@ lib_path = tvm_ffi.cpp.build(
 
 mod = tvm_ffi.load_module(lib_path)
 _kernel = mod.gdn_prefill_v5
+_h_and_o = mod.run_h_and_o
 
 
 def run(
@@ -32,4 +33,15 @@ def run(
     output = torch.empty_like(v)
     new_state = torch.empty_like(state, dtype=torch.float32)
     _kernel(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, output, new_state)
+    return output, new_state
+
+
+def run_h_and_o(
+    q: Tensor, k: Tensor, w: Tensor, u: Tensor, g_cu: Tensor,
+    state: Tensor, cu_seqlens: Tensor, chunk_offsets: Tensor,
+    scale: float,
+):
+    output = torch.empty_like(q.new_empty(q.size(0), 8, 128))
+    new_state = torch.empty_like(state, dtype=torch.float32)
+    _h_and_o(q, k, w, u, g_cu, state, cu_seqlens, chunk_offsets, scale, output, new_state)
     return output, new_state

@@ -9,7 +9,7 @@ from torch import Tensor
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
 from .chunk_v6c import run as chunk_v6c
 from .chunk_v7b import run as chunk_v7b
-from .cuda_parallel_v4 import run as cuda_v4
+from .cuda_parallel_v5 import run as cuda_v5
 
 
 def run(
@@ -27,17 +27,16 @@ def run(
     T = q.shape[0]
     N = cu_seqlens.shape[0] - 1
 
-    # chunk pipeline for T>=525
-    # v6c (Triton H) for N<=2 — better SM utilization than CUDA H for few sequences
+    # chunk pipeline for T>=525 (Triton prep + CUDA H + Triton O — matches reference precision)
     if T >= 525:
         if N <= 2:
             return chunk_v6c(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
         else:
             return chunk_v7b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA v4 for medium workloads
+    # CUDA v5 for medium workloads (single C++ call — FusedPrep + v4 H + tcgen05 O)
     if T >= 64 or (N == 1 and T >= 46):
-        return cuda_v4(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+        return cuda_v5(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA recurrent for tiny workloads
     o = torch.empty_like(v)
