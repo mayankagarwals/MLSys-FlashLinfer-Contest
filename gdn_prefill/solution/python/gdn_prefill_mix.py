@@ -9,6 +9,7 @@ from torch import Tensor
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
 from .chunk_v6c import run as chunk_v6c
 from .chunk_v7b import run as chunk_v7b
+from .chunk_v7b_vtile import run as chunk_v7b_vtile
 from .cuda_parallel_v5 import run as cuda_v5
 
 

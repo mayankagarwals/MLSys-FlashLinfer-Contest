@@ -1055,6 +1055,7 @@ void h_kernel_cutlass_vtile(
       }
     }
     bar_sync<1>(128);
+    asm volatile("fence.proxy.async::generic.release.sync_restrict::shared::cta.cluster;");
 
     if (warp_id_ == 0) {
       if (elect_sync()) {
