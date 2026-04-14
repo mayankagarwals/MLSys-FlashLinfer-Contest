@@ -97,21 +97,66 @@
 - prep_meta takes 7.3 us (vs Triton's 6.6 us) — slower kernel but fewer launches
 - Net savings: ~38 us over 40 chunk workloads
 
-## Current Result (after all optimizations)
-- Optimized total: 8683.8 us
-- Total improvement: 153.9 us (1.74% from baseline 8837.7 us)
-- Chunk path: 6208.6 → 6048.5 us (+2.6%)
-- v4 path: unchanged
-- Recurrent: unchanged
+## Session 2 Optimizations (2026-04-14)
 
-## Remaining Gap to 10%
-- Need: ~883 us more savings (current: 154 us / target: 884 us)
-- The remaining gap requires fundamentally different approaches:
-  1. CUDA graphs (blocked by mixed Triton+CUDA)
-  2. torch.compile (blocked by TVM FFI correctness issues)
-  3. Hand-tuned PTX kernels (very complex, uncertain gain)
-  4. Algorithmic changes (different chunk sizes, math reformulations)
-  5. Full pipeline in C++ (eliminates ~34 us Python overhead per call)
+### 15. L2 EVICT_LAST cache hint for K in H kernel (APPLIED)
+- K tensor shared across H/Hg=2 head groups — EVICT_LAST keeps it in L2
+- H kernel: 79.4 us vs 79.7 us (0.4% faster per call)
+- Overall: ~5 us total savings
+
+### 16. Dispatch threshold tuning: recurrent for T<67/N=1 + T<64/N=2 (APPLIED)
+- Profiled crossover: recurrent 40 us vs v5 49 us for T=49/N=1
+- Changed from `T>=64 || (N==1 && T>=46)` to `T>=64 && (N>=3 || T>=67)`
+- Saves ~30 us from 8 workloads switched to faster path
+
+### 17. v6c/v7b dispatch: v7b for T<600 N<=2 (APPLIED)
+- v7b (CUDA H) 5-6 us faster than v6c (Triton H) for small T, N<=2
+- Changed: T>=525 with N<=2 AND T>=600 → v6c, else → v7b
+- Saves ~12 us from 2 workloads
+
+### 18. v5 framework integration (INFRASTRUCTURE)
+- Created cuda_h_kernel.h with tcgen05 H kernel in namespace hv1
+- Created RunHAndO C++ function for potential H+O fusion
+- NOT used in production — OOutputKernel precision doesn't match Triton O
+
+### 19. FusedPrep for T>=525 (TESTED, REJECTED)
+- FusedPrep is 2-3x SLOWER than Triton KKT+inverse for T>=525
+- T=8192: 219 us (FusedPrep) vs 70 us (Triton)
+- Only competitive for T<700
+
+### 20. H kernel dual-pass fusion (TESTED, REJECTED)
+- Merged bf16 conversion + scaling passes into single pass
+- SLOWER (80.2 us vs 79.4 us) because breaks pipeline between wh and vk MMAs
+- Two-pass design is intentional for latency hiding
+
+### 21. Tensor pool for v7b/v6c (TESTED, REJECTED)
+- Pre-allocated tensors with view slicing to avoid per-call malloc
+- SLOWER (8522 vs 8410 us) — view creation overhead exceeds allocation savings
+
+### 22. CUDA inverse kernel (IN PROGRESS, BLOCKED)
+- 1240-line cuda_inverse_v1.cu using mma.sync bf16 m16n8k16
+- CRITICAL: Triton uses mma.sync (not tcgen05) for 16x16 bf16 on sm_100a
+- Has fundamental MMA register/smem mapping bug (identity test fails with diff ~3.9)
+- Needs standalone MMA test harness to debug
+- If fixed: could replace Triton inverse (42 us) and enable kernel fusion
+
+### Key Precision Findings
+- FusedPrep inverse IS precise enough (max W/U diff 0.004 vs Triton)
+- The ONLY precision issue is OOutputKernel vs Triton O kernel
+- FusedPrep + CUDA H + Triton O → 0/0 failures
+- Python overhead is only 3.3 us/workload (not a bottleneck)
+
+## Current Result (after session 2)
+- Optimized total: ~8365 us (measurement varies 8360-8390)
+- Total improvement: ~473 us (5.4% from baseline 8837.7 us)
+- Remaining gap to 10%: ~411 us
+
+## Remaining Optimization Opportunities
+1. **CUDA inverse kernel** (highest impact, ~400 us if debugged and faster than Triton)
+   - Need to fix mma_16x16_bf16 helper function
+   - Test with standalone harness before integrating
+2. **Algorithmic changes** (e.g., different chunk sizes for specific workloads)
+3. **ncu profiling** of hottest kernels to find micro-optimization opportunities
 
 ## Key Findings
 1. The Triton compiler generates excellent code on B200 Blackwell — hand-written CUDA is NOT faster
