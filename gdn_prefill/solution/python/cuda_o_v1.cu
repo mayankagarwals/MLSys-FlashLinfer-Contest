@@ -79,8 +79,9 @@ constexpr uint32_t G_STAGE_SMEM_SIZE = BLOCK_T * sizeof(float);
 constexpr uint32_t G_RAW_SMEM_SIZE = HEADS_PER_QK_HEAD * G_STAGE_SMEM_SIZE;
 constexpr uint32_t G_CENTER_SMEM_SIZE = HEADS_PER_QK_HEAD * sizeof(float);
 constexpr uint32_t G_POS_SMEM_SIZE = HEADS_PER_QK_HEAD * G_STAGE_SMEM_SIZE;
+constexpr uint32_t G_ALPHA_SMEM_SIZE = HEADS_PER_QK_HEAD * sizeof(float);
 constexpr uint32_t G_NEG_SMEM_SIZE = HEADS_PER_QK_HEAD * G_STAGE_SMEM_SIZE;
-constexpr uint32_t G_OUT_SMEM_SIZE = HEADS_PER_QK_HEAD * G_STAGE_SMEM_SIZE;
+constexpr uint32_t G_REDUCE_PARTIAL_SMEM_SIZE = NUM_CUDA_WARPS * sizeof(float);
 constexpr uint32_t QK_TMA_BARRIER_BYTES = QK_STAGE_COUNT * 8U;
 constexpr uint32_t VH_TMA_BARRIER_BYTES = VH_STAGE_COUNT * 8U;
 constexpr uint32_t ATTN_READY_BARRIER_BYTES = ATTN_STAGE_COUNT * 8U;
@@ -94,9 +95,13 @@ constexpr uint32_t OFFSET_QK_SPILL = OFFSET_OUTPUT + OUTPUT_SMEM_SIZE;
 constexpr uint32_t OFFSET_G_RAW = OFFSET_QK_SPILL + QK_SPILL_SMEM_SIZE;
 constexpr uint32_t OFFSET_G_CENTER = OFFSET_G_RAW + G_RAW_SMEM_SIZE;
 constexpr uint32_t OFFSET_G_POS = OFFSET_G_CENTER + G_CENTER_SMEM_SIZE;
-constexpr uint32_t OFFSET_G_NEG = OFFSET_G_POS + G_POS_SMEM_SIZE;
-constexpr uint32_t OFFSET_G_OUT = OFFSET_G_NEG + G_NEG_SMEM_SIZE;
-constexpr uint32_t OFFSET_QK_TMA_BAR = OFFSET_G_OUT + G_OUT_SMEM_SIZE;
+constexpr uint32_t OFFSET_G_ALPHA = OFFSET_G_POS + G_POS_SMEM_SIZE;
+constexpr uint32_t OFFSET_G_NEG = OFFSET_G_ALPHA + G_ALPHA_SMEM_SIZE;
+constexpr uint32_t OFFSET_G_REDUCE_MIN = OFFSET_G_NEG + G_NEG_SMEM_SIZE;
+constexpr uint32_t OFFSET_G_REDUCE_MAX =
+    OFFSET_G_REDUCE_MIN + G_REDUCE_PARTIAL_SMEM_SIZE;
+constexpr uint32_t OFFSET_QK_TMA_BAR =
+    OFFSET_G_REDUCE_MAX + G_REDUCE_PARTIAL_SMEM_SIZE;
 constexpr uint32_t OFFSET_V_TMA_BAR = OFFSET_QK_TMA_BAR + QK_TMA_BARRIER_BYTES;
 constexpr uint32_t OFFSET_H_TMA_BAR = OFFSET_V_TMA_BAR + VH_TMA_BARRIER_BYTES;
 constexpr uint32_t OFFSET_MMA_BAR = OFFSET_H_TMA_BAR + VH_TMA_BARRIER_BYTES;
@@ -259,13 +264,12 @@ mma_attn_v_mmajor_64x128(uint32_t output_tmem, uint32_t matrix_a_smem,
   }
 }
 
-__device__ __forceinline__ float scale_qk_if_active(float qk, float g_row,
-                                                    float g_col,
+__device__ __forceinline__ float scale_qk_if_active(float qk, float g_col,
                                                     uint32_t active) {
   if (active == 0U) {
     return 0.0f;
   }
-  return g_row < g_col ? (qk * g_row) * g_col : (qk * g_col) * g_row;
+  return qk * g_col;
 }
 
 __device__ __forceinline__ void store_bf162_shared(nv_bfloat16 *ptr,
@@ -278,8 +282,8 @@ __device__ __forceinline__ void store_bf162_shared(nv_bfloat16 *ptr,
 __device__ __forceinline__ void
 store_attn_column_pair(nv_bfloat16 *attn_smem_ptr, const float *g_neg_smem_ptr,
                        float qk_row0_col0, float qk_row0_col1,
-                       float qk_row1_col0, float qk_row1_col1, float g_row0,
-                       float g_row1, uint32_t row_base, uint32_t row_hi,
+                       float qk_row1_col0, float qk_row1_col1,
+                       uint32_t row_base, uint32_t row_hi,
                        uint32_t row_base_limit, uint32_t row_hi_limit,
                        uint32_t col) {
   const uint32_t col_hi = col + 1U;
@@ -291,16 +295,13 @@ store_attn_column_pair(nv_bfloat16 *attn_smem_ptr, const float *g_neg_smem_ptr,
   store_bf162_shared(
       attn_smem_ptr + row_base_idx,
       __floats2bfloat162_rn(
-          scale_qk_if_active(qk_row0_col0, g_row0, g_col0,
-                             col < row_base_limit),
-          scale_qk_if_active(qk_row0_col1, g_row0, g_col1,
-                             col_hi < row_base_limit)));
+          scale_qk_if_active(qk_row0_col0, g_col0, col < row_base_limit),
+          scale_qk_if_active(qk_row0_col1, g_col1, col_hi < row_base_limit)));
   store_bf162_shared(
       attn_smem_ptr + row_hi_idx,
       __floats2bfloat162_rn(
-          scale_qk_if_active(qk_row1_col0, g_row1, g_col0, col < row_hi_limit),
-          scale_qk_if_active(qk_row1_col1, g_row1, g_col1,
-                             col_hi < row_hi_limit)));
+          scale_qk_if_active(qk_row1_col0, g_col0, col < row_hi_limit),
+          scale_qk_if_active(qk_row1_col1, g_col1, col_hi < row_hi_limit)));
 }
 
 __device__ __forceinline__ void load_qk_fragment(float *qk_reg_lo,
@@ -310,11 +311,63 @@ __device__ __forceinline__ void load_qk_fragment(float *qk_reg_lo,
   tcgen05_wait_ld();
 }
 
+__device__ __forceinline__ float warp_reduce_min(float value) {
+#pragma unroll
+  for (uint32_t offset = WARP_SIZE / 2U; offset > 0U; offset >>= 1U) {
+    value = fminf(value, __shfl_down_sync(0xffffffffU, value, offset));
+  }
+  return value;
+}
+
+__device__ __forceinline__ float warp_reduce_max(float value) {
+#pragma unroll
+  for (uint32_t offset = WARP_SIZE / 2U; offset > 0U; offset >>= 1U) {
+    value = fmaxf(value, __shfl_down_sync(0xffffffffU, value, offset));
+  }
+  return value;
+}
+
+__device__ __forceinline__ void reduce_g_center_per_head(
+    const float *g_raw_smem_ptr, float *g_center_smem_ptr,
+    float *g_reduce_min_smem_ptr, float *g_reduce_max_smem_ptr,
+    uint32_t tid, uint32_t warp_id, uint32_t lane_id, uint32_t chunk_len) {
+  const uint32_t head_offset = warp_id >> 1U;
+  const uint32_t token_offset = ((warp_id & 1U) * WARP_SIZE) + lane_id;
+  float g_min = INFINITY;
+  float g_max = -INFINITY;
+  if (token_offset < chunk_len) {
+    const float g_value = g_raw_smem_ptr[head_offset * BLOCK_T + token_offset];
+    g_min = g_value;
+    g_max = g_value;
+  }
+
+  g_min = warp_reduce_min(g_min);
+  g_max = warp_reduce_max(g_max);
+  if (lane_id == 0U) {
+    g_reduce_min_smem_ptr[warp_id] = g_min;
+    g_reduce_max_smem_ptr[warp_id] = g_max;
+  }
+  bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
+
+  if (tid < HEADS_PER_QK_HEAD) {
+    float g_center = 0.0f;
+    if (chunk_len > 0U) {
+      const uint32_t warp_base = tid * 2U;
+      const float head_min =
+          fminf(g_reduce_min_smem_ptr[warp_base], g_reduce_min_smem_ptr[warp_base + 1U]);
+      const float head_max =
+          fmaxf(g_reduce_max_smem_ptr[warp_base], g_reduce_max_smem_ptr[warp_base + 1U]);
+      g_center = 0.5f * (head_min + head_max);
+    }
+    g_center_smem_ptr[tid] = g_center;
+  }
+}
+
 __device__ __forceinline__ void materialize_attn_stage_from_regs(
     char *smem_ptr, uint32_t smem, uint32_t attn_stage_smem,
     const float *qk_reg_lo, const float *qk_reg_hi, const float *g_neg_head_ptr,
-    float g_row_base, float g_row_hi, uint32_t row_base, uint32_t row_hi,
-    uint32_t row_base_limit, uint32_t row_hi_limit, uint32_t lane_col) {
+    uint32_t row_base, uint32_t row_hi, uint32_t row_base_limit,
+    uint32_t row_hi_limit, uint32_t lane_col) {
   nv_bfloat16 *attn_smem_ptr =
       reinterpret_cast<nv_bfloat16 *>(smem_ptr + (attn_stage_smem - smem));
 #pragma unroll
@@ -325,22 +378,21 @@ __device__ __forceinline__ void materialize_attn_stage_from_regs(
 
     store_attn_column_pair(attn_smem_ptr, g_neg_head_ptr, qk_reg_lo[reg_base],
                            qk_reg_lo[reg_base + 1U], qk_reg_lo[reg_base + 2U],
-                           qk_reg_lo[reg_base + 3U], g_row_base, g_row_hi,
-                           row_base, row_hi, row_base_limit, row_hi_limit,
-                           col_lo);
+                           qk_reg_lo[reg_base + 3U], row_base, row_hi,
+                           row_base_limit, row_hi_limit, col_lo);
     store_attn_column_pair(attn_smem_ptr, g_neg_head_ptr, qk_reg_hi[reg_base],
                            qk_reg_hi[reg_base + 1U], qk_reg_hi[reg_base + 2U],
-                           qk_reg_hi[reg_base + 3U], g_row_base, g_row_hi,
-                           row_base, row_hi, row_base_limit, row_hi_limit,
-                           col_hi);
+                           qk_reg_hi[reg_base + 3U], row_base, row_hi,
+                           row_base_limit, row_hi_limit, col_hi);
   }
 }
 
 __device__ __forceinline__ __nv_bfloat162 combine_output_pair(
-    float ov_0, float ov_1, float qh_0, float qh_1, float g_row_scale,
-    float scale) {
-  return __floats2bfloat162_rn(scale * __fmaf_rn(qh_0, g_row_scale, ov_0),
-                               scale * __fmaf_rn(qh_1, g_row_scale, ov_1));
+    float ov_0, float ov_1, float qh_0, float qh_1, float gp_row,
+    float alpha, float scale) {
+  const float row_scale = scale * gp_row;
+  return __floats2bfloat162_rn(row_scale * __fmaf_rn(alpha, qh_0, ov_0),
+                               row_scale * __fmaf_rn(alpha, qh_1, ov_1));
 }
 
 __device__ __forceinline__ void
@@ -408,8 +460,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
   const uint32_t g_raw_smem = smem + OFFSET_G_RAW;
   const uint32_t g_center_smem = smem + OFFSET_G_CENTER;
   const uint32_t g_pos_smem = smem + OFFSET_G_POS;
+  const uint32_t g_alpha_smem = smem + OFFSET_G_ALPHA;
   const uint32_t g_neg_smem = smem + OFFSET_G_NEG;
-  const uint32_t g_out_smem = smem + OFFSET_G_OUT;
+  const uint32_t g_reduce_min_smem = smem + OFFSET_G_REDUCE_MIN;
+  const uint32_t g_reduce_max_smem = smem + OFFSET_G_REDUCE_MAX;
   const uint32_t qk_tma_barriers = smem + OFFSET_QK_TMA_BAR;
   const uint32_t v_tma_barrier = smem + OFFSET_V_TMA_BAR;
   const uint32_t h_tma_barrier = smem + OFFSET_H_TMA_BAR;
@@ -426,10 +480,14 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       reinterpret_cast<float *>(smem_ptr + (g_center_smem - smem));
   float *g_pos_smem_ptr =
       reinterpret_cast<float *>(smem_ptr + (g_pos_smem - smem));
+  float *g_alpha_smem_ptr =
+      reinterpret_cast<float *>(smem_ptr + (g_alpha_smem - smem));
   float *g_neg_smem_ptr =
       reinterpret_cast<float *>(smem_ptr + (g_neg_smem - smem));
-  float *g_out_smem_ptr =
-      reinterpret_cast<float *>(smem_ptr + (g_out_smem - smem));
+  float *g_reduce_min_smem_ptr =
+      reinterpret_cast<float *>(smem_ptr + (g_reduce_min_smem - smem));
+  float *g_reduce_max_smem_ptr =
+      reinterpret_cast<float *>(smem_ptr + (g_reduce_max_smem - smem));
 
   if (warp_id == TMA_WARP) {
     if (elect_sync()) {
@@ -669,30 +727,22 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       }
       bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
 
-      if (tid < HEADS_PER_QK_HEAD) {
-        float g_center = 0.0f;
-        if (chunk_len > 0U) {
-          const float *g_head_ptr = g_raw_smem_ptr + tid * BLOCK_T;
-          float g_min = g_head_ptr[0];
-          float g_max = g_head_ptr[0];
-          for (uint32_t i = 1; i < chunk_len; ++i) {
-            const float g_value = g_head_ptr[i];
-            g_min = g_value < g_min ? g_value : g_min;
-            g_max = g_value > g_max ? g_value : g_max;
-          }
-          g_center = 0.5f * (g_min + g_max);
-        }
-        g_center_smem_ptr[tid] = g_center;
-      }
+      reduce_g_center_per_head(g_raw_smem_ptr, g_center_smem_ptr,
+                               g_reduce_min_smem_ptr, g_reduce_max_smem_ptr,
+                               tid, warp_id, lane_id, chunk_len);
       bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
 
+      if (tid < HEADS_PER_QK_HEAD) {
+        g_alpha_smem_ptr[tid] = __expf(g_center_smem_ptr[tid]);
+      }
       for (uint32_t i = tid; i < HEADS_PER_QK_HEAD * BLOCK_T;
            i += NUM_CUDA_WARPS * WARP_SIZE) {
         const uint32_t head_offset = i / BLOCK_T;
-        const float g_shifted = g_raw_smem_ptr[i] - g_center_smem_ptr[head_offset];
-        g_pos_smem_ptr[i] = __expf(g_shifted);
-        g_neg_smem_ptr[i] = __expf(-g_shifted);
-        g_out_smem_ptr[i] = __expf(g_raw_smem_ptr[i]);
+        const float g_shifted =
+            g_raw_smem_ptr[i] - g_center_smem_ptr[head_offset];
+        const float gp = __expf(g_shifted);
+        g_pos_smem_ptr[i] = gp;
+        g_neg_smem_ptr[i] = __frcp_rn(gp);
       }
       bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
 
@@ -703,13 +753,11 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       float qk_reg_hi[REGS_PER_FRAGMENT];
       load_qk_fragment(qk_reg_lo, qk_reg_hi);
 
-      const float *head0_g_pos_ptr = g_pos_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T;
       const float *head0_g_neg_ptr = g_neg_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T;
       materialize_attn_stage_from_regs(
           smem_ptr, smem, attn_smem + HEAD0_STAGE_INDEX * ATTN_SMEM_SIZE,
-          qk_reg_lo, qk_reg_hi, head0_g_neg_ptr, head0_g_pos_ptr[row_base],
-          head0_g_pos_ptr[row_hi], row_base, row_hi, row_base_limit,
-          row_hi_limit, lane_col);
+          qk_reg_lo, qk_reg_hi, head0_g_neg_ptr, row_base, row_hi,
+          row_base_limit, row_hi_limit, lane_col);
       fence_proxy_async_shared_cta();
       __syncwarp();
       if (elect_sync()) {
@@ -721,21 +769,19 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
            ++head_offset) {
         const uint32_t head_phase = head_offset & 1U;
         const uint32_t head_id = head_id_base + head_offset;
-        const float *g_out_head_ptr = g_out_smem_ptr + head_offset * BLOCK_T;
-        const float g_output_row_base = g_out_head_ptr[row_base];
-        const float g_output_row_hi = g_out_head_ptr[row_hi];
+        const float *gp_head_ptr = g_pos_smem_ptr + head_offset * BLOCK_T;
+        const float gp_row_base = gp_head_ptr[row_base];
+        const float gp_row_hi = gp_head_ptr[row_hi];
+        const float alpha = g_alpha_smem_ptr[head_offset];
 
         if (head_offset + 1U < HEADS_PER_QK_HEAD) {
           const uint32_t next_head_offset = head_offset + 1U;
-          const float *next_g_pos_ptr =
-              g_pos_smem_ptr + next_head_offset * BLOCK_T;
           const float *next_g_neg_ptr =
               g_neg_smem_ptr + next_head_offset * BLOCK_T;
           materialize_attn_stage_from_regs(
               smem_ptr, smem, attn_smem + next_head_offset * ATTN_SMEM_SIZE,
-              qk_reg_lo, qk_reg_hi, next_g_neg_ptr, next_g_pos_ptr[row_base],
-              next_g_pos_ptr[row_hi], row_base, row_hi, row_base_limit,
-              row_hi_limit, lane_col);
+              qk_reg_lo, qk_reg_hi, next_g_neg_ptr, row_base, row_hi,
+              row_base_limit, row_hi_limit, lane_col);
           fence_proxy_async_shared_cta();
           __syncwarp();
           if (elect_sync()) {
@@ -785,25 +831,25 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
                   combine_output_pair(
                       ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U],
                       qh_reg_lo[reg_row0], qh_reg_lo[reg_row0 + 1U],
-                      g_output_row_base, scale));
+                      gp_row_base, alpha, scale));
               store_bf162_no_allocate(
                   row_base_o_ptr + col_hi,
                   combine_output_pair(
                       ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U],
                       qh_reg_hi[reg_row0], qh_reg_hi[reg_row0 + 1U],
-                      g_output_row_base, scale));
+                      gp_row_base, alpha, scale));
               store_bf162_no_allocate(
                   row_hi_o_ptr + col_lo,
                   combine_output_pair(
                       ov_reg_lo[reg_row1], ov_reg_lo[reg_row1 + 1U],
                       qh_reg_lo[reg_row1], qh_reg_lo[reg_row1 + 1U],
-                      g_output_row_hi, scale));
+                      gp_row_hi, alpha, scale));
               store_bf162_no_allocate(
                   row_hi_o_ptr + col_hi,
                   combine_output_pair(
                       ov_reg_hi[reg_row1], ov_reg_hi[reg_row1 + 1U],
                       qh_reg_hi[reg_row1], qh_reg_hi[reg_row1 + 1U],
-                      g_output_row_hi, scale));
+                      gp_row_hi, alpha, scale));
             }
           }
         } else {
@@ -846,24 +892,24 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
                   combine_output_pair(
                       ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U],
                       qh_reg_lo[reg_row0], qh_reg_lo[reg_row0 + 1U],
-                      g_output_row_base, scale),
+                      gp_row_base, alpha, scale),
                   row_base_o_ptr + col_hi,
                   combine_output_pair(
                       ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U],
                       qh_reg_hi[reg_row0], qh_reg_hi[reg_row0 + 1U],
-                      g_output_row_base, scale),
+                      gp_row_base, alpha, scale),
                   row_base_active);
               store_bf162_pair_no_allocate_if(
                   row_hi_o_ptr + col_lo,
                   combine_output_pair(
                       ov_reg_lo[reg_row1], ov_reg_lo[reg_row1 + 1U],
                       qh_reg_lo[reg_row1], qh_reg_lo[reg_row1 + 1U],
-                      g_output_row_hi, scale),
+                      gp_row_hi, alpha, scale),
                   row_hi_o_ptr + col_hi,
                   combine_output_pair(
                       ov_reg_hi[reg_row1], ov_reg_hi[reg_row1 + 1U],
                       qh_reg_hi[reg_row1], qh_reg_hi[reg_row1 + 1U],
-                      g_output_row_hi, scale),
+                      gp_row_hi, alpha, scale),
                   row_hi_active);
             }
           }
