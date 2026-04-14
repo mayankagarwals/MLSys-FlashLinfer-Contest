@@ -279,7 +279,8 @@ void h_kernel_cutlass(
         // permute shape: [H, dim/64, T, 64]
         tma_load_4d(W_smem, &W_tmap, 0, off_t, 0, head_id, mbar_addr, EVICT_FIRST);
         tma_load_4d(V_smem, &V_tmap, 0, off_t, 0, head_id, mbar_addr, EVICT_FIRST);
-        tma_load_4d(K_smem, &K_tmap, 0, off_t, 0, k_head_id, mbar_addr);
+        // K shared across H/Hg=2 head groups — use EVICT_LAST to keep in L2
+        tma_load_4d(K_smem, &K_tmap, 0, off_t, 0, k_head_id, mbar_addr, EVICT_LAST);
         mbarrier_arrive_expect_tx(mbar_addr, STAGE_SIZE);
         profiler.stamp(ISSUE_TMA);
 
