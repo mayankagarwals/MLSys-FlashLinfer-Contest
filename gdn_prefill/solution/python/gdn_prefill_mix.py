@@ -27,14 +27,14 @@ def run(
     T = q.shape[0]
     N = cu_seqlens.shape[0] - 1
 
-    # chunk pipeline for T>=525 (Triton prep + CUDA H + Triton O — matches reference precision)
+    # chunk pipeline for T>=525 (Triton prep — must match reference precision)
     if T >= 525:
         if N <= 2:
             return chunk_v6c(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
         else:
             return chunk_v7b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
-    # CUDA v5 for medium workloads (single C++ call — FusedPrep + v4 H + tcgen05 O)
+    # CUDA v5 for medium workloads
     if T >= 64 or (N == 1 and T >= 46):
         return cuda_v5(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
