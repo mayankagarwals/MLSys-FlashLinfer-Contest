@@ -13,7 +13,7 @@ os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
-    name="gdn_prefill_chunk_v7_o_v2_cuda_r11",
+    name="gdn_prefill_chunk_v7_o_v2_cuda_r16",
     cuda_files=[str(CURRENT_DIR / "cuda_o_v2.cu")],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[

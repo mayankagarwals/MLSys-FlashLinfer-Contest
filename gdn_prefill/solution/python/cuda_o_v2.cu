@@ -1225,7 +1225,6 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v2_kernel_cutlass(
         mbarrier_arrive(attn_release_barriers + attn_stage_index * 8U);
       }
 
-      mbarrier_wait(qk_consumed_barrier, 0U);
     }
 
     global_chunk_id += gridDim.y;
