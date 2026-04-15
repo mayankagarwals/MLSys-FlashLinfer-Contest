@@ -470,7 +470,7 @@ materialize_attn_tmem_from_regs(const float *qk_reg_lo, const float *qk_reg_hi,
     tcgen05_st<SHAPE::_16x128b, 1>(0U, ATTN_TMEM_COL + 16U + step_pair * 4U,
                                    attn_regs_hi);
   }
-  fence_view_async_tmem_store();
+  tcgen05_wait_st();
 }
 
 __device__ __forceinline__ __nv_bfloat162
@@ -602,10 +602,11 @@ issue_tma_stage_qk(uint32_t q_stage_smem, uint32_t k_stage_smem,
   }
 }
 
-__device__ __forceinline__ void
-issue_tma_stage_h(uint32_t h_stage_smem, const CUtensorMap *h_tmap,
-                  uint32_t global_chunk_id, uint32_t head_id,
-                  uint32_t h_tma_barriers) {
+__device__ __forceinline__ void issue_tma_stage_h(uint32_t h_stage_smem,
+                                                  const CUtensorMap *h_tmap,
+                                                  uint32_t global_chunk_id,
+                                                  uint32_t head_id,
+                                                  uint32_t h_tma_barriers) {
   const uint32_t h_outer = global_chunk_id * NUM_OUTPUT_HEADS + head_id;
 
 #pragma unroll
@@ -792,27 +793,24 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v2_kernel_cutlass(
             const uint32_t qk_reused_slot = qk_prod_slot - NUM_QK_STAGES;
             const uint32_t qk_reuse_phase =
                 (qk_reused_slot / NUM_QK_STAGES) & 1U;
-            mbarrier_wait(qk_mma_barriers + next_qk_stage * 8U,
-                          qk_reuse_phase);
-            mbarrier_wait(qh_mma_barriers + next_qk_stage * 8U,
-                          qk_reuse_phase);
+            mbarrier_wait(qk_mma_barriers + next_qk_stage * 8U, qk_reuse_phase);
+            mbarrier_wait(qh_mma_barriers + next_qk_stage * 8U, qk_reuse_phase);
           }
           issue_tma_stage_qk(
               q_smem + next_qk_stage * Q_STAGE_SMEM_SIZE,
               k_smem + next_qk_stage * K_STAGE_SMEM_SIZE, &q_tmap, &k_tmap,
               cu_seqlens_ptr, chunk_indices_ptr, next_qk_global_chunk_id,
-              qk_head_id,
-              qk_tma_barriers + next_qk_stage * NUM_QK_ATOMS * 8U);
+              qk_head_id, qk_tma_barriers + next_qk_stage * NUM_QK_ATOMS * 8U);
         }
 
         const uint32_t h_prod_slot = chunk_iter + INITIAL_H_PREFETCH_STAGES;
-        const uint32_t next_h_global_chunk_id = stripe_id + h_prod_slot * gridDim.x;
+        const uint32_t next_h_global_chunk_id =
+            stripe_id + h_prod_slot * gridDim.x;
         if (next_h_global_chunk_id < total_num_chunks_u) {
           const uint32_t next_h_stage = h_prod_slot % NUM_H_STAGES;
           if (h_prod_slot >= NUM_H_STAGES) {
             const uint32_t h_reused_slot = h_prod_slot - NUM_H_STAGES;
-            const uint32_t h_reuse_phase =
-                (h_reused_slot / NUM_H_STAGES) & 1U;
+            const uint32_t h_reuse_phase = (h_reused_slot / NUM_H_STAGES) & 1U;
             mbarrier_wait(h_reuse_barriers + next_h_stage * 8U, h_reuse_phase);
           }
           issue_tma_stage_h(h_smem + next_h_stage * H_STAGE_SMEM_SIZE, &h_tmap,
@@ -821,13 +819,13 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v2_kernel_cutlass(
         }
 
         const uint32_t v_prod_slot = chunk_iter + INITIAL_V_PREFETCH_STAGES;
-        const uint32_t next_v_global_chunk_id = stripe_id + v_prod_slot * gridDim.x;
+        const uint32_t next_v_global_chunk_id =
+            stripe_id + v_prod_slot * gridDim.x;
         if (next_v_global_chunk_id < total_num_chunks_u) {
           const uint32_t next_v_stage = v_prod_slot % NUM_V_STAGES;
           if (v_prod_slot >= NUM_V_STAGES) {
             const uint32_t v_reused_slot = v_prod_slot - NUM_V_STAGES;
-            const uint32_t v_reuse_phase =
-                (v_reused_slot / NUM_V_STAGES) & 1U;
+            const uint32_t v_reuse_phase = (v_reused_slot / NUM_V_STAGES) & 1U;
             mbarrier_wait(ov_mma_barriers + next_v_stage * 8U, v_reuse_phase);
           }
           issue_tma_stage_v(v_smem + next_v_stage * V_STAGE_SMEM_SIZE, &v_tmap,
@@ -849,8 +847,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v2_kernel_cutlass(
       const uint32_t v_stage_smem = v_smem + v_stage * V_STAGE_SMEM_SIZE;
       const uint32_t qk_tma_stage =
           qk_tma_barriers + qk_stage * NUM_QK_ATOMS * 8U;
-      const uint32_t v_tma_stage =
-          v_tma_barriers + v_stage * NUM_V_ATOMS * 8U;
+      const uint32_t v_tma_stage = v_tma_barriers + v_stage * NUM_V_ATOMS * 8U;
 
       if (chunk_iter > 0U) {
         mbarrier_wait(qk_tmem_release_barrier, 1U ^ (chunk_iter & 1U));
@@ -896,8 +893,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v2_kernel_cutlass(
       const uint32_t h_stage_smem = h_smem + h_stage * H_STAGE_SMEM_SIZE;
       const uint32_t qk_tma_stage =
           qk_tma_barriers + qk_stage * NUM_QK_ATOMS * 8U;
-      const uint32_t h_tma_stage =
-          h_tma_barriers + h_stage * NUM_H_ATOMS * 8U;
+      const uint32_t h_tma_stage = h_tma_barriers + h_stage * NUM_H_ATOMS * 8U;
 
       mbarrier_wait(qk_tma_stage + 0U * 8U, qk_stage_phase);
       mbarrier_wait(h_tma_stage + 0U * 8U, h_stage_phase);
