@@ -555,13 +555,21 @@ void h_v1_kernel_cutlass(
       bar_sync<2>(128);
       if (elect_sync()) profiler.stamp(WAIT_TMA);
 
+      // Issue g_cu global loads EARLY so they overlap with PROCESS_V below
+      // This hides DRAM latency (31.8% of H kernel long_scoreboard stalls)
+      float g_cu_val = 0.0f, g_cu_last_val = 0.0f;
+      int g_cu_t = 0;
+      if (tid < BT) {
+        g_cu_t = bos + chunk_id * BT + tid;
+        const int last_idx = min(bos + (chunk_id + 1) * BT, eos) - 1;
+        // Issue both loads — they will be in flight during PROCESS_V
+        g_cu_val = g_cu_ptr[g_cu_t * H + head_id];
+        g_cu_last_val = g_cu_ptr[last_idx * H + head_id];
+      }
+
       // unpack V from BF16->FP32, then store as acc for wh MMA
-      // total tile:  [V_dim, BT]
-      // each warp:   [32, BT]
-      // each thread: [1, BT]
+      // (g_cu loads are in flight during this compute-heavy section)
       for (int i = 0; i < BT / 8; i++) {
-        // V smem layout: [V_dim/64, BT, 64] = [2, BT, 64]
-        // each ldmatrix loads [8, 32] along the last 2 dims
         uint32_t v_bf16[4];
         const uint32_t offset = (warp_id / 2) * BT * 128;
         const uint32_t s_row = i * 8 + (lane_id % 8);
@@ -580,16 +588,11 @@ void h_v1_kernel_cutlass(
       mbarrier_arrive(wh_in_mbar_addr + stage_id * 8);
       if (elect_sync()) profiler.stamp(PROCESS_V);
 
-      // load g_cu and compute scaling for v_new
+      // Compute v_scale using pre-loaded g_cu values (loads already completed)
       if (tid < BT) {
-        const int last_idx = min(bos + (chunk_id + 1) * BT, eos) - 1;
-        const int t = bos + chunk_id * BT + tid;
-        float g_cu = g_cu_ptr[t * H + head_id];
-        float g_cu_last = g_cu_ptr[last_idx * H + head_id];
-
         float v_new_scale = 0.0f;
-        if (t < eos)
-          v_new_scale = __expf(g_cu_last - g_cu);
+        if (g_cu_t < eos)
+          v_new_scale = __expf(g_cu_last_val - g_cu_val);
         v_scale_smem_ptr[tid] = v_new_scale;
         if (elect_sync()) profiler.stamp(COMPUTE_V_SCALE);
       }
