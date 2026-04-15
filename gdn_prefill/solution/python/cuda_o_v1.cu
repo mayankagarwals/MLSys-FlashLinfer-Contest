@@ -275,17 +275,15 @@ __device__ __forceinline__ float scale_qk_if_active(float qk, float g_col,
 __device__ __forceinline__ void store_bf162_shared(nv_bfloat16 *ptr,
                                                    __nv_bfloat162 value) {
   const uint32_t data = reinterpret_cast<const uint32_t &>(value);
-  asm volatile("st.shared.b32 [%0], %1;" :: "r"(cvt_smem_ptr(ptr)), "r"(data)
+  asm volatile("st.shared.b32 [%0], %1;" ::"r"(cvt_smem_ptr(ptr)), "r"(data)
                : "memory");
 }
 
-__device__ __forceinline__ void
-store_attn_column_pair(nv_bfloat16 *attn_smem_ptr, const float *g_neg_smem_ptr,
-                       float qk_row0_col0, float qk_row0_col1,
-                       float qk_row1_col0, float qk_row1_col1,
-                       uint32_t row_base, uint32_t row_hi,
-                       uint32_t row_base_limit, uint32_t row_hi_limit,
-                       uint32_t col) {
+__device__ __forceinline__ void store_attn_column_pair(
+    nv_bfloat16 *attn_smem_ptr, const float *g_neg_smem_ptr, float qk_row0_col0,
+    float qk_row0_col1, float qk_row1_col0, float qk_row1_col1,
+    uint32_t row_base, uint32_t row_hi, uint32_t row_base_limit,
+    uint32_t row_hi_limit, uint32_t col) {
   const uint32_t col_hi = col + 1U;
   const float g_col0 = g_neg_smem_ptr[col];
   const float g_col1 = g_neg_smem_ptr[col_hi];
@@ -329,8 +327,8 @@ __device__ __forceinline__ float warp_reduce_max(float value) {
 
 __device__ __forceinline__ void reduce_g_center_per_head(
     const float *g_raw_smem_ptr, float *g_center_smem_ptr,
-    float *g_reduce_min_smem_ptr, float *g_reduce_max_smem_ptr,
-    uint32_t tid, uint32_t warp_id, uint32_t lane_id, uint32_t chunk_len) {
+    float *g_reduce_min_smem_ptr, float *g_reduce_max_smem_ptr, uint32_t tid,
+    uint32_t warp_id, uint32_t lane_id, uint32_t chunk_len) {
   const uint32_t head_offset = warp_id >> 1U;
   const uint32_t token_offset = ((warp_id & 1U) * WARP_SIZE) + lane_id;
   float g_min = INFINITY;
@@ -353,10 +351,10 @@ __device__ __forceinline__ void reduce_g_center_per_head(
     float g_center = 0.0f;
     if (chunk_len > 0U) {
       const uint32_t warp_base = tid * 2U;
-      const float head_min =
-          fminf(g_reduce_min_smem_ptr[warp_base], g_reduce_min_smem_ptr[warp_base + 1U]);
-      const float head_max =
-          fmaxf(g_reduce_max_smem_ptr[warp_base], g_reduce_max_smem_ptr[warp_base + 1U]);
+      const float head_min = fminf(g_reduce_min_smem_ptr[warp_base],
+                                   g_reduce_min_smem_ptr[warp_base + 1U]);
+      const float head_max = fmaxf(g_reduce_max_smem_ptr[warp_base],
+                                   g_reduce_max_smem_ptr[warp_base + 1U]);
       g_center = 0.5f * (head_min + head_max);
     }
     g_center_smem_ptr[tid] = g_center;
@@ -387,9 +385,9 @@ __device__ __forceinline__ void materialize_attn_stage_from_regs(
   }
 }
 
-__device__ __forceinline__ __nv_bfloat162 combine_output_pair(
-    float ov_0, float ov_1, float qh_0, float qh_1, float gp_row,
-    float alpha, float scale) {
+__device__ __forceinline__ __nv_bfloat162
+combine_output_pair(float ov_0, float ov_1, float qh_0, float qh_1,
+                    float gp_row, float alpha, float scale) {
   const float row_scale = scale * gp_row;
   return __floats2bfloat162_rn(row_scale * __fmaf_rn(alpha, qh_0, ov_0),
                                row_scale * __fmaf_rn(alpha, qh_1, ov_1));
@@ -402,12 +400,12 @@ store_bf162_pair_no_allocate_if(nv_bfloat16 *ptr_0, __nv_bfloat162 value_0,
                                 nv_bfloat16 *ptr_1, __nv_bfloat162 value_1,
                                 uint32_t predicate);
 
-__device__ __forceinline__ void load_output_fragment_pair(
-    uint32_t col_base, float *ov_reg_lo, float *ov_reg_hi, float *qh_reg_lo,
-    float *qh_reg_hi) {
+__device__ __forceinline__ void
+load_output_fragment_pair(uint32_t col_base, float *ov_reg_lo, float *ov_reg_hi,
+                          float *qh_reg_lo, float *qh_reg_hi) {
   tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_lo, 0, OUTPUT_TMEM_COL + col_base);
-  tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_hi, 0,
-                                 OUTPUT_TMEM_COL + col_base + COLS_PER_FRAGMENT);
+  tcgen05_ld<SHAPE::_16x256b, 4>(
+      ov_reg_hi, 0, OUTPUT_TMEM_COL + col_base + COLS_PER_FRAGMENT);
   tcgen05_ld<SHAPE::_16x256b, 4>(qh_reg_lo, 0, QH_TMEM_COL + col_base);
   tcgen05_ld<SHAPE::_16x256b, 4>(qh_reg_hi, 0,
                                  QH_TMEM_COL + col_base + COLS_PER_FRAGMENT);
@@ -415,10 +413,11 @@ __device__ __forceinline__ void load_output_fragment_pair(
 }
 
 template <bool FULL_CHUNK>
-__device__ __forceinline__ void store_output_row_pair(
-    nv_bfloat16 *row_base_o_ptr, nv_bfloat16 *row_hi_o_ptr, uint32_t lane_col,
-    uint32_t row_base_active, uint32_t row_hi_active, float gp_row_base,
-    float gp_row_hi, float alpha, float scale) {
+__device__ __forceinline__ void
+store_output_row_pair(nv_bfloat16 *row_base_o_ptr, nv_bfloat16 *row_hi_o_ptr,
+                      uint32_t lane_col, uint32_t row_base_active,
+                      uint32_t row_hi_active, float gp_row_base,
+                      float gp_row_hi, float alpha, float scale) {
 #pragma unroll
   for (uint32_t fragment_pair = 0; fragment_pair < BLOCK_V / BLOCK_T;
        ++fragment_pair) {
@@ -821,7 +820,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       float qk_reg_hi[REGS_PER_FRAGMENT];
       load_qk_fragment(qk_reg_lo, qk_reg_hi);
 
-      const float *head0_g_neg_ptr = g_neg_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T;
+      const float *head0_g_neg_ptr =
+          g_neg_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T;
       materialize_attn_stage_from_regs(
           smem_ptr, smem, attn_smem + HEAD0_STAGE_INDEX * ATTN_SMEM_SIZE,
           qk_reg_lo, qk_reg_hi, head0_g_neg_ptr, row_base, row_hi,
@@ -870,15 +870,15 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         nv_bfloat16 *row_hi_o_ptr = row_base_o_ptr + ROW_PAIR_OUTPUT_STRIDE;
 
         if (full_chunk) {
-          store_output_row_pair<true>(row_base_o_ptr, row_hi_o_ptr, lane_col, 0U,
-                                      0U, gp_row_base, gp_row_hi, alpha,
+          store_output_row_pair<true>(row_base_o_ptr, row_hi_o_ptr, lane_col,
+                                      0U, 0U, gp_row_base, gp_row_hi, alpha,
                                       scale);
         } else {
           const uint32_t row_base_active = row_base < chunk_len;
           const uint32_t row_hi_active = row_hi < chunk_len;
-          store_output_row_pair<false>(
-              row_base_o_ptr, row_hi_o_ptr, lane_col, row_base_active,
-              row_hi_active, gp_row_base, gp_row_hi, alpha, scale);
+          store_output_row_pair<false>(row_base_o_ptr, row_hi_o_ptr, lane_col,
+                                       row_base_active, row_hi_active,
+                                       gp_row_base, gp_row_hi, alpha, scale);
         }
 
         tcgen05_fence_before_thread_sync();
@@ -907,7 +907,8 @@ void launch_o_v1(TensorView q_chunks, TensorView k_chunks, TensorView v_new,
                  TensorView cu_seqlens, TensorView chunk_indices,
                  TensorView total_chunks, double scale) {
   const uint32_t total_num_tokens = static_cast<uint32_t>(q_chunks.size(0));
-  const uint32_t total_num_chunks_capacity = static_cast<uint32_t>(v_new.size(0));
+  const uint32_t total_num_chunks_capacity =
+      static_cast<uint32_t>(v_new.size(0));
   if (total_num_chunks_capacity == 0U) {
     return;
   }
