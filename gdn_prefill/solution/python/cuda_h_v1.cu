@@ -166,7 +166,7 @@ struct Profiler {
 template <int NUM_STAGES, bool DO_PROFILE>
 __global__
 __block_size__((TB_SIZE, 1, 1))
-void h_kernel_cutlass(
+void h_v1_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,      // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap W_tmap,      // [total_T, H, K_dim]
@@ -675,7 +675,7 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   uint64_t globalDim[rank] = {64, T, dim / 64, H};
   uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16),
                                                                 128,
-                                           dim * sizeof(nv_bfloat16)};  // in bytes
+                                          dim * sizeof(nv_bfloat16)};  // in bytes
   uint32_t boxDim[rank] = {64, BT, dim / 64, 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
@@ -739,10 +739,10 @@ void h_v1(
   auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim);
   auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
   auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
-  auto V_new_tmap = encode_tma(V_new.data_ptr(), 100000, H, V_dim);  // padded layout
+  auto V_new_tmap = encode_tma(V_new.data_ptr(), V_new.size(0), H, V_dim);  // padded layout
   auto H0_tmap    = encode_h_tma(h0.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
   auto HT_tmap    = encode_h_tma(ht.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
-  auto H_tmap     = encode_h_tma(h.data_ptr(), 100000, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
+  auto H_tmap     = encode_h_tma(h.data_ptr(), h.size(0), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
 
   auto *V_new_ptr         = reinterpret_cast<nv_bfloat16 *>(V_new.data_ptr());
   auto *g_cu_ptr          = reinterpret_cast<const float *>(g_cu.data_ptr());
@@ -764,7 +764,7 @@ void h_v1(
     const int num_entries = (profiler.value().size(2) - 1) / 2;
     auto *profiler_ptr = reinterpret_cast<int64_t *>(profiler.value().data_ptr());
 
-    auto kernel = h_kernel_cutlass<NUM_STAGES, true>;
+    auto kernel = h_v1_kernel_cutlass<NUM_STAGES, true>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     dim3 grid(H, N);
     kernel<<<grid, TB_SIZE, smem_size>>>(
@@ -772,7 +772,7 @@ void h_v1(
       g_cu_ptr, cu_seqlens_ptr, chunk_offsets_ptr, profiler_ptr, num_entries);
   }
   else {
-    auto kernel = h_kernel_cutlass<NUM_STAGES, false>;
+    auto kernel = h_v1_kernel_cutlass<NUM_STAGES, false>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
     dim3 grid(H, N);
     kernel<<<grid, TB_SIZE, smem_size>>>(

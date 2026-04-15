@@ -1,4 +1,23 @@
-# chunk_v6c: chunk_v6b + bf16 diagonal inverse experiment
+# chunk_v8: combine chunk_v6b (Triton H kernel for small N) and
+#           chunk_v7 (CUDA C++ H kernel for large N)
+#
+# Summary:
+#
+#   1. Inverse diagonal: 2 Neumann iterations + bf16 correction (was 3 iter + tf32)
+#      Saves 2 bf16 MMA calls (removed 3rd iteration) + 2 tf32→bf16 downgrade.
+#
+#      Why fewer iterations work: the Neumann series (I-A)(I+A^2)(I+A^4)... computes
+#      (I+A)^{-1} for strictly triangular A. For 16x16 blocks, A^k can be nonzero up
+#      to k=15. With 2 iterations we cover A^1..A^4, missing A^5..A^15. The correction
+#      step (Newton refinement: R = (I+A)@Ai - I, then Ai = Ai@(I-R)) recovers most
+#      of the missing terms in one step, reducing error from O(||A||^5) to O(||A||^10).
+#
+#   2. Inverse off-diagonal: all bf16 MMA (was tf32x3, which uses 3x more mma.sync)
+#
+#   3. CUDA metadata: cuda_prep_meta.cu replaces Triton compute_chunks_kernel
+#      Faster kernel launch than Triton JIT (~185 us total savings).
+#
+#   4. Triton H kernel: num_stages=5 (was 3, better Triton load/compute overlap, ~73 us savings)
 
 import os
 from pathlib import Path
@@ -11,7 +30,6 @@ from torch import Tensor
 
 from .triton_v4 import (
     chunk_gated_delta_rule_fwd_kernel_h,
-    compute_chunks_kernel,
 )
 
 os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
@@ -19,9 +37,11 @@ os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
-    name="gdn_prefill_cuda_v6c",
+    name="gdn_prefill_cuda_v8c",
     cuda_files=[
+        str(CURRENT_DIR / "cuda_prep_meta.cu"),
         str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
+        str(CURRENT_DIR / "cuda_h_v1.cu"),
     ],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
@@ -41,8 +61,8 @@ def _unit_lower_inverse_16x16_bf16_corr1(A_orig):
     m_I = tl.where(o_i[:, None] == o_i[None, :], 1.0, 0.0)
     m_I_bf16 = m_I.to(tl.bfloat16)
 
-    # Experiment: use bf16-input MMAs for the 6-dot Neumann path, then recover
-    # accuracy with a single residual correction factor: (I + R)^-1 ~= I - R.
+    # 2-iteration Neumann: covers A through A^4 exactly, missing A^5..A^15.
+    # Correction step recovers most of the remaining error.
     A = A_orig.to(tl.bfloat16)
     Ai = m_I_bf16 - A
 
@@ -54,13 +74,11 @@ def _unit_lower_inverse_16x16_bf16_corr1(A_orig):
     A_pow_bf16 = A_pow.to(tl.bfloat16)
     Ai = tl.dot(Ai.to(tl.bfloat16), m_I_bf16 + A_pow_bf16)
 
-    A_pow = tl.dot(A_pow_bf16, A_pow_bf16)
-    A_pow_bf16 = A_pow.to(tl.bfloat16)
-    Ai = tl.dot(Ai.to(tl.bfloat16), m_I_bf16 + A_pow_bf16)
-
-    MAi = Ai + tl.dot(A_orig, Ai, input_precision="tf32")
+    # Correction: compute residual R = (I+A)@Ai - I, then Ai = Ai @ (I - R)
+    # Using bf16 MMAs for correction (saves 2 tf32 dots per block)
+    MAi = Ai + tl.dot(A_orig.to(tl.bfloat16), Ai.to(tl.bfloat16))
     R = MAi - m_I
-    Ai = tl.dot(Ai, m_I - R, input_precision="tf32")
+    Ai = tl.dot(Ai.to(tl.bfloat16), (m_I - R).to(tl.bfloat16))
 
     return Ai
 
@@ -118,6 +136,12 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     Ai_33 = _unit_lower_inverse_16x16_bf16_corr1(A_33)
     Ai_44 = _unit_lower_inverse_16x16_bf16_corr1(A_44)
 
+    # Early bf16 roundtrip on diagonal blocks — enables faster bf16 MMA for off-diagonal
+    Ai_11 = Ai_11.to(tl.bfloat16).to(tl.float32)
+    Ai_22 = Ai_22.to(tl.bfloat16).to(tl.float32)
+    Ai_33 = Ai_33.to(tl.bfloat16).to(tl.float32)
+    Ai_44 = Ai_44.to(tl.bfloat16).to(tl.float32)
+
     A_21 = tl.load(A_ptr + (offsets + (16 * H * BT + 0)), mask=offs_t < seqlen - 16)
     A_31 = tl.load(A_ptr + (offsets + (32 * H * BT + 0)), mask=offs_t < seqlen - 32)
     A_32 = tl.load(A_ptr + (offsets + (32 * H * BT + 16)), mask=offs_t < seqlen - 32)
@@ -125,39 +149,33 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     A_42 = tl.load(A_ptr + (offsets + (48 * H * BT + 16)), mask=offs_t < seqlen - 48)
     A_43 = tl.load(A_ptr + (offsets + (48 * H * BT + 32)), mask=offs_t < seqlen - 48)
 
-    tmp = tl.dot(Ai_22, A_21, input_precision="tf32x3")
-    Ai_21 = -tl.dot(tmp, Ai_11, input_precision="tf32x3")
-    tmp = tl.dot(Ai_33, A_32, input_precision="tf32x3")
-    Ai_32 = -tl.dot(tmp, Ai_22, input_precision="tf32x3")
-    tmp = tl.dot(Ai_44, A_43, input_precision="tf32x3")
-    Ai_43 = -tl.dot(tmp, Ai_33, input_precision="tf32x3")
-    tmp = tl.dot(A_31, Ai_11, input_precision="tf32x3")
-    tmp = tl.dot(A_32, Ai_21, acc=tmp, input_precision="tf32x3")
-    Ai_31 = -tl.dot(Ai_33, tmp, input_precision="tf32x3")
-    tmp = tl.dot(A_42, Ai_22, input_precision="tf32x3")
-    tmp = tl.dot(A_43, Ai_32, acc=tmp, input_precision="tf32x3")
-    Ai_42 = -tl.dot(Ai_44, tmp, input_precision="tf32x3")
-    tmp = tl.dot(A_41, Ai_11, input_precision="tf32x3")
-    tmp = tl.dot(A_42, Ai_21, acc=tmp, input_precision="tf32x3")
-    tmp = tl.dot(A_43, Ai_31, acc=tmp, input_precision="tf32x3")
-    Ai_41 = -tl.dot(Ai_44, tmp, input_precision="tf32x3")
+    # Level 0: bf16 MMA (faster — diagonal inputs already bf16-rounded)
+    tmp = tl.dot(Ai_22.to(tl.bfloat16), A_21.to(tl.bfloat16))
+    Ai_21 = -tl.dot(tmp.to(tl.bfloat16), Ai_11.to(tl.bfloat16))
+    tmp = tl.dot(Ai_33.to(tl.bfloat16), A_32.to(tl.bfloat16))
+    Ai_32 = -tl.dot(tmp.to(tl.bfloat16), Ai_22.to(tl.bfloat16))
+    tmp = tl.dot(Ai_44.to(tl.bfloat16), A_43.to(tl.bfloat16))
+    Ai_43 = -tl.dot(tmp.to(tl.bfloat16), Ai_33.to(tl.bfloat16))
+    # Level 1: bf16 MMA
+    tmp = tl.dot(A_31.to(tl.bfloat16), Ai_11.to(tl.bfloat16))
+    tmp = tl.dot(A_32.to(tl.bfloat16), Ai_21.to(tl.bfloat16), acc=tmp)
+    Ai_31 = -tl.dot(Ai_33.to(tl.bfloat16), tmp.to(tl.bfloat16))
+    tmp = tl.dot(A_42.to(tl.bfloat16), Ai_22.to(tl.bfloat16))
+    tmp = tl.dot(A_43.to(tl.bfloat16), Ai_32.to(tl.bfloat16), acc=tmp)
+    Ai_42 = -tl.dot(Ai_44.to(tl.bfloat16), tmp.to(tl.bfloat16))
+    # Level 2: bf16 MMA (was tf32x3 — testing if bf16 is precise enough)
+    tmp = tl.dot(A_41.to(tl.bfloat16), Ai_11.to(tl.bfloat16))
+    tmp = tl.dot(A_42.to(tl.bfloat16), Ai_21.to(tl.bfloat16), acc=tmp)
+    tmp = tl.dot(A_43.to(tl.bfloat16), Ai_31.to(tl.bfloat16), acc=tmp)
+    Ai_41 = -tl.dot(Ai_44.to(tl.bfloat16), tmp.to(tl.bfloat16))
 
-    # bf16 roundtrip: matches the standard "fp32 inverse → bf16 → MMA" pipeline that
-    # the flashinfer reference also uses. The reference computes the inverse via scalar
-    # fp32 back-substitution, then stores to smem as bf16 before W/U MMA. We replicate
-    # this truncation so our block-wise W/U dot inputs match. Without this, 2 workloads
-    # fail at atol=1e-2 because keeping fp32 Ai causes different bf16 rounding in
-    # Ab = (Ai * beta).to(bf16), diverging from the reference's bf16-quantized path.
-    Ai_11 = Ai_11.to(tl.bfloat16).to(tl.float32)
+    # bf16 roundtrip on off-diagonal blocks (diagonal already done above)
     Ai_21 = Ai_21.to(tl.bfloat16).to(tl.float32)
-    Ai_22 = Ai_22.to(tl.bfloat16).to(tl.float32)
     Ai_31 = Ai_31.to(tl.bfloat16).to(tl.float32)
     Ai_32 = Ai_32.to(tl.bfloat16).to(tl.float32)
-    Ai_33 = Ai_33.to(tl.bfloat16).to(tl.float32)
     Ai_41 = Ai_41.to(tl.bfloat16).to(tl.float32)
     Ai_42 = Ai_42.to(tl.bfloat16).to(tl.float32)
     Ai_43 = Ai_43.to(tl.bfloat16).to(tl.float32)
-    Ai_44 = Ai_44.to(tl.bfloat16).to(tl.float32)
 
     k_ptr += bos * Hg * K_dim + head_id // (H // Hg) * K_dim
     v_ptr += bos * H * V_dim + head_id * V_dim
@@ -266,6 +284,115 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     tl.store(w_ptr + (t3[:, None] * H * K_dim + offs_k[None, :]), w3, mask=m3[:, None])
 
 
+# save v_new in padded layout
+@triton.jit
+def chunk_gated_delta_rule_fwd_kernel_h(
+    k_ptr,
+    v_ptr,
+    w_ptr,
+    v_new_ptr,
+    g_cu_ptr,
+    h_ptr,
+    h0_ptr,
+    ht_ptr,
+    cu_seqlens_ptr,
+    chunk_offsets_ptr,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K_dim: tl.constexpr,
+    V_dim: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    i_nh = tl.program_id(1)
+    seq_id = i_nh // H
+    head_id = i_nh % H
+
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
+    seqlen = eos - bos
+    num_chunks = tl.cdiv(seqlen, BT)
+    boh = tl.load(chunk_offsets_ptr + seq_id).to(tl.int32)
+
+    # calculate offset
+    h_ptr += ((boh * H + head_id) * V_dim * K_dim).to(tl.int64)
+    v_ptr += ((bos * H + head_id) * V_dim).to(tl.int64)
+    k_ptr += ((bos * Hg + head_id // (H // Hg)) * K_dim).to(tl.int64)
+    w_ptr += ((bos * H + head_id) * K_dim).to(tl.int64)
+    v_new_ptr += ((boh * BT * H + head_id) * V_dim).to(tl.int64)
+    g_cu_ptr += bos * H + head_id
+
+    stride_v = H * V_dim
+    stride_h = H * V_dim * K_dim
+    stride_k = Hg * K_dim
+    stride_w = H * K_dim
+
+    h0_ptr = h0_ptr + i_nh * V_dim * K_dim
+    ht_ptr = ht_ptr + i_nh * V_dim * K_dim
+
+    offs_v = i_v * BV + tl.arange(0, BV)[:, None]
+    offs_k = tl.arange(0, K_dim)[None, :]
+
+    # load initial state
+    h = tl.load(h0_ptr + (offs_v * K_dim + offs_k)).to(tl.float32)  # [BV, K_dim]
+
+    # main recurrence
+    # NOTE: TMA might not be faster?
+    for chunk_id in range(num_chunks):
+        # save intermediate state for o computation
+        tl.store(h_ptr + (chunk_id * stride_h + offs_v * K_dim + offs_k), h)
+
+        # issue all loads first
+        offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
+        mask_t = offs_t < seqlen
+        offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
+
+        w = tl.load(
+            w_ptr + (offs_t * stride_w + offs_k),
+            mask=mask_t,
+            other=0.0,
+        )  # [BT, K_dim]
+
+        v = tl.load(
+            v_ptr + (offs_t * stride_v + offs_v_block),
+            mask=mask_t,
+            other=0.0,
+        )  # [BT, BV]
+
+        k = tl.load(
+            k_ptr + (offs_t * stride_k + offs_k),
+            mask=mask_t,
+            other=0.0,
+        )  # [BT, K_dim]
+
+        last_idx = min((chunk_id + 1) * BT, seqlen) - 1
+        g_cu_last = tl.load(g_cu_ptr + last_idx * H)
+        offs_t_1d = chunk_id * BT + tl.arange(0, BT)
+        g_cu = tl.load(g_cu_ptr + offs_t_1d * H, mask=offs_t_1d < seqlen, other=0.0)
+
+        # computation
+        v_new = v - tl.dot(w, h.to(w.dtype).T)  # [BT, BV]
+
+        # save new value for o computation
+        tl.store(
+            v_new_ptr + (offs_t * stride_v + offs_v_block),
+            v_new,
+            mask=offs_t < seqlen,
+        )
+
+        # apply g
+        mask_t = offs_t_1d < seqlen
+        v_new *= tl.where(mask_t, tl.exp(g_cu_last - g_cu), 0)[:, None]
+        h *= tl.exp(g_cu_last)
+
+        # update state
+        h = tl.dot(v_new.to(k.dtype).T, k, acc=h)
+
+    # epilogue
+    tl.store(ht_ptr + (offs_v * K_dim + offs_k), h)
+
+
 @triton.jit
 def chunk_fwd_kernel_o(
     q_ptr,
@@ -276,6 +403,7 @@ def chunk_fwd_kernel_o(
     o_ptr,
     cu_seqlens_ptr,
     chunk_indices_ptr,
+    chunk_offsets_ptr,
     total_chunks_ptr,
     scale,
     H: tl.constexpr,
@@ -297,9 +425,11 @@ def chunk_fwd_kernel_o(
     eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
 
+    chunk_offset = tl.load(chunk_offsets_ptr + seq_id)
+
     q_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
     k_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
-    v_ptr += (bos * H + head_id) * V_dim
+    v_ptr += (chunk_offset * BT * H + head_id) * V_dim  # padded layout for V
     o_ptr += (bos * H + head_id) * V_dim
     h_ptr += (global_chunk_id * H + head_id) * V_dim * K_dim
     g_cu_ptr += bos * H + head_id
@@ -329,9 +459,6 @@ def chunk_fwd_kernel_o(
         tl.store(o_ptr + (offs_t * (H * V_dim) + offs_v_block), o, mask=mask_t)
 
 
-_FLAG = None
-
-
 def run(
     q: Tensor,  # (total_seqlen, num_q_heads, head_dim)
     k: Tensor,  # (total_seqlen, num_k_heads, head_dim)
@@ -349,26 +476,17 @@ def run(
 
     BT = 64
 
-    global _FLAG
-    if _FLAG is None:
-        _FLAG = q.new_zeros(1, dtype=torch.int32)
-
     upper_bound_chunks = (N - 1) + triton.cdiv(T - (N - 1), BT)
-    num_chunks = q.new_empty(N, dtype=torch.int32)
     chunk_offsets = q.new_empty(N + 1, dtype=torch.int32)
-    chunk_indices = q.new_zeros((upper_bound_chunks, 2), dtype=torch.int32)
-    compute_chunks_kernel[(N,)](
-        cu_seqlens,
-        num_chunks,
-        chunk_offsets,
-        chunk_indices,
-        _FLAG,
-        N=N,
-        BT=BT,
-        BLOCK_SIZE=triton.next_power_of_2(N),
-    )
+    chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
     total_chunks_ptr = chunk_offsets[N:]
 
+    pad_T = upper_bound_chunks * BT
+
+    # Compute chunk metadata (replaces Triton compute_chunks_kernel, ~140 us savings)
+    mod.prep_meta(cu_seqlens, chunk_indices, chunk_offsets)
+
+    # K@K.T + gating → A, g_cu, beta
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
@@ -409,30 +527,48 @@ def run(
 
     h = k.new_empty(upper_bound_chunks, H, V_dim, K_dim)
     final_state = torch.empty_like(state, dtype=torch.float32)
-    v_new = torch.empty_like(u)
+    v_new = v.new_empty(pad_T, H, V_dim)
 
-    BV = 16
-    grid = (triton.cdiv(V_dim, BV), N * H)
-    chunk_gated_delta_rule_fwd_kernel_h[grid](
-        k,
-        u,
-        w,
-        v_new,
-        g_cu,
-        h,
-        state,
-        final_state,
-        cu_seqlens,
-        chunk_offsets,
-        H=H,
-        Hg=Hg,
-        K_dim=K_dim,
-        V_dim=V_dim,
-        BT=BT,
-        BV=BV,
-        num_warps=4,
-        num_stages=3,
-    )
+    if N <= 2 or (N <= 5 and T >= 512):
+        # triton for small N
+        BV = 16
+        grid = (triton.cdiv(V_dim, BV), N * H)
+        chunk_gated_delta_rule_fwd_kernel_h[grid](
+            k,
+            u,
+            w,
+            v_new,
+            g_cu,
+            h,
+            state,
+            final_state,
+            cu_seqlens,
+            chunk_offsets,
+            H=H,
+            Hg=Hg,
+            K_dim=K_dim,
+            V_dim=V_dim,
+            BT=BT,
+            BV=BV,
+            num_warps=4,
+            num_stages=5,
+        )
+    else:
+        # CUDA C++ for large N
+        profiler = None
+        mod.h_v1(
+            k,
+            u,
+            w,
+            v_new,
+            g_cu,
+            h,
+            state,
+            final_state,
+            cu_seqlens,
+            chunk_offsets,
+            profiler,
+        )
 
     o = torch.empty_like(v)
     BV = 64
@@ -445,6 +581,7 @@ def run(
         o,
         cu_seqlens,
         chunk_indices,
+        chunk_offsets,
         total_chunks_ptr,
         scale=scale,
         H=H,
