@@ -10,7 +10,7 @@
 //       load h from h0(gmem)
 //     else:
 //       wait and load h(tmem) from vk MMA
-//     convert h to BF16, store to tmem (input for wh MMA)
+//     convert h to BF16, store to tmem (input for wh MMA) and gmem (for O kernel)
 //
 //     # CUDA V warp
 //     wait and load v(smem) from TMA
@@ -28,7 +28,6 @@
 //       load h from h0(gmem)
 //     else:
 //       load h(tmem) from vk MMA
-//     convert h to BF16, store to gmem (for O kernel)
 //     compute scaled_h = h * h_scale, store to tmem (acc for vk MMA)
 //
 //     # CUDA V warp
@@ -422,9 +421,7 @@ void h_v1_kernel_cutlass(
 
         if (chunk_id == 0) {
           // load H0 from smem for 1st chunk
-          // natural shape:  [N, H, V_dim, K_dim]
-          // permuted shape: [N, H, K_dim/32, V_dim, 32]
-          // box shape:      [K_dim/32, V_dim, 32] with swizzling
+          // smem layout: [K_dim/32, V_dim, 32] with swizzling
           for (int j = 0; j < 32 / 4; j++) {
             const int col = j ^ (tid_ % 8);
             const int addr = H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16;
@@ -451,7 +448,7 @@ void h_v1_kernel_cutlass(
           sts_b32x4(addr, tmp + j * 4);
         }
       }
-      tcgen05_wait_st();
+      // tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
       mbarrier_arrive(wh_in_mbar_addr + stage_id * 8);
       if (elect_sync()) profiler.stamp(PROCESS_H);
@@ -462,9 +459,7 @@ void h_v1_kernel_cutlass(
 
         if (chunk_id == 0) {
           // load H0 from smem for 1st chunk
-          // natural shape:  [N, H, V_dim, K_dim]
-          // permuted shape: [N*H, K_dim/32, V_dim, 32]
-          // box shape:      [K_dim/32, V_dim, 32] with swizzling
+          // smem layout: [K_dim/32, V_dim, 32] with swizzling
           for (int j = 0; j < 32 / 4; j++) {
             const int col = j ^ (tid_ % 8);
             const int addr = H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16;
@@ -511,9 +506,7 @@ void h_v1_kernel_cutlass(
 
     // store final H to smem
     // this mirrors loading H0 from smem
-    // natural shape:  [N, H, V_dim, K_dim]
-    // permuted shape: [N*H, K_dim/32, V_dim, 32]
-    // box shape:      [K_dim/32, V_dim, 32] with swizzling
+    // smem layout: [K_dim/32, V_dim, 32] with swizzling
     for (int i = 0; i < K_dim / 32; i++) {
       float h_f32[32];
       tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
@@ -607,7 +600,7 @@ void h_v1_kernel_cutlass(
       tcgen05_fence_after_thread_sync();
       if (elect_sync()) profiler.stamp(WAIT_WH_MMA);
 
-      // compute v_new
+      // process v_new
       // total tile:  [V_dim, BT]
       // each warp:   [32, BT]
       // each thread: [1, BT]
