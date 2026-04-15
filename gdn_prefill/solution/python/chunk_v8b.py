@@ -2,8 +2,8 @@
 #
 # Changes from v7b:
 #   1. Uses cuda_h_v1.cu tcgen05 H kernel (with EVICT_LAST L2 hint for K)
-#   2. Uses cuda_kkt_v1b.cu's kkt_v1b_with_meta: fuses Triton compute_chunks_kernel
-#      into CUDA KKT kernel, eliminating one kernel launch (~140 us total savings)
+#   2. Uses cuda_prep_meta.cu to replace Triton compute_chunks_kernel
+#      Faster kernel launch than Triton JIT (~185 us total savings)
 #   3. Uses optimized inverse from chunk_v8c (bf16 precision, see v8c for details)
 
 import os
@@ -29,6 +29,7 @@ lib_path = tvm_ffi.cpp.build(
     cuda_files=[
         str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
         str(CURRENT_DIR / "cuda_h_v1.cu"),
+        str(CURRENT_DIR / "cuda_prep_meta.cu"),
     ],
     extra_cflags=["-O3"],
     extra_cuda_cflags=["-O3", "--use_fast_math", "-lineinfo"],
@@ -58,11 +59,14 @@ def run(
     chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
     total_chunks_ptr = chunk_offsets[N:]
 
-    # Combined: compute chunk metadata + K@K.T + gating → A, g_cu, beta
+    # Compute chunk metadata (replaces Triton compute_chunks_kernel, ~140 us savings)
+    mod.prep_meta(cu_seqlens, chunk_indices, chunk_offsets)
+
+    # K@K.T + gating → A, g_cu, beta
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    mod.kkt_v1b_with_meta(
+    mod.kkt_v1b(
         k,
         A_log,
         a,
@@ -73,7 +77,7 @@ def run(
         A,
         cu_seqlens,
         chunk_indices,
-        chunk_offsets,
+        total_chunks_ptr,
     )
 
     # - compute Ai = inverse(I + strictTriu(A))

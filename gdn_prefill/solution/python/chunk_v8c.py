@@ -29,8 +29,8 @@
 #
 #      This saves ~32 mma.sync calls total (tf32x3 = 3x mma per dot, bf16 = 1x).
 #
-#   3. Fused metadata: kkt_v1b_with_meta replaces Triton compute_chunks_kernel
-#      Eliminates one kernel launch per call (~140 us total savings).
+#   3. CUDA metadata: cuda_prep_meta.cu replaces Triton compute_chunks_kernel
+#      Faster kernel launch than Triton JIT (~185 us total savings).
 #
 #   4. H kernel: num_stages=5 (was 3, better Triton load/compute overlap, ~73 us savings)
 
@@ -52,9 +52,10 @@ os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"
 CURRENT_DIR = Path(__file__).parent
 
 lib_path = tvm_ffi.cpp.build(
-    name="gdn_prefill_cuda_v6c",
+    name="gdn_prefill_cuda_v8c",
     cuda_files=[
         str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
+        str(CURRENT_DIR / "cuda_prep_meta.cu"),
     ],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
@@ -382,10 +383,14 @@ def run(
     chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
     total_chunks_ptr = chunk_offsets[N:]
 
+    # Compute chunk metadata (replaces Triton compute_chunks_kernel, ~140 us savings)
+    mod.prep_meta(cu_seqlens, chunk_indices, chunk_offsets)
+
+    # K@K.T + gating → A, g_cu, beta
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
     A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
-    mod.kkt_v1b_with_meta(
+    mod.kkt_v1b(
         k,
         A_log,
         a,
@@ -396,7 +401,7 @@ def run(
         A,
         cu_seqlens,
         chunk_indices,
-        chunk_offsets,
+        total_chunks_ptr,
     )
 
     u = torch.empty_like(v)
