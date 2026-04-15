@@ -1,6 +1,7 @@
-# chunk_v8c: based on chunk_v6c (Triton H kernel path for low-N workloads)
+# chunk_v8: combine chunk_v6b (Triton H kernel for small N) and
+#           chunk_v7 (CUDA C++ H kernel for large N)
 #
-# Changes from v6c:
+# Summary:
 #
 #   1. Inverse diagonal: 2 Neumann iterations + bf16 correction (was 3 iter + tf32)
 #      Saves 2 bf16 MMA calls (removed 3rd iteration) + 2 tf32→bf16 downgrade.
@@ -11,28 +12,12 @@
 #      step (Newton refinement: R = (I+A)@Ai - I, then Ai = Ai@(I-R)) recovers most
 #      of the missing terms in one step, reducing error from O(||A||^5) to O(||A||^10).
 #
-#      Why bf16 correction works: the correction result gets bf16-rounded before the
-#      W/U computation anyway (the bf16 roundtrip at line ~155). So computing the
-#      correction in tf32 gives extra precision that is immediately discarded.
-#
 #   2. Inverse off-diagonal: all bf16 MMA (was tf32x3, which uses 3x more mma.sync)
-#
-#      Why bf16 works here: v6c did the bf16 roundtrip on ALL blocks AFTER the
-#      off-diagonal computation. This means the off-diagonal results were computed in
-#      tf32x3 precision and then truncated to bf16. We moved the roundtrip on DIAGONAL
-#      blocks to BEFORE the off-diagonal computation (line ~122). Now the off-diagonal
-#      inputs (Ai_11..Ai_44) are already at bf16 precision. Since:
-#        off_diag_result = f(Ai_diag_bf16, A_offdiag)
-#      and the off_diag_result also gets bf16-rounded at the end, using bf16 MMA for
-#      the computation itself produces the same final bf16 values as tf32x3 would —
-#      the extra intermediate precision from tf32x3 was being thrown away.
-#
-#      This saves ~32 mma.sync calls total (tf32x3 = 3x mma per dot, bf16 = 1x).
 #
 #   3. CUDA metadata: cuda_prep_meta.cu replaces Triton compute_chunks_kernel
 #      Faster kernel launch than Triton JIT (~185 us total savings).
 #
-#   4. H kernel: num_stages=5 (was 3, better Triton load/compute overlap, ~73 us savings)
+#   4. Triton H kernel: num_stages=5 (was 3, better Triton load/compute overlap, ~73 us savings)
 
 import os
 from pathlib import Path
@@ -54,8 +39,9 @@ CURRENT_DIR = Path(__file__).parent
 lib_path = tvm_ffi.cpp.build(
     name="gdn_prefill_cuda_v8c",
     cuda_files=[
-        str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
         str(CURRENT_DIR / "cuda_prep_meta.cu"),
+        str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
+        str(CURRENT_DIR / "cuda_h_v1.cu"),
     ],
     extra_cflags=["-O3"],
     extra_cuda_cflags=[
@@ -298,6 +284,115 @@ def merge_16x16_to_64x64_inverse_kernel_v2(
     tl.store(w_ptr + (t3[:, None] * H * K_dim + offs_k[None, :]), w3, mask=m3[:, None])
 
 
+# save v_new in padded layout
+@triton.jit
+def chunk_gated_delta_rule_fwd_kernel_h(
+    k_ptr,
+    v_ptr,
+    w_ptr,
+    v_new_ptr,
+    g_cu_ptr,
+    h_ptr,
+    h0_ptr,
+    ht_ptr,
+    cu_seqlens_ptr,
+    chunk_offsets_ptr,
+    H: tl.constexpr,
+    Hg: tl.constexpr,
+    K_dim: tl.constexpr,
+    V_dim: tl.constexpr,
+    BT: tl.constexpr,
+    BV: tl.constexpr,
+):
+    i_v = tl.program_id(0)
+    i_nh = tl.program_id(1)
+    seq_id = i_nh // H
+    head_id = i_nh % H
+
+    bos = tl.load(cu_seqlens_ptr + seq_id).to(tl.int32)
+    eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
+    seqlen = eos - bos
+    num_chunks = tl.cdiv(seqlen, BT)
+    boh = tl.load(chunk_offsets_ptr + seq_id).to(tl.int32)
+
+    # calculate offset
+    h_ptr += ((boh * H + head_id) * V_dim * K_dim).to(tl.int64)
+    v_ptr += ((bos * H + head_id) * V_dim).to(tl.int64)
+    k_ptr += ((bos * Hg + head_id // (H // Hg)) * K_dim).to(tl.int64)
+    w_ptr += ((bos * H + head_id) * K_dim).to(tl.int64)
+    v_new_ptr += ((boh * BT * H + head_id) * V_dim).to(tl.int64)
+    g_cu_ptr += bos * H + head_id
+
+    stride_v = H * V_dim
+    stride_h = H * V_dim * K_dim
+    stride_k = Hg * K_dim
+    stride_w = H * K_dim
+
+    h0_ptr = h0_ptr + i_nh * V_dim * K_dim
+    ht_ptr = ht_ptr + i_nh * V_dim * K_dim
+
+    offs_v = i_v * BV + tl.arange(0, BV)[:, None]
+    offs_k = tl.arange(0, K_dim)[None, :]
+
+    # load initial state
+    h = tl.load(h0_ptr + (offs_v * K_dim + offs_k)).to(tl.float32)  # [BV, K_dim]
+
+    # main recurrence
+    # NOTE: TMA might not be faster?
+    for chunk_id in range(num_chunks):
+        # save intermediate state for o computation
+        tl.store(h_ptr + (chunk_id * stride_h + offs_v * K_dim + offs_k), h)
+
+        # issue all loads first
+        offs_t = chunk_id * BT + tl.arange(0, BT)[:, None]
+        mask_t = offs_t < seqlen
+        offs_v_block = i_v * BV + tl.arange(0, BV)[None, :]
+
+        w = tl.load(
+            w_ptr + (offs_t * stride_w + offs_k),
+            mask=mask_t,
+            other=0.0,
+        )  # [BT, K_dim]
+
+        v = tl.load(
+            v_ptr + (offs_t * stride_v + offs_v_block),
+            mask=mask_t,
+            other=0.0,
+        )  # [BT, BV]
+
+        k = tl.load(
+            k_ptr + (offs_t * stride_k + offs_k),
+            mask=mask_t,
+            other=0.0,
+        )  # [BT, K_dim]
+
+        last_idx = min((chunk_id + 1) * BT, seqlen) - 1
+        g_cu_last = tl.load(g_cu_ptr + last_idx * H)
+        offs_t_1d = chunk_id * BT + tl.arange(0, BT)
+        g_cu = tl.load(g_cu_ptr + offs_t_1d * H, mask=offs_t_1d < seqlen, other=0.0)
+
+        # computation
+        v_new = v - tl.dot(w, h.to(w.dtype).T)  # [BT, BV]
+
+        # save new value for o computation
+        tl.store(
+            v_new_ptr + (offs_t * stride_v + offs_v_block),
+            v_new,
+            mask=offs_t < seqlen,
+        )
+
+        # apply g
+        mask_t = offs_t_1d < seqlen
+        v_new *= tl.where(mask_t, tl.exp(g_cu_last - g_cu), 0)[:, None]
+        h *= tl.exp(g_cu_last)
+
+        # update state
+        h = tl.dot(v_new.to(k.dtype).T, k, acc=h)
+
+    # epilogue
+    tl.store(ht_ptr + (offs_v * K_dim + offs_k), h)
+
+
 @triton.jit
 def chunk_fwd_kernel_o(
     q_ptr,
@@ -308,6 +403,7 @@ def chunk_fwd_kernel_o(
     o_ptr,
     cu_seqlens_ptr,
     chunk_indices_ptr,
+    chunk_offsets_ptr,
     total_chunks_ptr,
     scale,
     H: tl.constexpr,
@@ -329,9 +425,11 @@ def chunk_fwd_kernel_o(
     eos = tl.load(cu_seqlens_ptr + (seq_id + 1)).to(tl.int32)
     seqlen = eos - bos
 
+    chunk_offset = tl.load(chunk_offsets_ptr + seq_id)
+
     q_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
     k_ptr += (bos * Hg + head_id // (H // Hg)) * K_dim
-    v_ptr += (bos * H + head_id) * V_dim
+    v_ptr += (chunk_offset * BT * H + head_id) * V_dim  # padded layout for V
     o_ptr += (bos * H + head_id) * V_dim
     h_ptr += (global_chunk_id * H + head_id) * V_dim * K_dim
     g_cu_ptr += bos * H + head_id
@@ -383,6 +481,8 @@ def run(
     chunk_indices = q.new_empty((upper_bound_chunks, 2), dtype=torch.int32)
     total_chunks_ptr = chunk_offsets[N:]
 
+    pad_T = upper_bound_chunks * BT
+
     # Compute chunk metadata (replaces Triton compute_chunks_kernel, ~140 us savings)
     mod.prep_meta(cu_seqlens, chunk_indices, chunk_offsets)
 
@@ -427,30 +527,48 @@ def run(
 
     h = k.new_empty(upper_bound_chunks, H, V_dim, K_dim)
     final_state = torch.empty_like(state, dtype=torch.float32)
-    v_new = torch.empty_like(u)
+    v_new = v.new_empty(pad_T, H, V_dim)
 
-    BV = 16
-    grid = (triton.cdiv(V_dim, BV), N * H)
-    chunk_gated_delta_rule_fwd_kernel_h[grid](
-        k,
-        u,
-        w,
-        v_new,
-        g_cu,
-        h,
-        state,
-        final_state,
-        cu_seqlens,
-        chunk_offsets,
-        H=H,
-        Hg=Hg,
-        K_dim=K_dim,
-        V_dim=V_dim,
-        BT=BT,
-        BV=BV,
-        num_warps=4,
-        num_stages=5,
-    )
+    if N <= 2 or (N <= 5 and T >= 512):
+        # triton for small N
+        BV = 16
+        grid = (triton.cdiv(V_dim, BV), N * H)
+        chunk_gated_delta_rule_fwd_kernel_h[grid](
+            k,
+            u,
+            w,
+            v_new,
+            g_cu,
+            h,
+            state,
+            final_state,
+            cu_seqlens,
+            chunk_offsets,
+            H=H,
+            Hg=Hg,
+            K_dim=K_dim,
+            V_dim=V_dim,
+            BT=BT,
+            BV=BV,
+            num_warps=4,
+            num_stages=5,
+        )
+    else:
+        # CUDA C++ for large N
+        profiler = None
+        mod.h_v1(
+            k,
+            u,
+            w,
+            v_new,
+            g_cu,
+            h,
+            state,
+            final_state,
+            cu_seqlens,
+            chunk_offsets,
+            profiler,
+        )
 
     o = torch.empty_like(v)
     BV = 64
@@ -463,6 +581,7 @@ def run(
         o,
         cu_seqlens,
         chunk_indices,
+        chunk_offsets,
         total_chunks_ptr,
         scale=scale,
         H=H,
