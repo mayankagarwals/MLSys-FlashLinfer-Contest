@@ -273,7 +273,7 @@ def run(
     # padded v_new so we can use TMA store for v_new in H kernel
     h = k.new_empty(upper_bound_chunks, H, V_dim, K_dim)
     final_state = torch.empty_like(state, dtype=torch.float32)
-    v_new = q.new_empty(upper_bound_chunks, BT, H, V_dim)
+    v_new = q.new_empty(upper_bound_chunks * BT, H, V_dim)
 
     # uncomment to enable profiling
     profiler = None
