@@ -1,4 +1,6 @@
 # https://github.com/vllm-project/vllm/blob/v0.17.0/vllm/model_executor/layers/fla/ops/chunk.py
+# fuse O kernel with H kernel. generally slower, probably due to lacking load balancing effect
+# in the original O kernel.
 
 import torch
 import triton
