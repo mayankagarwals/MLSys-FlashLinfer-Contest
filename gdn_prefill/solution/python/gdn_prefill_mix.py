@@ -7,8 +7,7 @@ import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .chunk_v8c import run as chunk_v8c
-from .chunk_v8b import run as chunk_v8b
+from .chunk_v8 import run as chunk_v8
 from .cuda_parallel_v4 import run as cuda_v4
 
 
@@ -28,14 +27,8 @@ def run(
     N = cu_seqlens.shape[0] - 1
 
     # chunk_v8 pipeline for T>=525
-    # v8c (Triton H, BV=16) wins for low N — creates 8x more blocks for better SM utilization
-    # v8b (CUDA tcgen05 H) wins for high N — tcgen05 MMA is faster per chunk
     if T >= 525:
-        use_v8c = (N <= 2 and T >= 600) or (N == 3 and T >= 1500) or (N <= 5 and T >= 3000)
-        if use_v8c:
-            return chunk_v8c(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
-        else:
-            return chunk_v8b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+        return chunk_v8(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA v4 for medium workloads
     if T >= 64 or (N == 1 and T >= 46):
