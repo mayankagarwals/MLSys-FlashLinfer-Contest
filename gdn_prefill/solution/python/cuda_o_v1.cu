@@ -42,7 +42,8 @@ Pipeline sketch for `o_v1`
      CUDA materializes ATTN1 from the same QK registers and arrives `attn_ready[1]`.
 
   5. MMA builds QH1 in the aliased [QK | ATTN0] bank.
-     Gate: wait for `qk_tmem_release` before reusing those columns.
+     Gate: wait for `qk_tmem_release` plus head0 QH/OV completion before
+     reusing those columns and SMEM stages.
 
   6. CUDA drains head0 by reading OUT + QH0 into registers.
      On the final TMEM read it arrives `head0_release`, then finishes GMEM stores.
@@ -810,21 +811,29 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
 
         if (warp_elected) {
           if (head_offset == HEAD1_STAGE_INDEX) {
-            // Step 5 gate: head1 QH aliases [QK | ATTN0].
+            // Step 5 gate: head1 QH aliases [QK | ATTN0], so it waits for
+            // the QK read-release plus head0 QH/OV completion before reusing
+            // the aliased TMEM and the head0 SMEM stages.
             mbarrier_wait(qk_tmem_release_barrier, qk_phase);
+            mbarrier_wait(ov_mma_barrier, HEAD0_STAGE_INDEX & 1U);
+            mbarrier_wait(qh_mma_barrier, HEAD0_STAGE_INDEX & 1U);
+            tcgen05_fence_before_thread_sync();
+            mbarrier_arrive(h_reuse_barriers + HEAD0_STAGE_INDEX * 8U);
+            mbarrier_arrive(v_reuse_barriers + HEAD0_STAGE_INDEX * 8U);
           }
           // Step 3 / 5: build QH for this head from q + h.
           mbarrier_wait(h_stage_barrier, qk_phase);
           tcgen05_fence_after_thread_sync();
           mma_swizzled_qh_64x128(qh_stage_tmem, q_stage_smem, h_stage_smem);
           tcgen05_commit(qh_mma_barrier);
-          mbarrier_arrive(h_reuse_barriers + head_offset * 8U);
-          if (head_offset + 1U == HEADS_PER_QK_HEAD) {
-            mbarrier_arrive(qk_reuse_barriers + qk_stage * 8U);
-          }
           mbarrier_wait(v_stage_barrier, qk_phase);
           mbarrier_wait(attn_stage_barrier, qk_phase);
           if (head_offset == HEAD1_STAGE_INDEX) {
+            // Step 5 release: q + h1 are free once QH1 is fully consumed.
+            mbarrier_wait(qh_mma_barrier, HEAD1_STAGE_INDEX & 1U);
+            tcgen05_fence_before_thread_sync();
+            mbarrier_arrive(h_reuse_barriers + HEAD1_STAGE_INDEX * 8U);
+            mbarrier_arrive(qk_reuse_barriers + qk_stage * 8U);
             // Step 6 gate: head1 OUT waits for head0's final TMEM read.
             mbarrier_wait(head0_release_barrier, qk_phase);
           }
@@ -833,9 +842,11 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
           mma_attn_v_tmem_64x128(OUTPUT_TMEM_COL, attn_stage_tmem,
                                  v_stage_smem);
           tcgen05_commit(ov_mma_barrier);
-          mbarrier_arrive(v_reuse_barriers + head_offset * 8U);
           if (head_offset + 1U == HEADS_PER_QK_HEAD) {
+            // Step 7 release: v1 + ATTN1 are free once OV1 is complete.
+            mbarrier_wait(ov_mma_barrier, HEAD1_STAGE_INDEX & 1U);
             tcgen05_fence_before_thread_sync();
+            mbarrier_arrive(v_reuse_barriers + HEAD1_STAGE_INDEX * 8U);
             mbarrier_arrive(attn_tmem_release_barrier);
           }
         }
@@ -912,6 +923,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       }
       if (chunk_iter > 0U) {
         mbarrier_wait(attn_tmem_release_barrier, 1U ^ qk_phase);
+        tcgen05_fence_after_thread_sync();
       }
 
       // Step 3: materialize ATTN0 from the QK registers.
@@ -920,6 +932,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
           qk_reg_lo, qk_reg_hi, g_neg_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T,
           row_base_limit, row_hi_limit, lane_col);
       tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
       if (warp_elected) {
         mbarrier_arrive(attn_ready_barriers + HEAD0_STAGE_INDEX * 8U);
       }
@@ -930,6 +943,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
           qk_reg_lo, qk_reg_hi, g_neg_smem_ptr + HEAD1_STAGE_INDEX * BLOCK_T,
           row_base_limit, row_hi_limit, lane_col);
       tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
       if (warp_elected) {
         mbarrier_arrive(attn_ready_barriers + HEAD1_STAGE_INDEX * 8U);
       }
