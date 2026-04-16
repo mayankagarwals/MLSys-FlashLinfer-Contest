@@ -1,4 +1,4 @@
-# improve CUDA H kernel from v1->v2
+# improve prep_meta kernel from v1->v2
 
 import os
 from pathlib import Path
@@ -18,7 +18,7 @@ CURRENT_DIR = Path(__file__).parent
 lib_path = tvm_ffi.cpp.build(
     name="gdn_prefill_cuda_v8b",
     cuda_files=[
-        str(CURRENT_DIR / "cuda_prep_meta_v1.cu"),
+        str(CURRENT_DIR / "cuda_prep_meta_v2.cu"),
         str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
         str(CURRENT_DIR / "cuda_h_v2.cu"),
     ],
@@ -54,7 +54,7 @@ def run(
     pad_T = upper_bound_chunks * BT
 
     # Compute chunk metadata (replaces Triton compute_chunks_kernel, ~140 us savings)
-    mod.prep_meta_v1(cu_seqlens, chunk_indices, chunk_offsets)
+    mod.prep_meta_v2(cu_seqlens, chunk_indices, chunk_offsets)
 
     # K@K.T + gating → A, g_cu, beta
     g_cu = torch.empty_like(a, dtype=torch.float32)

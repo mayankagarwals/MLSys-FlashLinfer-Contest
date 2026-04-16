@@ -685,7 +685,8 @@ void bar_sync(uint32_t count) {
 
 template <int num>
 __device__ __forceinline__
-void ldmatrix(uint32_t *data, uint32_t addr) {
+void ldmatrix(void *data_, uint32_t addr) {
+  uint32_t *data = reinterpret_cast<uint32_t *>(data_);
   static_assert(num == 1 || num == 2 || num == 4);
   if constexpr (num == 1)
     asm volatile("ldmatrix.sync.aligned.m8n8.x1.shared.b16 {%0}, [%1];"
@@ -703,7 +704,8 @@ void ldmatrix(uint32_t *data, uint32_t addr) {
 
 template <int num>
 __device__ __forceinline__
-void ldmatrix_trans(uint32_t *data, uint32_t addr) {
+void ldmatrix_trans(void *data_, uint32_t addr) {
+  uint32_t *data = reinterpret_cast<uint32_t *>(data_);
   static_assert(num == 1 || num == 2 || num == 4);
   if constexpr (num == 1)
     asm volatile("ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16 {%0}, [%1];"
@@ -721,7 +723,8 @@ void ldmatrix_trans(uint32_t *data, uint32_t addr) {
 
 template <int num>
 __device__ __forceinline__
-void stmatrix(uint32_t addr, uint32_t *data) {
+void stmatrix(uint32_t addr, const void *data_) {
+  const uint32_t *data = reinterpret_cast<const uint32_t *>(data_);
   static_assert(num == 1 || num == 2 || num == 4);
   if constexpr (num == 1)
     asm volatile("stmatrix.sync.aligned.m8n8.x1.shared.b16 [%1], {%0};"
@@ -736,7 +739,8 @@ void stmatrix(uint32_t addr, uint32_t *data) {
 
 template <int num>
 __device__ __forceinline__
-void stmatrix_trans(uint32_t addr, uint32_t *data) {
+void stmatrix_trans(uint32_t addr, const void *data_) {
+  const uint32_t *data = reinterpret_cast<const uint32_t *>(data_);
   static_assert(num == 1 || num == 2 || num == 4);
   if constexpr (num == 1)
     asm volatile("stmatrix.sync.aligned.m8n8.x1.trans.shared.b16 [%1], {%0};"

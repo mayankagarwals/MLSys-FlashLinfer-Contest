@@ -13,7 +13,7 @@
 constexpr int BT = 64;
 
 __global__ void __launch_bounds__(128)
-prep_meta_kernel(
+prep_meta_v1_kernel(
     const int64_t *cu_seqlens,
     int32_t *chunk_indices,   // [max_chunks, 2]
     int32_t *chunk_offsets,   // [N+1]
@@ -48,7 +48,7 @@ prep_meta_kernel(
   }
 }
 
-void prep_meta(
+void prep_meta_v1(
   TensorView cu_seqlens,
   TensorView chunk_indices,
   TensorView chunk_offsets  // [N+1] — last element is total_chunks
@@ -59,8 +59,8 @@ void prep_meta(
   auto *chunk_offsets_ptr = reinterpret_cast<int32_t *>(chunk_offsets.data_ptr());
   auto *total_chunks_ptr  = chunk_offsets_ptr + num_seqs;
 
-  prep_meta_kernel<<<1, 128>>>(
+  prep_meta_v1_kernel<<<1, 128>>>(
     cu_seqlens_ptr, chunk_indices_ptr, chunk_offsets_ptr, total_chunks_ptr, num_seqs);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(prep_meta, prep_meta);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(prep_meta_v1, prep_meta_v1);
