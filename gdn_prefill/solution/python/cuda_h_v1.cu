@@ -448,7 +448,7 @@ void h_v1_kernel_cutlass(
           sts_b32x4(addr, tmp + j * 4);
         }
       }
-      // tcgen05_wait_st();
+      tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
       mbarrier_arrive(wh_in_mbar_addr + stage_id * 8);
       if (elect_sync()) profiler.stamp(PROCESS_H);
