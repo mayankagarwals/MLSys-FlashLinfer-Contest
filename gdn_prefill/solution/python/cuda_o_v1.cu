@@ -8,60 +8,88 @@
 Pipeline sketch for `o_v1`
 
   Participants
-    TMA   : producer warp
-    MMA   : tensor-core warp
-    CUDA  : consumer/store warps
-    SMEM  : q/k + h/v staging
-    TMEM  : qk/attn/qh/out banks
-    BAR   : mbarrier handoff
+    TMA  : producer warp, fills SMEM stages
+    MMA  : single elected thread issues tcgen05.mma / tcgen05.commit
+    CUDA : four consumer warps, materialize ATTN and drain TMEM to GMEM
 
-  TMEM bank map
-    [   0 ..  63] QK
-    [  64 .. 127] ATTN0
-    [ 128 .. 191] ATTN1
-    [ 192 .. 319] OUT  (shared by both heads)
-    [ 320 .. 447] QH0
+  Storage
+    SMEM :
+      - q/k ring: 2 stages
+      - h ring:   1 stage per output head within the qk-head group
+      - v ring:   1 stage per output head within the qk-head group
+    TMEM :
+      [   0 ..  63] QK
+      [  64 .. 127] ATTN0
+      [ 128 .. 191] ATTN1
+      [ 192 .. 319] OUT   (shared by head0 and head1)
+      [ 320 .. 447] QH0
+      head1 QH aliases [QK | ATTN0] = [0 .. 127]
 
-    Head1 QH aliases [QK | ATTN0] = [0 .. 127], but only after:
-      1. CUDA finishes reading QK
-      2. MMA finishes consuming ATTN0
-      3. previous chunk finishes draining head1 output
+  Important aliasing rule
+    The head1 QH build reuses the same TMEM columns that hold QK and ATTN0.
+    That alias is only legal after all of the following are true:
+      1. CUDA has finished reading QK and arrived
+         `qk_tmem_release_barrier`
+      2. MMA has finished head0 QH and head0 OV and both commits have completed
+         (`qh_mma_barrier` and `ov_mma_barrier`)
+      3. The previous chunk has finished draining head1 OUT+QH and arrived
+         `output_tmem_release_barrier`
 
-  Steady-state chunk flow
+  Resource lifetime rule
+    A TMEM buffer is considered free when its last TMEM consumer has finished,
+    not when the later GMEM store finishes. CUDA reads OUT/QH into registers
+    first, then stores to GMEM after the TMEM read-release barrier arrives.
 
-  1. TMA prefetches q/k + h0/v0 + h1/v1 into SMEM.
-     `qk_tma`, `h_tma`, and `v_tma` make those stages visible.
+  Steady-state flow for one chunk
+
+  1. TMA makes the SMEM stages visible.
+     - q/k uses `qk_tma_barriers[qk_stage]`
+     - h uses `h_tma_barrier[head]`
+     - v uses `v_tma_barrier[head]`
 
   2. MMA builds QK in TMEM from q/k.
-     CUDA reads QK to registers and arrives `qk_tmem_release`.
+     - Commit: `mma_barrier`
+     - CUDA waits on `mma_barrier`, reads QK to registers, then arrives
+       `qk_tmem_release_barrier`
 
-  3. MMA builds QH0 from q + h0.
-     CUDA materializes ATTN0 from the QK registers and arrives `attn_ready[0]`.
+  3. CUDA materializes ATTN0 from the QK registers.
+     - ATTN0 becomes visible via `attn_ready_barriers[head0]`
+     - In parallel, MMA builds QH0 from q + h0 and commits `qh_mma_barrier`
 
-  4. MMA consumes ATTN0 + v0 into OUT.
-     CUDA materializes ATTN1 from the same QK registers and arrives `attn_ready[1]`.
+  4. MMA consumes ATTN0 + v0 into the shared OUT bank.
+     - Commit: `ov_mma_barrier`
+     - While that is in flight, CUDA materializes ATTN1 from the same QK regs
+       and arrives `attn_ready_barriers[head1]`
 
-  5. MMA builds QH1 in the aliased [QK | ATTN0] bank.
-     Gate: wait for `qk_tmem_release` plus head0 QH/OV completion before
-     reusing those columns and SMEM stages.
+  5. MMA builds QH1 in the aliased [QK | ATTN0] region.
+     Gate before the alias is reused:
+       - `qk_tmem_release_barrier`
+       - head0 `qh_mma_barrier`
+       - head0 `ov_mma_barrier`
+     Releases caused by this transition:
+       - h0/v0 SMEM stages are returned through `h_reuse_barriers[head0]` and
+         `v_reuse_barriers[head0]`
+       - once QH1 is complete, h1 and the q/k SMEM stage are returned through
+         `h_reuse_barriers[head1]` and `qk_reuse_barriers[qk_stage]`
 
   6. CUDA drains head0 by reading OUT + QH0 into registers.
-     On the final TMEM read it arrives `head0_release`, then finishes GMEM stores.
+     - CUDA waits on head0 `ov_mma_barrier` and `qh_mma_barrier`
+     - On the final TMEM read, CUDA arrives `head0_release_barrier`
+     - Only after that may head1 OV reuse the shared OUT bank
 
   7. MMA consumes ATTN1 + v1 into OUT, then CUDA drains head1 from OUT + QH1.
-     On the final TMEM read it arrives `output_tmem_release`, which frees the
-     head1 alias for the next chunk's QK and ATTN0 rebuild.
+     - MMA waits on `head0_release_barrier` before launching head1 OV
+     - Once head1 OV is complete, v1 is returned through
+       `v_reuse_barriers[head1]`
+     - On the final head1 OUT+QH TMEM read, CUDA arrives
+       `output_tmem_release_barrier`
 
-  Reuse edges
-    `qk_reuse[stage]`   : q/k stage can be refilled
-    `h_reuse[head]`     : h stage for that head can be refilled
-    `v_reuse[head]`     : v stage for that head can be refilled
-
-  High-level intent
-    - Head0 ATTN is materialized first so MMA can start OV0 early.
-    - While head0 OV/store is in flight, CUDA materializes ATTN1 and MMA builds
-      QH1 in aliased TMEM columns.
-    - OUT stays single-banked, so head1 OV still waits for head0 store to drain.
+  Cross-chunk consequence
+    `output_tmem_release_barrier` is the barrier that makes the next chunk safe:
+      - MMA waits on it before rebuilding the next chunk's QK
+      - CUDA waits on it before rebuilding the next chunk's ATTN0
+    This is required because the next chunk's [QK | ATTN0] overlaps the prior
+    chunk's head1 QH alias.
 */
 
 //// Tile Config
@@ -683,7 +711,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       const int32_t first_chunk_start_i32 = static_cast<int32_t>(
           cu_seqlens_ptr[first_seq_id] +
           static_cast<int64_t>(first_chunk_id) * static_cast<int64_t>(BLOCK_T));
-      // Step 1: seed q/k + both h/v stages for the first resident chunk.
+      // Step 1: seed the first resident chunk's q/k stage and both per-head
+      // h/v stages so MMA/CUDA can enter steady state without an initial gap.
       tma_load_qk_stage(q_smem, k_smem, &q_tmap, &k_tmap, first_chunk_start_i32,
                         qk_head_id, qk_head_id, qk_tma_barriers);
       const int32_t first_v_chunk_start_i32 =
@@ -713,7 +742,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
           continue;
         }
 
-        // Step 1: keep the next chunk's q/k + h/v stages prefetched in SMEM.
+        // Step 1 overlap: keep the next chunk resident in SMEM while the
+        // current chunk is consuming TMEM. Each ring slot is refilled only
+        // after the corresponding reuse barrier says the old contents are dead.
         const int2 next_chunk_meta = reinterpret_cast<const int2 *>(
             chunk_indices_ptr)[next_global_chunk_id];
         const uint32_t next_seq_id = static_cast<uint32_t>(next_chunk_meta.x);
@@ -777,7 +808,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       const uint32_t qk_tma_stage_phase = (chunk_iter / QK_STAGE_COUNT) & 1U;
 
       if (chunk_iter > 0U) {
-        // Step 7 gate: wait for the prior chunk to free the head1 alias.
+        // Cross-chunk alias gate: the next chunk's QK rebuild touches cols
+        // [0..63], which still hold the prior chunk's head1 QH alias until the
+        // prior chunk finishes its final OUT+QH TMEM read.
         mbarrier_wait(output_tmem_release_barrier, 1U ^ qk_phase);
       }
 
@@ -805,9 +838,13 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
 
         if (warp_elected) {
           if (head_offset == HEAD1_STAGE_INDEX) {
-            // Step 5 gate: head1 QH aliases [QK | ATTN0], so it waits for
-            // the QK read-release plus head0 QH/OV completion before reusing
-            // the aliased TMEM and the head0 SMEM stages.
+            // Step 5 gate: head1 QH writes into cols [0..127], reusing this
+            // chunk's [QK | ATTN0] region. Wait until:
+            //   1. CUDA has finished reading QK from TMEM
+            //   2. head0 QH build has completed
+            //   3. head0 OV into the shared OUT bank has completed
+            // Only then is it safe to reuse those TMEM columns and return the
+            // head0 h/v SMEM stages to the TMA producer.
             mbarrier_wait(qk_tmem_release_barrier, qk_phase);
             mbarrier_wait(ov_mma_barrier, HEAD0_STAGE_INDEX & 1U);
             mbarrier_wait(qh_mma_barrier, HEAD0_STAGE_INDEX & 1U);
@@ -815,7 +852,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
             mbarrier_arrive(h_reuse_barriers + HEAD0_STAGE_INDEX * 8U);
             mbarrier_arrive(v_reuse_barriers + HEAD0_STAGE_INDEX * 8U);
           }
-          // Step 3 / 5: build QH for this head from q + h.
+          // Step 3 / 5: build this head's QH tile once its h stage is visible.
           mbarrier_wait(h_stage_barrier, qk_phase);
           tcgen05_fence_after_thread_sync();
           mma_swizzled_qh_64x128(qh_stage_tmem, q_stage_smem, h_stage_smem);
@@ -823,21 +860,25 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
           mbarrier_wait(v_stage_barrier, qk_phase);
           mbarrier_wait(attn_stage_barrier, qk_phase);
           if (head_offset == HEAD1_STAGE_INDEX) {
-            // Step 5 release: q + h1 are free once QH1 is fully consumed.
+            // Step 5 release: once the QH1 build itself has completed, the
+            // q-stage input and h1 SMEM input are no longer needed. CUDA will
+            // later read QH1 from TMEM, but it will not touch those SMEM stages.
             mbarrier_wait(qh_mma_barrier, HEAD1_STAGE_INDEX & 1U);
             tcgen05_fence_before_thread_sync();
             mbarrier_arrive(h_reuse_barriers + HEAD1_STAGE_INDEX * 8U);
             mbarrier_arrive(qk_reuse_barriers + qk_stage * 8U);
-            // Step 6 gate: head1 OUT waits for head0's final TMEM read.
+            // Step 6 gate: head0 and head1 share the OUT bank, so head1 OV
+            // cannot start until CUDA has finished the final head0 OUT+QH read.
             mbarrier_wait(head0_release_barrier, qk_phase);
           }
-          // Step 4 / 7: consume ATTN + V into the shared OUT bank.
+          // Step 4 / 7: once both ATTN and V are visible, consume them into the
+          // shared OUT bank for this head.
           tcgen05_fence_after_thread_sync();
           mma_attn_v_tmem_64x128(OUTPUT_TMEM_COL, attn_stage_tmem,
                                  v_stage_smem);
           tcgen05_commit(ov_mma_barrier);
           if (head_offset + 1U == HEADS_PER_QK_HEAD) {
-            // Step 7 release: v1 is free once OV1 is complete.
+            // Step 7 release: after head1 OV completes, no later MMA reuses v1.
             mbarrier_wait(ov_mma_barrier, HEAD1_STAGE_INDEX & 1U);
             tcgen05_fence_before_thread_sync();
             mbarrier_arrive(v_reuse_barriers + HEAD1_STAGE_INDEX * 8U);
@@ -903,7 +944,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       }
       bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
 
-      // Step 2: read QK from TMEM and release the QK bank for head1 aliasing.
+      // Step 2: wait for the QK MMA commit, then read QK from TMEM into CUDA
+      // registers. After this point the QK TMEM columns can be reused by head1
+      // QH, because CUDA no longer needs to touch QK in TMEM.
       mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
       tcgen05_fence_after_thread_sync();
 
@@ -915,14 +958,15 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         mbarrier_arrive(qk_tmem_release_barrier);
       }
       if (chunk_iter > 0U) {
-        // ATTN0 aliases the prior chunk's head1 QH in cols [64..127], so the
-        // next chunk must wait for the final head1 OUT+QH TMEM read-release
-        // before rebuilding either ATTN bank.
+        // Cross-chunk alias gate: cols [64..127] are ATTN0 for this chunk, but
+        // they were head1 QH for the prior chunk. Wait until the prior chunk's
+        // final OUT+QH TMEM read has completed before overwriting that region.
         mbarrier_wait(output_tmem_release_barrier, 1U ^ qk_phase);
         tcgen05_fence_after_thread_sync();
       }
 
-      // Step 3: materialize ATTN0 from the QK registers.
+      // Step 3: materialize ATTN0 from the resident QK registers and publish it
+      // for MMA via `attn_ready_barriers[head0]`.
       materialize_attn_tmem_from_regs(
           ATTN_TMEM_BASE_COL + HEAD0_STAGE_INDEX * ATTN_TMEM_HEAD_STRIDE,
           qk_reg_lo, qk_reg_hi, g_neg_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T,
@@ -933,7 +977,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         mbarrier_arrive(attn_ready_barriers + HEAD0_STAGE_INDEX * 8U);
       }
 
-      // Step 4: materialize ATTN1 while MMA can already advance head0.
+      // Step 4: materialize ATTN1 from the same QK registers while MMA can
+      // already be working on head0.
       materialize_attn_tmem_from_regs(
           ATTN_TMEM_BASE_COL + HEAD1_STAGE_INDEX * ATTN_TMEM_HEAD_STRIDE,
           qk_reg_lo, qk_reg_hi, g_neg_smem_ptr + HEAD1_STAGE_INDEX * BLOCK_T,
@@ -957,7 +1002,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         const float gp_row_hi = gp_head_ptr[row_hi];
         const float alpha = g_alpha_smem_ptr[head_offset];
 
-        // Step 6 / 7: wait for QH + OUT, then drain this head to GMEM.
+        // Step 6 / 7: wait until both QH and OUT are ready for this head, then
+        // drain TMEM to registers and finally store the result to GMEM.
         mbarrier_wait(ov_mma_barrier, head_offset & 1U);
         mbarrier_wait(qh_mma_barrier, head_offset & 1U);
         tcgen05_fence_after_thread_sync();
@@ -983,7 +1029,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
                                       ov_reg_lo, ov_reg_hi, qh_reg_lo,
                                       qh_reg_hi);
             if (fragment_pair + 1U == OUTPUT_FRAGMENT_PAIRS) {
-              // Step 6 / 7 read-release: free TMEM on the final OUT+QH read.
+              // Step 6 / 7 read-release: after the final OUT+QH fragment has
+              // been read into registers, this head's TMEM storage is dead.
+              // The following GMEM stores use only registers.
               tcgen05_fence_before_thread_sync();
               __syncwarp();
               if (warp_elected) {
@@ -1010,7 +1058,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
                                       ov_reg_lo, ov_reg_hi, qh_reg_lo,
                                       qh_reg_hi);
             if (fragment_pair + 1U == OUTPUT_FRAGMENT_PAIRS) {
-              // Step 6 / 7 read-release: free TMEM on the final OUT+QH read.
+              // Step 6 / 7 read-release: after the final OUT+QH fragment has
+              // been read into registers, this head's TMEM storage is dead.
+              // The following GMEM stores use only registers.
               tcgen05_fence_before_thread_sync();
               __syncwarp();
               if (warp_elected) {
