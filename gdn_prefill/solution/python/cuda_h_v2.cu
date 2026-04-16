@@ -1,47 +1,3 @@
-// for chunk_id in range(num_chunks):
-//     # TMA warp
-//     load w, v, k from gmem->smem
-//     w - [BT, K_dim]
-//     v - [BT, V_dim]
-//     k - [BT, K_dim]
-//
-//     # CUDA H warp
-//     if 1st chunk:
-//       load h from h0(gmem)
-//     else:
-//       wait and load h(tmem) from vk MMA
-//     convert h to BF16, store to tmem (input for wh MMA) and gmem (for O kernel)
-//
-//     # CUDA V warp
-//     wait and load v(smem) from TMA
-//     convert v to FP32, store to tmem (acc for wh MMA)
-//
-//     # MMA warp (wh MMA)
-//     wait w(smem) from TMA
-//     wait h(tmem) from CUDA H warp, and v(tmem) from CUDA V warp
-//     issue MMA: v_new.T = v.T - h @ w.T - [V_dim, BT]
-//
-//     # CUDA H warp
-//     load g_cu_last from gmem->rmem
-//     compute h_scale = exp(g_cu_last)
-//     if 1st chunk:
-//       load h from h0(gmem)
-//     else:
-//       load h(tmem) from vk MMA
-//     compute scaled_h = h * h_scale, store to tmem (acc for vk MMA)
-//
-//     # CUDA V warp
-//     load g_cu from gmem->rmem
-//     compute v_scale = exp(g_cu_last - g_cu)
-//     wait and load v_new.T(tmem) from wh MMA
-//     convert v_new to BF16, store to gmem (for O kernel)
-//     compute scaled_v_new = v_new * v_scale, store to tmem (input for vk MMA)
-//
-//     # MMA warp (vk MMA)
-//     wait k(smem) from TMA
-//     wait scaled_h(tmem) from CUDA H warp, and scaled_v_new(tmem) from CUDA V warp
-//     issue MMA: h_new = scaled_h + scaled_v_new.T @ k - [V_dim, K_dim]
-
 #include <cuda_bf16.h>
 #include <cudaTypedefs.h>
 #include <cstdint>
@@ -70,14 +26,6 @@ constexpr int BT = 64;
 constexpr int K_dim = 128;
 constexpr int V_dim = 128;
 
-constexpr uint32_t W_size = BT * K_dim * sizeof(nv_bfloat16);
-constexpr uint32_t V_size = BT * V_dim * sizeof(nv_bfloat16);
-constexpr uint32_t K_size = BT * K_dim * sizeof(nv_bfloat16);
-constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
-
-constexpr uint32_t H_fp32_size = V_dim * K_dim * sizeof(float);
-constexpr uint32_t v_scale_size = BT * sizeof(float);
-
 constexpr int NUM_WARPS = 4 + 4 + 2;
 constexpr int WARP_SIZE = 32;
 constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
@@ -86,6 +34,13 @@ __device__ inline
 void lds_f32x4(float *data, uint32_t addr) {
   asm volatile("ld.shared.v4.f32 {%0, %1, %2, %3}, [%4];"
               : "=f"(data[0]), "=f"(data[1]), "=f"(data[2]), "=f"(data[3])
+              : "r"(addr));
+};
+
+__device__ inline
+void lds_f32x2(float *data, uint32_t addr) {
+  asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];"
+              : "=f"(data[0]), "=f"(data[1])
               : "r"(addr));
 };
 
@@ -162,10 +117,10 @@ struct Profiler {
   }
 };
 
-template <int NUM_STAGES, bool DO_PROFILE>
+template <int BV, int NUM_STAGES, bool DO_PROFILE>
 __global__
 __block_size__((TB_SIZE, 1, 1))
-void h_v1_kernel_cutlass(
+void h_v2_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,      // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,      // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap W_tmap,      // [total_T, H, K_dim]
@@ -183,8 +138,9 @@ void h_v1_kernel_cutlass(
   const int warp_id = warp_uniform(tid / WARP_SIZE);
   const int lane_id = tid % WARP_SIZE;
 
-  const int head_id = blockIdx.x;
-  const int seq_id  = blockIdx.y;
+  const int v_id    = blockIdx.x;
+  const int head_id = blockIdx.y;
+  const int seq_id  = blockIdx.z;
 
   Profiler<DO_PROFILE, NUM_WARPS> profiler;
   profiler.init(profiler_ptr, num_entries);
@@ -195,6 +151,14 @@ void h_v1_kernel_cutlass(
   const int num_chunks = cdiv(seqlen, BT);
 
   // set up smem
+  constexpr uint32_t W_size = BT * K_dim * sizeof(nv_bfloat16);
+  constexpr uint32_t V_size = BT * BV * sizeof(nv_bfloat16);
+  constexpr uint32_t K_size = BT * K_dim * sizeof(nv_bfloat16);
+  constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
+
+  constexpr uint32_t H_fp32_size = BV * K_dim * sizeof(float);
+  constexpr uint32_t v_scale_size = BT * sizeof(float);
+
   extern __shared__ __align__(1024) char smem_ptr[];
   const uint32_t smem = __cvta_generic_to_shared(smem_ptr);
   const uint32_t H0_f32_smem = smem + NUM_STAGES * STAGE_SIZE;
@@ -204,13 +168,13 @@ void h_v1_kernel_cutlass(
   const uint32_t v_scale_smem = V_new_smem + V_size;
   float *v_scale_smem_ptr = reinterpret_cast<float *>(smem_ptr + (v_scale_smem - smem));
 
-  const uint32_t tma_mbar_addr      = v_scale_smem + v_scale_size;
-  const uint32_t wh_in_mbar_addr    = tma_mbar_addr + NUM_STAGES * 8;
-  const uint32_t wh_done_mbar_addr  = wh_in_mbar_addr + NUM_STAGES * 8;
-  const uint32_t vk_in_mbar_addr    = wh_done_mbar_addr + NUM_STAGES * 8;
-  const uint32_t vk_done_mbar_addr  = vk_in_mbar_addr + NUM_STAGES * 8;
+  const uint32_t tma_mbar     = v_scale_smem + v_scale_size;
+  const uint32_t wh_in_mbar   = tma_mbar + NUM_STAGES * 8;
+  const uint32_t wh_done_mbar = wh_in_mbar + NUM_STAGES * 8;
+  const uint32_t vk_in_mbar   = wh_done_mbar + NUM_STAGES * 8;
+  const uint32_t vk_done_mbar = vk_in_mbar + NUM_STAGES * 8;
 
-  const uint32_t h0_mbar_addr = vk_done_mbar_addr + NUM_STAGES * 8;
+  const uint32_t h0_mbar_addr = vk_done_mbar + NUM_STAGES * 8;
   const uint32_t taddr        = h0_mbar_addr + 8;
 
   // set up tmem
@@ -226,11 +190,11 @@ void h_v1_kernel_cutlass(
     // init mbar
     if (elect_sync()) {
       for (int i = 0; i < NUM_STAGES; i++) {
-        mbarrier_init(tma_mbar_addr + i * 8, 1);                // 1 TMA
-        mbarrier_init(wh_in_mbar_addr + i * 8, WARP_SIZE * 8);  // h from H warps and v from V warps
-        mbarrier_init(wh_done_mbar_addr + i * 8, 1);            // 1 MMA
-        mbarrier_init(vk_in_mbar_addr + i * 8, WARP_SIZE * 8);  // scaled_h from H warps and scaled_v from V warps
-        mbarrier_init(vk_done_mbar_addr + i * 8, 1);            // 1 MMA
+        mbarrier_init(tma_mbar + i * 8, 1);                // 1 TMA
+        mbarrier_init(wh_in_mbar + i * 8, WARP_SIZE * 8);  // h from H warps and v from V warps
+        mbarrier_init(wh_done_mbar + i * 8, 1);            // 1 MMA
+        mbarrier_init(vk_in_mbar + i * 8, WARP_SIZE * 8);  // scaled_h from H warps and scaled_v from V warps
+        mbarrier_init(vk_done_mbar + i * 8, 1);            // 1 MMA
       }
       mbarrier_init(h0_mbar_addr, 1);
       fence_mbarrier_init();
@@ -258,7 +222,7 @@ void h_v1_kernel_cutlass(
 
       // natural shape:  [N, H, V_dim, K_dim]
       // permuted shape: [N*H, K_dim/32, V_dim, 32]
-      tma_load_4d(H0_f32_smem, &H0_tmap, 0, 0, 0, seq_id * H + head_id, h0_mbar_addr, EVICT_FIRST);
+      tma_load_4d(H0_f32_smem, &H0_tmap, 0, v_id * BV, 0, seq_id * H + head_id, h0_mbar_addr, EVICT_FIRST);
       mbarrier_arrive_expect_tx(h0_mbar_addr, H_fp32_size);
 
       for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
@@ -267,18 +231,17 @@ void h_v1_kernel_cutlass(
         const uint32_t W_smem = smem + stage_id * STAGE_SIZE;
         const uint32_t V_smem = W_smem + W_size;
         const uint32_t K_smem = V_smem + V_size;
-        const uint32_t mbar_addr = tma_mbar_addr + stage_id * 8;
+        const uint32_t mbar_addr = tma_mbar + stage_id * 8;
   
         // wait MMA warp to release the buffer
-        mbarrier_wait(vk_done_mbar_addr + stage_id * 8, parity);
+        mbarrier_wait(vk_done_mbar + stage_id * 8, parity);
         profiler.stamp(WAIT_MMA);
 
         // issue TMA and arrive
         // natural shape: [T, H, dim]
         // permute shape: [H, dim/64, T, 64]
         tma_load_4d(W_smem, &W_tmap, 0, off_t, 0, head_id, mbar_addr, EVICT_FIRST);
-        tma_load_4d(V_smem, &V_tmap, 0, off_t, 0, head_id, mbar_addr, EVICT_FIRST);
-        // CHANGED: EVICT_LAST keeps K in L2 (shared across H/Hg=2 head groups)
+        tma_load_4d(V_smem, &V_tmap, 0, off_t, v_id * BV / 64, head_id, mbar_addr, EVICT_FIRST);
         tma_load_4d(K_smem, &K_tmap, 0, off_t, 0, k_head_id, mbar_addr, EVICT_LAST);
         mbarrier_arrive_expect_tx(mbar_addr, STAGE_SIZE);
         profiler.stamp(ISSUE_TMA);
@@ -306,37 +269,37 @@ void h_v1_kernel_cutlass(
 
         // wh MMA
         // H in tmem, W in smem. both are K-major
-        // [V_dim, K_dim] x [BT, K_dim] -> [V_dim, BT]
-        constexpr uint32_t wh_idesc = make_tcgen05_idesc(V_dim, BT) | (1U << 13U);  // negate A
+        // [BV, K_dim] x [BT, K_dim] -> [BV, BT]
+        constexpr uint32_t wh_idesc = make_tcgen05_idesc(BV, BT) | (1U << 13U);  // negate A
 
         // 128B swizzling
         constexpr uint64_t w_desc_base = (desc_encode(8 * 128) << 32ULL)  // SBO
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
 
         // wait for TMA
-        mbarrier_wait(tma_mbar_addr + stage_id * 8, parity);
+        mbarrier_wait(tma_mbar + stage_id * 8, parity);
         profiler.stamp(WAIT_TMA);
 
         // wait for h(tmem, input) and v(tmem, acc)
-        mbarrier_wait(wh_in_mbar_addr + stage_id * 8, parity);
+        mbarrier_wait(wh_in_mbar + stage_id * 8, parity);
         profiler.stamp(WAIT_WH_IN);
         tcgen05_fence_after_thread_sync();
 
-        // i selects the [V_dim/BT, 64] tile (increment 32 tmem columns for H, increment by BT x 128B for W)
-        // j selects the [V_dim/BT, 16] tile (increment 8  tmem columns for H, increment by 32B due to swizzling for W)
+        // i selects the [BV/BT, 64] tile (increment 32 tmem columns for H, increment by BT x 128B for W)
+        // j selects the [BV/BT, 16] tile (increment 8  tmem columns for H, increment by 32B due to swizzling for W)
         for (int i = 0; i < K_dim / 64; i++)
           for (int j = 0; j < 64 / 16; j++) {
             const int h_tmem = h_tmem_base + i * 32 + j * 8;
             const uint64_t w_desc = w_desc_base | ((W_smem + i * BT * 128 + j * 32) >> 4);
             tcgen05_mma_tmem(wh_tmem, h_tmem, w_desc, wh_idesc, 1);  // always enable input d
           }
-        tcgen05_commit(wh_done_mbar_addr + stage_id * 8);
+        tcgen05_commit(wh_done_mbar + stage_id * 8);
         profiler.stamp(ISSUE_WH_MMA);
 
         // vk MMA
         // scaled v_new in tmem, K in smem. K is MN-major
-        // [V_dim, BT] x [BT, K_dim] -> [V_dim, K_dim]
-        constexpr uint32_t vk_idesc = make_tcgen05_idesc(V_dim, K_dim) | (1U << 16U);  // transpose B
+        // [BV, BT] x [BT, K_dim] -> [BV, K_dim]
+        constexpr uint32_t vk_idesc = make_tcgen05_idesc(BV, K_dim) | (1U << 16U);  // transpose B
 
         // MN-major, 128B swizzling
         constexpr uint64_t k_desc_base = (desc_encode(BT * 128) << 16ULL)  // LBO
@@ -344,7 +307,7 @@ void h_v1_kernel_cutlass(
                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
 
         // wait for scaled_h(tmem, acc) and scaled_v_new(tmem, input)
-        mbarrier_wait(vk_in_mbar_addr + stage_id * 8, parity);
+        mbarrier_wait(vk_in_mbar + stage_id * 8, parity);
         profiler.stamp(WAIT_VK_IN);
         tcgen05_fence_after_thread_sync();
 
@@ -354,7 +317,7 @@ void h_v1_kernel_cutlass(
           const uint64_t k_desc = k_desc_base | ((K_smem + k * 16 * 128) >> 4);
           tcgen05_mma_tmem(vk_tmem, v_tmem, k_desc, vk_idesc, 1);  // always enable input d
         }
-        tcgen05_commit(vk_done_mbar_addr + stage_id * 8);
+        tcgen05_commit(vk_done_mbar + stage_id * 8);
         profiler.stamp(ISSUE_VK_MMA);
 
         stage_id = (stage_id + 1) % NUM_STAGES;
@@ -397,7 +360,7 @@ void h_v1_kernel_cutlass(
       }
       else {
         if (warp_id_ == 0) {
-          mbarrier_wait(vk_done_mbar_addr + vk_stage_id * 8, vk_parity);
+          mbarrier_wait(vk_done_mbar + vk_stage_id * 8, vk_parity);
           vk_stage_id = (vk_stage_id + 1) % NUM_STAGES;
           if (vk_stage_id == 0)
             vk_parity ^= 1;
@@ -413,71 +376,135 @@ void h_v1_kernel_cutlass(
       }
 
       // convert H to BF16 for wh MMA input and store to gmem for O kernel
-      // collectively, 4 warps represent H[V_dim, K_dim]
-      // each thread processes 1 row
-      for (int i = 0; i < K_dim / 32; i++) {
-        float h_f32[32];
-        uint32_t tmp[16];
+      if constexpr (BV == 128) {
+        // H tmem layout: [BV, K_dim]
+        // per warp:      [32, K_dim]
+        for (int i = 0; i < K_dim / 32; i++) {
+          float h_f32[32];
+          uint32_t tmp[16];
 
-        if (chunk_id == 0) {
-          // load H0 from smem for 1st chunk
-          // smem layout: [K_dim/32, V_dim, 32] with swizzling
-          for (int j = 0; j < 32 / 4; j++) {
-            const int col = j ^ (tid_ % 8);
-            const int addr = H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16;
-            lds_f32x4(h_f32 + j * 4, addr);
+          if (chunk_id == 0) {
+            // load H0 from smem for 1st chunk
+            // smem layout: [K_dim/32, BV, 32] with swizzling
+            // each j iter: [       1, 32,  4]
+            for (int j = 0; j < 32 / 4; j++) {
+              const int col = j ^ (tid_ % 8);
+              lds_f32x4(h_f32 + j * 4, H0_f32_smem + i * BV * 128 + tid_ * 128 + col * 16);
+            }
           }
-        }
-        else {
-          // for subsequent chunks, load from tmem
-          tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
-        }
+          else {
+            // for subsequent chunks, load from tmem
+            tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
+          }
 
-        // pack to BF16
-        for (int j = 0; j < 16; j++)
-          tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
+          // pack to BF16
+          for (int j = 0; j < 16; j++)
+            tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
 
-        // for wh MMA input
-        tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, h_tmem_base + i * 16, tmp);
+          // for wh MMA input
+          tcgen05_st<SHAPE::_32x32b, 16>(warp_id_ * 32, h_tmem_base + i * 16, tmp);
 
-        // for O kernel
-        // H smem layout: [K_dim/64, V_dim, 64]
-        for (int j = 0; j < 32 / 8; j++) {
-          const int col = ((i % 2) * 4 + j) ^ (tid_ % 8);
-          const int addr = H_smem + (i / 2) * V_dim * 128 + tid_ * 128 + col * 16;
-          sts_b32x4(addr, tmp + j * 4);
+          // for O kernel
+          // H smem layout: [K_dim/64, BV, 64]
+          // each j iter:   [       1, 32,  8]
+          for (int j = 0; j < 32 / 8; j++) {
+            const int col = ((i % 2) * 4 + j) ^ (tid_ % 8);
+            sts_b32x4(H_smem + (i / 2) * BV * 128 + tid_ * 128 + col * 16, tmp + j * 4);
+          }
         }
       }
-      // tcgen05_wait_st();
-      tcgen05_fence_before_thread_sync();
-      mbarrier_arrive(wh_in_mbar_addr + stage_id * 8);
-      if (elect_sync()) profiler.stamp(PROCESS_H);
+      if constexpr (BV == 64) {
+        // H tmem layout: [BV, K_dim]
+        // per warp:      [16, K_dim]
+        for (int i = 0; i < K_dim / 32; i++) {
+          float h_f32[16];
+          uint32_t tmp[8];
 
-      // scale H for vk MMA acc
-      for (int i = 0; i < K_dim / 32; i++) {
-        float h_f32[32];
+          if (chunk_id == 0) {
+            // H0 smem layout: [K_dim/32, BV, 32]
+            // each j iter:    [       1, 16,  8]
+            for (int j = 0; j < 32 / 8; j++) {
+              const int row = warp_id_ * 16 + (lane_id / 4);
+              const int col = ((j * 2 + (lane_id % 4) / 2) ^ (lane_id / 4)) * 16 + (lane_id % 2) * 8;
+              lds_f32x2(h_f32 + j * 4 + 0, H0_f32_smem + i * BV * 128 + (row + 0) * 128 + col);  // lower [8, 8]
+              lds_f32x2(h_f32 + j * 4 + 2, H0_f32_smem + i * BV * 128 + (row + 8) * 128 + col);  // upper [8, 8]
+            }
+          }
+          else {
+            tcgen05_ld<SHAPE::_16x256b, 4>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
+          }
 
-        if (chunk_id == 0) {
-          // load H0 from smem for 1st chunk
-          // smem layout: [K_dim/32, V_dim, 32] with swizzling
-          for (int j = 0; j < 32 / 4; j++) {
-            const int col = j ^ (tid_ % 8);
-            const int addr = H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16;
-            lds_f32x4(h_f32 + j * 4, addr);
+          for (int j = 0; j < 8; j++)
+            tmp[j] = fp32x2_to_bf16x2(h_f32[j * 2], h_f32[j * 2 + 1]);
+          tcgen05_st<SHAPE::_16x128b, 4>(warp_id_ * 32, h_tmem_base + i * 16, tmp);
+
+          // for O kernel
+          // H smem layout: [K_dim/64, BV, 64]
+          // each j iter:   [       1, 16, 16]
+          for (int j = 0; j < 32 / 16; j++) {
+            const int row = warp_id_ * 16 + (lane_id % 16);
+            const int col = ((i % 2) * 4 + j * 2 + (lane_id / 16)) ^ (lane_id % 8);
+            stmatrix<4>(H_smem + (i / 2) * BV * 128 + row * 128 + col * 16, tmp + j * 4);
           }
         }
-        else {
-          // for subsequent chunks, load from tmem
-          tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
-        }
-
-        for (int j = 0; j < 32; j++)
-          h_f32[j] *= h_scale;
-        tcgen05_st<SHAPE::_32x32b, 32>(warp_id_ * 32, vk_tmem + i * 32, h_f32);  // for vk MMA
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
-      mbarrier_arrive(vk_in_mbar_addr + stage_id * 8);
+      mbarrier_arrive(wh_in_mbar + stage_id * 8);
+      if (elect_sync()) profiler.stamp(PROCESS_H);
+
+      // scale H for vk MMA acc
+      if constexpr (BV == 128) {
+        for (int i = 0; i < K_dim / 32; i++) {
+          float h_f32[32];
+
+          if (chunk_id == 0) {
+            // load H0 from smem for 1st chunk
+            // natural shape:  [N, H, V_dim, K_dim]
+            // permuted shape: [N*H, K_dim/32, V_dim, 32]
+            // box shape:      [K_dim/32, V_dim, 32] with swizzling
+            for (int j = 0; j < 32 / 4; j++) {
+              const int col = j ^ (tid_ % 8);
+              lds_f32x4(h_f32 + j * 4, H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16);
+            }
+          }
+          else {
+            // for subsequent chunks, load from tmem
+            tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
+          }
+
+          for (int j = 0; j < 32; j++)
+            h_f32[j] *= h_scale;
+          tcgen05_st<SHAPE::_32x32b, 32>(warp_id_ * 32, vk_tmem + i * 32, h_f32);  // for vk MMA
+        }
+      }
+      if constexpr (BV == 64) {
+        for (int i = 0; i < K_dim / 32; i++) {
+          float h_f32[16];
+
+          // TODO: since we don't need packing, we can use ldmatrix here
+          if (chunk_id == 0) {
+            // H0 smem layout: [K_dim/32, BV, 32]
+            // each warp:      [K_dim/32, 16, 32]
+            for (int j = 0; j < 32 / 8; j++) {
+              const int row = warp_id_ * 16 + (lane_id / 4);
+              const int col = ((j * 2 + (lane_id % 4) / 2) ^ (lane_id / 4)) * 16 + (lane_id % 2) * 8;
+              lds_f32x2(h_f32 + j * 4 + 0, H0_f32_smem + i * BV * 128 + (row + 0) * 128 + col);  // lower [8, 8]
+              lds_f32x2(h_f32 + j * 4 + 2, H0_f32_smem + i * BV * 128 + (row + 8) * 128 + col);  // upper [8, 8]
+            }
+          }
+          else {
+            tcgen05_ld<SHAPE::_16x256b, 4>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
+          }
+
+          for (int j = 0; j < 16; j++)
+            h_f32[j] *= h_scale;
+          tcgen05_st<SHAPE::_16x256b, 4>(warp_id_ * 32, vk_tmem + i * 32, h_f32);
+        }
+      }
+      tcgen05_wait_st();
+      tcgen05_fence_before_thread_sync();
+      mbarrier_arrive(vk_in_mbar + stage_id * 8);
       if (elect_sync()) profiler.stamp(PROCESS_SCALED_H);
 
       bar_sync<1>(128);
@@ -485,7 +512,7 @@ void h_v1_kernel_cutlass(
       if (warp_id_ == 3 && elect_sync()) {
         // natural shape:  [total_num_chunks, H, V_dim, K_dim]
         // permuted shape: [total_num_chunks*H, K_dim/64, V_dim, 64]
-        tma_store_4d(&H_tmap, H_smem, 0, 0, 0, (chunk_offset + chunk_id) * H + head_id);
+        tma_store_4d(&H_tmap, H_smem, 0, v_id * BV, 0, (chunk_offset + chunk_id) * H + head_id);
         cp_async_bulk_commit_group();
       }
 
@@ -499,33 +526,53 @@ void h_v1_kernel_cutlass(
     // store final H
     // wait for vk MMA
     if (warp_id_ == 0)
-      mbarrier_wait(vk_done_mbar_addr + vk_stage_id * 8, vk_parity);
+      mbarrier_wait(vk_done_mbar + vk_stage_id * 8, vk_parity);
     bar_sync<1>(128);
     tcgen05_fence_after_thread_sync();
     if (elect_sync()) profiler.stamp(WAIT_VK_MMA);
 
     // store final H to smem
     // this mirrors loading H0 from smem
-    // smem layout: [K_dim/32, V_dim, 32] with swizzling
-    for (int i = 0; i < K_dim / 32; i++) {
-      float h_f32[32];
-      tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
+    if constexpr (BV == 128) {
+      // smem layout: [K_dim/32, BV, 32] with swizzling
+      // per warp:    [K_dim/32, 32, 32]
+      // per i iter:  [       1, 32, 32]
+      // per j iter:  [       1, 32,  4]
+      for (int i = 0; i < K_dim / 32; i++) {
+        uint32_t h_f32[32];
+        tcgen05_ld<SHAPE::_32x32b, 32>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
 
-      for (int j = 0; j < 32 / 4; j++) {
-        const int col = j ^ (tid_ % 8);
-        const int addr = H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16;
-        sts_b32x4(addr, reinterpret_cast<const uint32_t *>(h_f32 + j * 4));
+        for (int j = 0; j < 32 / 4; j++) {
+          const int col = j ^ (tid_ % 8);
+          sts_b32x4(H0_f32_smem + i * BV * 128 + tid_ * 128 + col * 16, h_f32 + j * 4);
+        }
+      }
+    }
+    if constexpr (BV == 64) {
+      // smem layout: [K_dim/32, BV, 32] with swizzling
+      // per warp:    [K_dim/32, 16, 32]
+      // per i iter:  [       1, 16, 32]
+      // per j iter:  [       1, 16,  8]
+      for (int i = 0; i < K_dim / 32; i++) {
+        uint32_t h_f32[16];
+        tcgen05_ld<SHAPE::_16x128b, 8>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
+
+        for (int j = 0; j < 32 / 8; j++) {
+          const int row = warp_id_ * 16 + (lane_id % 16);
+          const int col = (j * 2 + (lane_id / 16)) ^ (lane_id % 8);
+          stmatrix<4>(H0_f32_smem + i * BV * 128 + row * 128 + col * 16, h_f32 + j * 4);
+        }
       }
     }
     bar_sync<1>(128);
 
-    if (warp_id_ == 0) {
-      if (elect_sync()) {
-        tma_store_4d(&HT_tmap, H0_f32_smem, 0, 0, 0, seq_id * H + head_id);
-        cp_async_bulk_commit_group();
-      }
+    if (warp_id_ == 0 && elect_sync()) {
+      // natural shape:  [N, H, V_dim, K_dim]
+      // permuted shape: [N*H, K_dim/64, V_dim, 64]
+      tma_store_4d(&HT_tmap, H0_f32_smem, 0, v_id * BV, 0, seq_id * H + head_id);
+      cp_async_bulk_commit_group();
     }
-    else if (warp_id_ == 1) {
+    if (warp_id_ == 1) {
       tcgen05_dealloc(0, 512);
     }
   }
@@ -544,33 +591,52 @@ void h_v1_kernel_cutlass(
 
       // wait for V
       if (warp_id == 0)
-        mbarrier_wait(tma_mbar_addr + stage_id * 8, parity);
+        mbarrier_wait(tma_mbar + stage_id * 8, parity);
       bar_sync<2>(128);
       if (elect_sync()) profiler.stamp(WAIT_TMA);
 
       // unpack V from BF16->FP32, then store as acc for wh MMA
-      // total tile:  [V_dim, BT]
-      // each warp:   [32, BT]
-      // each thread: [1, BT]
-      for (int i = 0; i < BT / 8; i++) {
-        // V smem layout: [V_dim/64, BT, 64] = [2, BT, 64]
-        // each ldmatrix loads [8, 32] along the last 2 dims
-        uint32_t v_bf16[4];
-        const uint32_t offset = (warp_id / 2) * BT * 128;
-        const uint32_t s_row = i * 8 + (lane_id % 8);
-        const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
-        ldmatrix_trans<4>(v_bf16, V_smem + offset + s_row * 128 + s_col * 16);
+      if constexpr (BV == 128) {
+        // V tmem layotu: [BV, BT]
+        // V smem layout: [BV/64, BT, 64]
+        // each warp:     [    1, BT, 32]
+        // each ldmatrix: [    1,  8, 32]
+        for (int i = 0; i < BT / 8; i++) {
+          uint32_t v_bf16[4];
+          const uint32_t offset = (warp_id / 2) * BT * 128;
+          const uint32_t s_row = i * 8 + (lane_id % 8);
+          const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
+          ldmatrix_trans<4>(v_bf16, V_smem + offset + s_row * 128 + s_col * 16);
 
-        float v_fp32[8];
-        for (int k = 0; k < 4; k++)
-          bf16x2_to_fp32x2(v_fp32 + k * 2, v_bf16[k]);
+          float v_fp32[8];
+          for (int k = 0; k < 4; k++)
+            bf16x2_to_fp32x2(v_fp32 + k * 2, v_bf16[k]);
 
-        tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 +  0, wh_tmem + i * 8, v_fp32 + 0);
-        tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 + 16, wh_tmem + i * 8, v_fp32 + 4);
+          tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 +  0, wh_tmem + i * 8, v_fp32 + 0);
+          tcgen05_st<SHAPE::_16x256b, 1>(warp_id * 32 + 16, wh_tmem + i * 8, v_fp32 + 4);
+        }
+      }
+      if constexpr (BV == 64) {
+        // V tmem layout: [BV, BT]
+        // V smem layout: [BV/64, BT, 64]
+        // each warp:     [    1, BT, 16]
+        // each ldmatrix: [    1, 16, 16]
+        for (int i = 0; i < BT / 16; i++) {
+          uint32_t v_bf16[4];
+          const uint32_t s_row = i * 16 + (lane_id / 16) * 8 + (lane_id % 8);
+          const uint32_t s_col = (warp_id * 2 + ((lane_id / 8) % 2)) ^ (lane_id % 8);
+          ldmatrix_trans<4>(v_bf16, V_smem + s_row * 128 + s_col * 16);
+
+          float v_fp32[8];
+          for (int k = 0; k < 4; k++)
+            bf16x2_to_fp32x2(v_fp32 + k * 2, v_bf16[k]);
+
+          tcgen05_st<SHAPE::_16x256b, 2>(warp_id * 32, wh_tmem + i * 16, v_fp32);
+        }
       }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
-      mbarrier_arrive(wh_in_mbar_addr + stage_id * 8);
+      mbarrier_arrive(wh_in_mbar + stage_id * 8);
       if (elect_sync()) profiler.stamp(PROCESS_V);
 
       // load g_cu and compute scaling for v_new
@@ -589,7 +655,7 @@ void h_v1_kernel_cutlass(
 
       if (warp_id == 2) {
         // wait for wh MMA
-        mbarrier_wait(wh_done_mbar_addr + stage_id * 8, parity);
+        mbarrier_wait(wh_done_mbar + stage_id * 8, parity);
       }
       else if (warp_id == 3) {
         // drain V_new TMA store in the previous iteration
@@ -600,44 +666,81 @@ void h_v1_kernel_cutlass(
       tcgen05_fence_after_thread_sync();
       if (elect_sync()) profiler.stamp(WAIT_WH_MMA);
 
-      // process v_new
-      // total tile:  [V_dim, BT]
-      // each warp:   [32, BT]
-      for (int i = 0; i < BT / 8; i++) {
-        float tmp[8];
-        tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 0, warp_id * 32 +  0, wh_tmem + i * 8);
-        tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 4, warp_id * 32 + 16, wh_tmem + i * 8);
+      // compute v_new
+      if constexpr (BV == 128) {
+        // total tile:  [BV, BT]
+        // each warp:   [32, BT]
+        // each i iter: [32,  8]
+        for (int i = 0; i < BT / 8; i++) {
+          float tmp[8];
+          tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 0, warp_id * 32 +  0, wh_tmem + i * 8);
+          tcgen05_ld<SHAPE::_16x256b, 1>(tmp + 4, warp_id * 32 + 16, wh_tmem + i * 8);
 
-        uint32_t v_tmp[4];
-        float2 v_scale = reinterpret_cast<float2 *>(v_scale_smem_ptr + (i * 8 + (lane_id % 4) * 2))[0];
+          uint32_t v_tmp[4];
+          float2 v_scale = reinterpret_cast<float2 *>(v_scale_smem_ptr + (i * 8 + (lane_id % 4) * 2))[0];
 
-        for (int k = 0; k < 4; k++) {
-          // pack v_new for O kernel
-          v_tmp[k] = fp32x2_to_bf16x2(tmp[k * 2 + 0], tmp[k * 2 + 1]);
+          for (int k = 0; k < 4; k++) {
+            // pack v_new for O kernel
+            v_tmp[k] = fp32x2_to_bf16x2(tmp[k * 2], tmp[k * 2 + 1]);
 
-          // scale v_new for vk MMA
-          reinterpret_cast<uint32_t *>(tmp)[k] = fp32x2_to_bf16x2(tmp[k * 2 + 0] * v_scale.x,
-                                                                  tmp[k * 2 + 1] * v_scale.y);
+            // scale v_new for vk MMA
+            reinterpret_cast<uint32_t *>(tmp)[k] = fp32x2_to_bf16x2(tmp[k * 2 + 0] * v_scale.x,
+                                                                    tmp[k * 2 + 1] * v_scale.y);
+          }
+
+          // store v_new for O kernel to smem
+          // this mirrors ldmatrix for V
+          // V smem layout: [BV/64, BT, 64]
+          // each warp:     [    1, BT, 32]
+          // each stmatrix: [    1,  8, 32]
+          const uint32_t offset = (warp_id / 2) * BT * 128;
+          const uint32_t s_row = i * 8 + (lane_id % 8);
+          const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
+          stmatrix_trans<4>(V_new_smem + offset + s_row * 128 + s_col * 16, v_tmp);
+
+          // store scaled v_new for vk MMA
+          tcgen05_st<SHAPE::_16x128b, 1>(warp_id * 32 +  0, v_tmem_base + i * 4, tmp + 0);
+          tcgen05_st<SHAPE::_16x128b, 1>(warp_id * 32 + 16, v_tmem_base + i * 4, tmp + 2);
         }
-
-        // store v_new for O kernel to smem
-        // this mirrors ldmatrix for V
-        // V smem layout: [V_dim/64, BT, 64]
-        // each warp:     [       1, BT, 32]
-        // each stmatrix: [       1,  8, 32]
-        const uint32_t offset = (warp_id / 2) * BT * 128;
-        const uint32_t s_row = i * 8 + (lane_id % 8);
-        const uint32_t s_col = ((warp_id % 2) * 4 + (lane_id / 8)) ^ (lane_id % 8);
-        stmatrix_trans<4>(V_new_smem + offset + s_row * 128 + s_col * 16, v_tmp);
-
-        // store scaled v_new for vk MMA
-        tcgen05_st<SHAPE::_16x128b, 1>(warp_id * 32 +  0, v_tmem_base + i * 4, tmp + 0);
-        tcgen05_st<SHAPE::_16x128b, 1>(warp_id * 32 + 16, v_tmem_base + i * 4, tmp + 2);
       }
+      if constexpr (BV == 64) {
+        // total tile:  [BV, BT]
+        // each warp:   [16, BT]
+        // each i iter: [16, 16]
+        for (int i = 0; i < BT / 16; i++) {
+          float tmp[8];
+          tcgen05_ld<SHAPE::_16x256b, 2>(tmp, warp_id * 32, wh_tmem + i * 16);
 
+          uint32_t v_tmp[4];
+          float2 v_scale[2];
+          v_scale[0] = reinterpret_cast<float2 *>(v_scale_smem_ptr + (i * 16 + 0 + (lane_id % 4) * 2))[0];  // first 8
+          v_scale[1] = reinterpret_cast<float2 *>(v_scale_smem_ptr + (i * 16 + 8 + (lane_id % 4) * 2))[0];  // next 8
+
+          for (int k = 0; k < 4; k++) {
+            // pack v_new for O kernel
+            v_tmp[k] = fp32x2_to_bf16x2(tmp[k * 2], tmp[k * 2 + 1]);
+
+            // scale v_new for vk MMA
+            reinterpret_cast<uint32_t *>(tmp)[k] = fp32x2_to_bf16x2(tmp[k * 2 + 0] * v_scale[k / 2].x,
+                                                                    tmp[k * 2 + 1] * v_scale[k / 2].y);
+          }
+
+          // store v_new for O kernel to smem
+          // this mirrors ldmatrix for V
+          // V smem layout: [BV/64, BT, 64]
+          // each warp:     [    1, BT, 16]
+          // each stmatrix: [    1, 16, 16]
+          const uint32_t s_row = i * 16 + (lane_id / 16) * 8 + (lane_id % 8);
+          const uint32_t s_col = (warp_id * 2 + ((lane_id / 8) % 2)) ^ (lane_id % 8);
+          stmatrix_trans<4>(V_new_smem + s_row * 128 + s_col * 16, v_tmp);
+
+          // store scaled v_new for vk MMA
+          tcgen05_st<SHAPE::_16x128b, 2>(warp_id * 32, v_tmem_base + i * 8, tmp);
+        }
+      }
       tcgen05_wait_st();
       tcgen05_fence_before_thread_sync();
-      mbarrier_arrive(vk_in_mbar_addr + stage_id * 8);
+      mbarrier_arrive(vk_in_mbar + stage_id * 8);
       if (elect_sync()) profiler.stamp(PROCESS_SCALED_V);
 
       // all warps finish storing scaled v_new to smem
@@ -646,7 +749,7 @@ void h_v1_kernel_cutlass(
       if (warp_id == 3 && elect_sync()) {
         // natural shape:  [total_num_chunks*BT, H, V_dim]
         // permuted shape: [H, V_dim/64, total_num_chunks*BT, 64]
-        tma_store_4d(&V_new_tmap, V_new_smem, 0, (chunk_offset + chunk_id) * BT, 0, head_id);
+        tma_store_4d(&V_new_tmap, V_new_smem, 0, (chunk_offset + chunk_id) * BT, v_id * BV / 64, head_id);
         cp_async_bulk_commit_group();
       }
 
@@ -659,7 +762,7 @@ void h_v1_kernel_cutlass(
 }
 
 static
-CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
+CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim, uint32_t block_dim) {
   CUtensorMap tmap;
 
   // natural shape:  [T, H, dim]
@@ -669,7 +772,7 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
   uint64_t globalStrides[rank - 1] = {H * dim * sizeof(nv_bfloat16),
                                                                 128,
                                           dim * sizeof(nv_bfloat16)};  // in bytes
-  uint32_t boxDim[rank] = {64, BT, dim / 64, 1};
+  uint32_t boxDim[rank] = {64, BT, block_dim / 64, 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
   cuTensorMapEncodeTiled(
@@ -683,7 +786,7 @@ CUtensorMap encode_tma(void *ptr, uint64_t T, uint64_t H, uint64_t dim) {
 }
 
 static
-CUtensorMap encode_h_tma(void *ptr, uint64_t N, CUtensorMapDataType dtype) {
+CUtensorMap encode_h_tma(void *ptr, uint64_t N, uint32_t BV, CUtensorMapDataType dtype) {
   CUtensorMap tmap;
 
   int elem_width = 0;
@@ -700,7 +803,7 @@ CUtensorMap encode_h_tma(void *ptr, uint64_t N, CUtensorMapDataType dtype) {
   uint64_t globalStrides[rank - 1] = {        K_dim * elem_width,
                                                              128,
                                       V_dim * K_dim * elem_width};  // in bytes
-  uint32_t boxDim[rank] = {num_elems, V_dim, K_dim / num_elems, 1};
+  uint32_t boxDim[rank] = {num_elems, BV, K_dim / num_elems, 1};
   uint32_t elementStrides[rank] = {1, 1, 1, 1};
 
   cuTensorMapEncodeTiled(
@@ -713,7 +816,7 @@ CUtensorMap encode_h_tma(void *ptr, uint64_t N, CUtensorMapDataType dtype) {
   return tmap;
 }
 
-void h_v1(
+void h_v2(
   TensorView K,
   TensorView V,
   TensorView W,
@@ -729,18 +832,29 @@ void h_v1(
   const int T = K.size(0);
   const int N = h0.size(0);
 
-  auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim);
-  auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim);
-  auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim);
-  auto V_new_tmap = encode_tma(V_new.data_ptr(), V_new.size(0), H, V_dim);  // padded layout
-  auto H0_tmap    = encode_h_tma(h0.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
-  auto HT_tmap    = encode_h_tma(ht.data_ptr(), N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
-  auto H_tmap     = encode_h_tma(h.data_ptr(), h.size(0), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
+  const int BV = 64;
+
+  auto K_tmap     = encode_tma(K.data_ptr(), T, Hg, K_dim, K_dim);
+  auto V_tmap     = encode_tma(V.data_ptr(), T, H, V_dim, BV);
+  auto W_tmap     = encode_tma(W.data_ptr(), T, H, K_dim, K_dim);
+  auto V_new_tmap = encode_tma(V_new.data_ptr(), V_new.size(0), H, V_dim, BV);  // padded layout
+  auto H0_tmap    = encode_h_tma(h0.data_ptr(), N, BV, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
+  auto HT_tmap    = encode_h_tma(ht.data_ptr(), N, BV, CU_TENSOR_MAP_DATA_TYPE_FLOAT32);
+  auto H_tmap     = encode_h_tma(h.data_ptr(), h.size(0), BV, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16);
 
   auto *V_new_ptr         = reinterpret_cast<nv_bfloat16 *>(V_new.data_ptr());
   auto *g_cu_ptr          = reinterpret_cast<const float *>(g_cu.data_ptr());
   auto *cu_seqlens_ptr    = reinterpret_cast<int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_offsets_ptr = reinterpret_cast<int32_t *>(chunk_offsets.data_ptr());
+
+  // compute smem requirements
+  constexpr uint32_t W_size = BT * K_dim * sizeof(nv_bfloat16);
+  constexpr uint32_t V_size = BT * BV * sizeof(nv_bfloat16);
+  constexpr uint32_t K_size = BT * K_dim * sizeof(nv_bfloat16);
+  constexpr uint32_t STAGE_SIZE = W_size + V_size + K_size;
+
+  constexpr uint32_t H_fp32_size = BV * K_dim * sizeof(float);
+  constexpr uint32_t v_scale_size = BT * sizeof(float);
 
   // deeper pipeline is slower?
   constexpr int NUM_STAGES = 2;
@@ -753,25 +867,25 @@ void h_v1(
                           + 8                   // h0
                           + 4;                  // tmem addr
 
+  dim3 grid(V_dim / BV, H, N);
+
   if (profiler.has_value()) {
     const int num_entries = (profiler.value().size(2) - 1) / 2;
     auto *profiler_ptr = reinterpret_cast<int64_t *>(profiler.value().data_ptr());
 
-    auto kernel = h_v1_kernel_cutlass<NUM_STAGES, true>;
+    auto kernel = h_v2_kernel_cutlass<BV, NUM_STAGES, true>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    dim3 grid(H, N);
     kernel<<<grid, TB_SIZE, smem_size>>>(
       K_tmap, V_tmap, W_tmap, H0_tmap, HT_tmap, H_tmap, V_new_tmap,
       g_cu_ptr, cu_seqlens_ptr, chunk_offsets_ptr, profiler_ptr, num_entries);
   }
   else {
-    auto kernel = h_v1_kernel_cutlass<NUM_STAGES, false>;
+    auto kernel = h_v2_kernel_cutlass<BV, NUM_STAGES, false>;
     cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-    dim3 grid(H, N);
     kernel<<<grid, TB_SIZE, smem_size>>>(
       K_tmap, V_tmap, W_tmap, H0_tmap, HT_tmap, H_tmap, V_new_tmap,
       g_cu_ptr, cu_seqlens_ptr, chunk_offsets_ptr, nullptr, 0);
   }
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(h_v1, h_v1);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(h_v2, h_v2);
