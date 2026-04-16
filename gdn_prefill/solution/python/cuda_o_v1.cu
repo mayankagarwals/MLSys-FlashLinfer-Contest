@@ -50,13 +50,12 @@ Pipeline sketch for `o_v1`
 
   7. MMA consumes ATTN1 + v1 into OUT, then CUDA drains head1 from OUT + QH1.
      On the final TMEM read it arrives `output_tmem_release`, which frees the
-     alias for the next chunk's QK.
+     head1 alias for the next chunk's QK and ATTN0 rebuild.
 
   Reuse edges
     `qk_reuse[stage]`   : q/k stage can be refilled
     `h_reuse[head]`     : h stage for that head can be refilled
     `v_reuse[head]`     : v stage for that head can be refilled
-    `attn_tmem_release` : CUDA may rebuild the ATTN banks for the next chunk
 
   High-level intent
     - Head0 ATTN is materialized first so MMA can start OV0 early.
@@ -175,9 +174,7 @@ constexpr uint32_t OFFSET_OV_MMA_BAR = OFFSET_QH_MMA_BAR + 8U;
 constexpr uint32_t OFFSET_QK_TMEM_RELEASE_BAR = OFFSET_OV_MMA_BAR + 8U;
 constexpr uint32_t OFFSET_OUTPUT_TMEM_RELEASE_BAR =
     OFFSET_QK_TMEM_RELEASE_BAR + 8U;
-constexpr uint32_t OFFSET_ATTN_TMEM_RELEASE_BAR =
-    OFFSET_OUTPUT_TMEM_RELEASE_BAR + 8U;
-constexpr uint32_t OFFSET_TMEM_ADDR = OFFSET_ATTN_TMEM_RELEASE_BAR + 8U;
+constexpr uint32_t OFFSET_TMEM_ADDR = OFFSET_OUTPUT_TMEM_RELEASE_BAR + 8U;
 constexpr uint32_t SMEM_SIZE = (OFFSET_TMEM_ADDR + 4U + 1023U) & ~1023U;
 
 //// Tensor Memory
@@ -612,8 +609,6 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
   const uint32_t qk_tmem_release_barrier = smem + OFFSET_QK_TMEM_RELEASE_BAR;
   const uint32_t output_tmem_release_barrier =
       smem + OFFSET_OUTPUT_TMEM_RELEASE_BAR;
-  const uint32_t attn_tmem_release_barrier =
-      smem + OFFSET_ATTN_TMEM_RELEASE_BAR;
   const uint32_t tmem_alloc_smem = smem + OFFSET_TMEM_ADDR;
 
   float *g_raw_smem_ptr =
@@ -653,7 +648,6 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       mbarrier_init(ov_mma_barrier, 1);
       mbarrier_init(qk_tmem_release_barrier, NUM_CUDA_WARPS);
       mbarrier_init(output_tmem_release_barrier, NUM_CUDA_WARPS);
-      mbarrier_init(attn_tmem_release_barrier, 1);
       prefetch_tensormap(&q_tmap);
       prefetch_tensormap(&k_tmap);
       prefetch_tensormap(&v_tmap);
@@ -843,11 +837,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
                                  v_stage_smem);
           tcgen05_commit(ov_mma_barrier);
           if (head_offset + 1U == HEADS_PER_QK_HEAD) {
-            // Step 7 release: v1 + ATTN1 are free once OV1 is complete.
+            // Step 7 release: v1 is free once OV1 is complete.
             mbarrier_wait(ov_mma_barrier, HEAD1_STAGE_INDEX & 1U);
             tcgen05_fence_before_thread_sync();
             mbarrier_arrive(v_reuse_barriers + HEAD1_STAGE_INDEX * 8U);
-            mbarrier_arrive(attn_tmem_release_barrier);
           }
         }
       }
@@ -922,7 +915,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         mbarrier_arrive(qk_tmem_release_barrier);
       }
       if (chunk_iter > 0U) {
-        mbarrier_wait(attn_tmem_release_barrier, 1U ^ qk_phase);
+        // ATTN0 aliases the prior chunk's head1 QH in cols [64..127], so the
+        // next chunk must wait for the final head1 OUT+QH TMEM read-release
+        // before rebuilding either ATTN bank.
+        mbarrier_wait(output_tmem_release_barrier, 1U ^ qk_phase);
         tcgen05_fence_after_thread_sync();
       }
 
