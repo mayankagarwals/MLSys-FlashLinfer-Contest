@@ -29,39 +29,33 @@ Pipeline sketch for `o_v1`
 
   Steady-state chunk flow
 
-      TMA / SMEM                BAR / TMEM                 MMA / CUDA
-      ------------------------  ------------------------
-------------------------
-  1.  load q/k, h0/v0, h1/v1 -> qk_tma, h_tma, v_tma   -> stages become visible
+  1. TMA prefetches q/k + h0/v0 + h1/v1 into SMEM.
+     `qk_tma`, `h_tma`, and `v_tma` make those stages visible.
 
-  2.                                                  -> MMA: q*k -> QK
-                              <- mma_barrier            CUDA: ld QK -> regs
-                              <- qk_tmem_release        CUDA done with QK cols
+  2. MMA builds QK in TMEM from q/k.
+     CUDA reads QK to registers and arrives `qk_tmem_release`.
 
-  3.                                                  -> MMA: q*h0 -> QH0
-                              <- attn_ready[0]          CUDA: regs -> ATTN0
+  3. MMA builds QH0 from q + h0.
+     CUDA materializes ATTN0 from the QK registers and arrives `attn_ready[0]`.
 
-  4.                                                  -> MMA: ATTN0 * v0 -> OUT
-                                                        CUDA: regs -> ATTN1
-                              <- attn_ready[1]          signal head1 attn ready
+  4. MMA consumes ATTN0 + v0 into OUT.
+     CUDA materializes ATTN1 from the same QK registers and arrives `attn_ready[1]`.
 
-  5.                              alias [QK|ATTN0]    -> MMA: q*h1 -> QH1
-                                  after qk_release
+  5. MMA builds QH1 in the aliased [QK | ATTN0] bank.
+     Gate: wait for `qk_tmem_release` before reusing those columns.
 
-  6.                                                  -> CUDA: ld QH0 + OUT
-                                                        CUDA: store head0 rows
-                              <- head0_release          OUT bank free for head1
+  6. CUDA drains head0 by reading OUT + QH0 into registers.
+     On the final TMEM read it arrives `head0_release`, then finishes GMEM stores.
 
-  7.                                                  -> MMA: ATTN1 * v1 -> OUT
-                                                        CUDA: ld QH1 + OUT
-                                                        CUDA: store head1 rows
-                              <- output_tmem_release    chunk fully drained
+  7. MMA consumes ATTN1 + v1 into OUT, then CUDA drains head1 from OUT + QH1.
+     On the final TMEM read it arrives `output_tmem_release`, which frees the
+     alias for the next chunk's QK.
 
-  8.  next chunk may reuse SMEM/TMEM slots after:
-        qk_reuse[stage]      : q/k stage can be refilled
-        h_reuse[head]        : h stage for that head can be refilled
-        v_reuse[head]        : v stage for that head can be refilled
-        attn_tmem_release    : CUDA may rebuild ATTN banks for the next chunk
+  Reuse edges
+    `qk_reuse[stage]`   : q/k stage can be refilled
+    `h_reuse[head]`     : h stage for that head can be refilled
+    `v_reuse[head]`     : v stage for that head can be refilled
+    `attn_tmem_release` : CUDA may rebuild the ATTN banks for the next chunk
 
   High-level intent
     - Head0 ATTN is materialized first so MMA can start OV0 early.
@@ -107,6 +101,7 @@ constexpr uint32_t ROW_PAIR_OUTPUT_STRIDE =
 constexpr uint32_t LANES_PER_ROW_GROUP = 4U;
 constexpr uint32_t FRAGMENT_STEPS = 8U;
 constexpr uint32_t FRAGMENT_PAIRS = FRAGMENT_STEPS / 2U;
+constexpr uint32_t OUTPUT_FRAGMENT_PAIRS = BLOCK_V / BLOCK_T;
 
 //// Swizzle 128B, 1024 bit width atom
 constexpr uint32_t TILE_ATOM = 8U;
@@ -484,55 +479,43 @@ load_output_fragment_pair(uint32_t output_tmem_col, uint32_t qh_tmem_col,
 }
 
 template <bool FULL_CHUNK>
-__device__ __forceinline__ void
-store_output_row_pair(nv_bfloat16 *row_base_o_ptr, nv_bfloat16 *row_hi_o_ptr,
-                      uint32_t output_tmem_col, uint32_t qh_tmem_col,
-                      uint32_t lane_col, uint32_t row_base_active,
-                      uint32_t row_hi_active, float gp_row_base,
-                      float gp_row_hi, float alpha, float scale) {
+__device__ __forceinline__ void store_output_fragment_pair(
+    nv_bfloat16 *row_base_o_ptr, nv_bfloat16 *row_hi_o_ptr, uint32_t col_base,
+    uint32_t lane_col, uint32_t row_base_active, uint32_t row_hi_active,
+    const float *ov_reg_lo, const float *ov_reg_hi, const float *qh_reg_lo,
+    const float *qh_reg_hi, float gp_row_base, float gp_row_hi, float alpha,
+    float scale) {
 #pragma unroll
-  for (uint32_t fragment_pair = 0; fragment_pair < BLOCK_V / BLOCK_T;
-       ++fragment_pair) {
-    const uint32_t col_base = fragment_pair * BLOCK_T;
-    float ov_reg_lo[REGS_PER_FRAGMENT];
-    float ov_reg_hi[REGS_PER_FRAGMENT];
-    float qh_reg_lo[REGS_PER_FRAGMENT];
-    float qh_reg_hi[REGS_PER_FRAGMENT];
-    load_output_fragment_pair(output_tmem_col, qh_tmem_col, col_base, ov_reg_lo,
-                              ov_reg_hi, qh_reg_lo, qh_reg_hi);
+  for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
+    const uint32_t col_lo = col_base + step_pair * 8U + 2U * lane_col;
+    const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
+    const uint32_t reg_row0 = step_pair * 4U;
+    const uint32_t reg_row1 = reg_row0 + 2U;
+    const __nv_bfloat162 row_base_lo = combine_output_pair(
+        ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U], qh_reg_lo[reg_row0],
+        qh_reg_lo[reg_row0 + 1U], gp_row_base, alpha, scale);
+    const __nv_bfloat162 row_base_hi = combine_output_pair(
+        ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U], qh_reg_hi[reg_row0],
+        qh_reg_hi[reg_row0 + 1U], gp_row_base, alpha, scale);
+    const __nv_bfloat162 row_hi_lo = combine_output_pair(
+        ov_reg_lo[reg_row1], ov_reg_lo[reg_row1 + 1U], qh_reg_lo[reg_row1],
+        qh_reg_lo[reg_row1 + 1U], gp_row_hi, alpha, scale);
+    const __nv_bfloat162 row_hi_hi = combine_output_pair(
+        ov_reg_hi[reg_row1], ov_reg_hi[reg_row1 + 1U], qh_reg_hi[reg_row1],
+        qh_reg_hi[reg_row1 + 1U], gp_row_hi, alpha, scale);
 
-#pragma unroll
-    for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
-      const uint32_t col_lo = col_base + step_pair * 8U + 2U * lane_col;
-      const uint32_t col_hi = col_lo + COLS_PER_FRAGMENT;
-      const uint32_t reg_row0 = step_pair * 4U;
-      const uint32_t reg_row1 = reg_row0 + 2U;
-      const __nv_bfloat162 row_base_lo = combine_output_pair(
-          ov_reg_lo[reg_row0], ov_reg_lo[reg_row0 + 1U], qh_reg_lo[reg_row0],
-          qh_reg_lo[reg_row0 + 1U], gp_row_base, alpha, scale);
-      const __nv_bfloat162 row_base_hi = combine_output_pair(
-          ov_reg_hi[reg_row0], ov_reg_hi[reg_row0 + 1U], qh_reg_hi[reg_row0],
-          qh_reg_hi[reg_row0 + 1U], gp_row_base, alpha, scale);
-      const __nv_bfloat162 row_hi_lo = combine_output_pair(
-          ov_reg_lo[reg_row1], ov_reg_lo[reg_row1 + 1U], qh_reg_lo[reg_row1],
-          qh_reg_lo[reg_row1 + 1U], gp_row_hi, alpha, scale);
-      const __nv_bfloat162 row_hi_hi = combine_output_pair(
-          ov_reg_hi[reg_row1], ov_reg_hi[reg_row1 + 1U], qh_reg_hi[reg_row1],
-          qh_reg_hi[reg_row1 + 1U], gp_row_hi, alpha, scale);
-
-      if constexpr (FULL_CHUNK) {
-        store_bf162_no_allocate(row_base_o_ptr + col_lo, row_base_lo);
-        store_bf162_no_allocate(row_base_o_ptr + col_hi, row_base_hi);
-        store_bf162_no_allocate(row_hi_o_ptr + col_lo, row_hi_lo);
-        store_bf162_no_allocate(row_hi_o_ptr + col_hi, row_hi_hi);
-      } else {
-        store_bf162_pair_no_allocate_if(row_base_o_ptr + col_lo, row_base_lo,
-                                        row_base_o_ptr + col_hi, row_base_hi,
-                                        row_base_active);
-        store_bf162_pair_no_allocate_if(row_hi_o_ptr + col_lo, row_hi_lo,
-                                        row_hi_o_ptr + col_hi, row_hi_hi,
-                                        row_hi_active);
-      }
+    if constexpr (FULL_CHUNK) {
+      store_bf162_no_allocate(row_base_o_ptr + col_lo, row_base_lo);
+      store_bf162_no_allocate(row_base_o_ptr + col_hi, row_base_hi);
+      store_bf162_no_allocate(row_hi_o_ptr + col_lo, row_hi_lo);
+      store_bf162_no_allocate(row_hi_o_ptr + col_hi, row_hi_hi);
+    } else {
+      store_bf162_pair_no_allocate_if(row_base_o_ptr + col_lo, row_base_lo,
+                                      row_base_o_ptr + col_hi, row_base_hi,
+                                      row_base_active);
+      store_bf162_pair_no_allocate_if(row_hi_o_ptr + col_lo, row_hi_lo,
+                                      row_hi_o_ptr + col_hi, row_hi_hi,
+                                      row_hi_active);
     }
   }
 }
@@ -705,6 +688,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       const int32_t first_chunk_start_i32 = static_cast<int32_t>(
           cu_seqlens_ptr[first_seq_id] +
           static_cast<int64_t>(first_chunk_id) * static_cast<int64_t>(BLOCK_T));
+      // Step 1: seed q/k + both h/v stages for the first resident chunk.
       tma_load_qk_stage(q_smem, k_smem, &q_tmap, &k_tmap, first_chunk_start_i32,
                         qk_head_id, qk_head_id, qk_tma_barriers);
       const int32_t first_v_chunk_start_i32 =
@@ -734,6 +718,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
           continue;
         }
 
+        // Step 1: keep the next chunk's q/k + h/v stages prefetched in SMEM.
         const int2 next_chunk_meta = reinterpret_cast<const int2 *>(
             chunk_indices_ptr)[next_global_chunk_id];
         const uint32_t next_seq_id = static_cast<uint32_t>(next_chunk_meta.x);
@@ -797,11 +782,12 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       const uint32_t qk_tma_stage_phase = (chunk_iter / QK_STAGE_COUNT) & 1U;
 
       if (chunk_iter > 0U) {
+        // Step 7 gate: wait for the prior chunk to free the head1 alias.
         mbarrier_wait(output_tmem_release_barrier, 1U ^ qk_phase);
-        mbarrier_wait(qk_tmem_release_barrier, 1U ^ qk_phase);
       }
 
       if (warp_elected) {
+        // Step 2: build QK in TMEM once the q/k stage is visible.
         mbarrier_wait(qk_tma_barrier, qk_tma_stage_phase);
         tcgen05_fence_after_thread_sync();
         mma_swizzled<NUM_SWIZZLE_ATOMS>(QK_TMEM_COL, q_stage_smem,
@@ -824,8 +810,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
 
         if (warp_elected) {
           if (head_offset == HEAD1_STAGE_INDEX) {
+            // Step 5 gate: head1 QH aliases [QK | ATTN0].
             mbarrier_wait(qk_tmem_release_barrier, qk_phase);
           }
+          // Step 3 / 5: build QH for this head from q + h.
           mbarrier_wait(h_stage_barrier, qk_phase);
           tcgen05_fence_after_thread_sync();
           mma_swizzled_qh_64x128(qh_stage_tmem, q_stage_smem, h_stage_smem);
@@ -837,8 +825,10 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
           mbarrier_wait(v_stage_barrier, qk_phase);
           mbarrier_wait(attn_stage_barrier, qk_phase);
           if (head_offset == HEAD1_STAGE_INDEX) {
+            // Step 6 gate: head1 OUT waits for head0's final TMEM read.
             mbarrier_wait(head0_release_barrier, qk_phase);
           }
+          // Step 4 / 7: consume ATTN + V into the shared OUT bank.
           tcgen05_fence_after_thread_sync();
           mma_attn_v_tmem_64x128(OUTPUT_TMEM_COL, attn_stage_tmem,
                                  v_stage_smem);
@@ -909,6 +899,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       }
       bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
 
+      // Step 2: read QK from TMEM and release the QK bank for head1 aliasing.
       mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
       tcgen05_fence_after_thread_sync();
 
@@ -923,6 +914,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         mbarrier_wait(attn_tmem_release_barrier, 1U ^ qk_phase);
       }
 
+      // Step 3: materialize ATTN0 from the QK registers.
       materialize_attn_tmem_from_regs(
           ATTN_TMEM_BASE_COL + HEAD0_STAGE_INDEX * ATTN_TMEM_HEAD_STRIDE,
           qk_reg_lo, qk_reg_hi, g_neg_smem_ptr + HEAD0_STAGE_INDEX * BLOCK_T,
@@ -932,6 +924,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         mbarrier_arrive(attn_ready_barriers + HEAD0_STAGE_INDEX * 8U);
       }
 
+      // Step 4: materialize ATTN1 while MMA can already advance head0.
       materialize_attn_tmem_from_regs(
           ATTN_TMEM_BASE_COL + HEAD1_STAGE_INDEX * ATTN_TMEM_HEAD_STRIDE,
           qk_reg_lo, qk_reg_hi, g_neg_smem_ptr + HEAD1_STAGE_INDEX * BLOCK_T,
@@ -946,11 +939,15 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
            ++head_offset) {
         const uint32_t head_id = head_id_base + head_offset;
         const uint32_t qh_stage_tmem = qh_tmem_col_for_head(head_offset);
+        const uint32_t read_release_barrier =
+            head_offset + 1U < HEADS_PER_QK_HEAD ? head0_release_barrier
+                                                 : output_tmem_release_barrier;
         const float *gp_head_ptr = g_pos_smem_ptr + head_offset * BLOCK_T;
         const float gp_row_base = gp_head_ptr[row_base];
         const float gp_row_hi = gp_head_ptr[row_hi];
         const float alpha = g_alpha_smem_ptr[head_offset];
 
+        // Step 6 / 7: wait for QH + OUT, then drain this head to GMEM.
         mbarrier_wait(ov_mma_barrier, head_offset & 1U);
         mbarrier_wait(qh_mma_barrier, head_offset & 1U);
         tcgen05_fence_after_thread_sync();
@@ -964,28 +961,56 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         nv_bfloat16 *row_hi_o_ptr = row_base_o_ptr + ROW_PAIR_OUTPUT_STRIDE;
 
         if (full_chunk) {
-          store_output_row_pair<true>(
-              row_base_o_ptr, row_hi_o_ptr, OUTPUT_TMEM_COL, qh_stage_tmem,
-              lane_col, 0U, 0U, gp_row_base, gp_row_hi, alpha, scale);
+#pragma unroll
+          for (uint32_t fragment_pair = 0;
+               fragment_pair < OUTPUT_FRAGMENT_PAIRS; ++fragment_pair) {
+            const uint32_t col_base = fragment_pair * BLOCK_T;
+            float ov_reg_lo[REGS_PER_FRAGMENT];
+            float ov_reg_hi[REGS_PER_FRAGMENT];
+            float qh_reg_lo[REGS_PER_FRAGMENT];
+            float qh_reg_hi[REGS_PER_FRAGMENT];
+            load_output_fragment_pair(OUTPUT_TMEM_COL, qh_stage_tmem, col_base,
+                                      ov_reg_lo, ov_reg_hi, qh_reg_lo,
+                                      qh_reg_hi);
+            if (fragment_pair + 1U == OUTPUT_FRAGMENT_PAIRS) {
+              // Step 6 / 7 read-release: free TMEM on the final OUT+QH read.
+              tcgen05_fence_before_thread_sync();
+              __syncwarp();
+              if (warp_elected) {
+                mbarrier_arrive(read_release_barrier);
+              }
+            }
+            store_output_fragment_pair<true>(
+                row_base_o_ptr, row_hi_o_ptr, col_base, lane_col, 0U, 0U,
+                ov_reg_lo, ov_reg_hi, qh_reg_lo, qh_reg_hi, gp_row_base,
+                gp_row_hi, alpha, scale);
+          }
         } else {
           const uint32_t row_base_active = row_base < chunk_len;
           const uint32_t row_hi_active = row_hi < chunk_len;
-          store_output_row_pair<false>(row_base_o_ptr, row_hi_o_ptr,
-                                       OUTPUT_TMEM_COL, qh_stage_tmem, lane_col,
-                                       row_base_active, row_hi_active,
-                                       gp_row_base, gp_row_hi, alpha, scale);
-        }
-
-        tcgen05_fence_before_thread_sync();
-        if (head_offset + 1U < HEADS_PER_QK_HEAD) {
-          __syncwarp();
-          if (warp_elected) {
-            mbarrier_arrive(head0_release_barrier);
-          }
-        } else {
-          __syncwarp();
-          if (warp_elected) {
-            mbarrier_arrive(output_tmem_release_barrier);
+#pragma unroll
+          for (uint32_t fragment_pair = 0;
+               fragment_pair < OUTPUT_FRAGMENT_PAIRS; ++fragment_pair) {
+            const uint32_t col_base = fragment_pair * BLOCK_T;
+            float ov_reg_lo[REGS_PER_FRAGMENT];
+            float ov_reg_hi[REGS_PER_FRAGMENT];
+            float qh_reg_lo[REGS_PER_FRAGMENT];
+            float qh_reg_hi[REGS_PER_FRAGMENT];
+            load_output_fragment_pair(OUTPUT_TMEM_COL, qh_stage_tmem, col_base,
+                                      ov_reg_lo, ov_reg_hi, qh_reg_lo,
+                                      qh_reg_hi);
+            if (fragment_pair + 1U == OUTPUT_FRAGMENT_PAIRS) {
+              // Step 6 / 7 read-release: free TMEM on the final OUT+QH read.
+              tcgen05_fence_before_thread_sync();
+              __syncwarp();
+              if (warp_elected) {
+                mbarrier_arrive(read_release_barrier);
+              }
+            }
+            store_output_fragment_pair<false>(
+                row_base_o_ptr, row_hi_o_ptr, col_base, lane_col,
+                row_base_active, row_hi_active, ov_reg_lo, ov_reg_hi, qh_reg_lo,
+                qh_reg_hi, gp_row_base, gp_row_hi, alpha, scale);
           }
         }
       }
