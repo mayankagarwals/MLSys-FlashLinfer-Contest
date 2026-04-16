@@ -18,7 +18,7 @@ from pathlib import Path
 import pandas as pd
 from flashinfer_bench.bench.evaluators import DefaultEvaluator
 from flashinfer_bench.bench.evaluators.utils import allocate_outputs
-from flashinfer_bench.bench.utils import BenchmarkConfig, gen_inputs, load_safetensors
+from flashinfer_bench.bench.utils import ResolvedEvalConfig, gen_inputs, load_safetensors
 from flashinfer_bench.compile import BuilderRegistry
 from flashinfer_bench.data import Definition, Solution, Workload
 from pack_solution import pack_solution
@@ -97,7 +97,7 @@ def main(args: argparse.Namespace):
             inputs=[inputs],
             ref_outputs=[outputs_ref],
             ref_mean_latency_ms=1.0,  # arbitrary number
-            cfg=BenchmarkConfig(),
+            cfg=ResolvedEvalConfig(),
             log_path="/tmp/flashinfer-bench",
             device=device,
         )
