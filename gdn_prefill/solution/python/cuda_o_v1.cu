@@ -30,7 +30,8 @@ Pipeline sketch for `o_v1`
   Steady-state chunk flow
 
       TMA / SMEM                BAR / TMEM                 MMA / CUDA
-      ------------------------  ------------------------   ------------------------
+      ------------------------  ------------------------
+------------------------
   1.  load q/k, h0/v0, h1/v1 -> qk_tma, h_tma, v_tma   -> stages become visible
 
   2.                                                  -> MMA: q*k -> QK
@@ -192,8 +193,7 @@ constexpr uint32_t OUTPUT_TMEM_COL = 3U * BLOCK_T;
 constexpr uint32_t HEAD0_QH_TMEM_COL = 5U * BLOCK_T;
 constexpr uint32_t HEAD1_QH_TMEM_COL = QK_TMEM_COL;
 static_assert(ATTN_TMEM_BASE_COL == QK_TMEM_COL + BLOCK_T);
-static_assert(ATTN_TMEM_BASE_COL +
-                  HEADS_PER_QK_HEAD * ATTN_TMEM_HEAD_STRIDE ==
+static_assert(ATTN_TMEM_BASE_COL + HEADS_PER_QK_HEAD * ATTN_TMEM_HEAD_STRIDE ==
               OUTPUT_TMEM_COL);
 static_assert(HEAD0_QH_TMEM_COL + 2U * BLOCK_T <= MAX_COLUMNS);
 constexpr CUtensorMapL2promotion TMA_L2_PROMOTION =
@@ -354,8 +354,7 @@ __device__ __forceinline__ void load_qk_fragment(float *qk_reg_lo,
   tcgen05_wait_ld();
 }
 
-__device__ __forceinline__ uint32_t qh_tmem_col_for_head(
-    uint32_t head_offset) {
+__device__ __forceinline__ uint32_t qh_tmem_col_for_head(uint32_t head_offset) {
   return head_offset == HEAD0_STAGE_INDEX ? HEAD0_QH_TMEM_COL
                                           : HEAD1_QH_TMEM_COL;
 }
@@ -473,15 +472,14 @@ store_bf162_pair_no_allocate_if(nv_bfloat16 *ptr_0, __nv_bfloat162 value_0,
 
 __device__ __forceinline__ void
 load_output_fragment_pair(uint32_t output_tmem_col, uint32_t qh_tmem_col,
-                          uint32_t col_base, float *ov_reg_lo,
-                          float *ov_reg_hi, float *qh_reg_lo,
-                          float *qh_reg_hi) {
+                          uint32_t col_base, float *ov_reg_lo, float *ov_reg_hi,
+                          float *qh_reg_lo, float *qh_reg_hi) {
   tcgen05_ld<SHAPE::_16x256b, 4>(ov_reg_lo, 0, output_tmem_col + col_base);
   tcgen05_ld<SHAPE::_16x256b, 4>(
       ov_reg_hi, 0, output_tmem_col + col_base + COLS_PER_FRAGMENT);
   tcgen05_ld<SHAPE::_16x256b, 4>(qh_reg_lo, 0, qh_tmem_col + col_base);
-  tcgen05_ld<SHAPE::_16x256b, 4>(
-      qh_reg_hi, 0, qh_tmem_col + col_base + COLS_PER_FRAGMENT);
+  tcgen05_ld<SHAPE::_16x256b, 4>(qh_reg_hi, 0,
+                                 qh_tmem_col + col_base + COLS_PER_FRAGMENT);
   tcgen05_wait_ld();
 }
 
@@ -500,8 +498,8 @@ store_output_row_pair(nv_bfloat16 *row_base_o_ptr, nv_bfloat16 *row_hi_o_ptr,
     float ov_reg_hi[REGS_PER_FRAGMENT];
     float qh_reg_lo[REGS_PER_FRAGMENT];
     float qh_reg_hi[REGS_PER_FRAGMENT];
-    load_output_fragment_pair(output_tmem_col, qh_tmem_col, col_base,
-                              ov_reg_lo, ov_reg_hi, qh_reg_lo, qh_reg_hi);
+    load_output_fragment_pair(output_tmem_col, qh_tmem_col, col_base, ov_reg_lo,
+                              ov_reg_hi, qh_reg_lo, qh_reg_hi);
 
 #pragma unroll
     for (uint32_t step_pair = 0; step_pair < FRAGMENT_PAIRS; ++step_pair) {
@@ -966,17 +964,16 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         nv_bfloat16 *row_hi_o_ptr = row_base_o_ptr + ROW_PAIR_OUTPUT_STRIDE;
 
         if (full_chunk) {
-          store_output_row_pair<true>(row_base_o_ptr, row_hi_o_ptr,
-                                      OUTPUT_TMEM_COL, qh_stage_tmem, lane_col,
-                                      0U, 0U, gp_row_base, gp_row_hi, alpha,
-                                      scale);
+          store_output_row_pair<true>(
+              row_base_o_ptr, row_hi_o_ptr, OUTPUT_TMEM_COL, qh_stage_tmem,
+              lane_col, 0U, 0U, gp_row_base, gp_row_hi, alpha, scale);
         } else {
           const uint32_t row_base_active = row_base < chunk_len;
           const uint32_t row_hi_active = row_hi < chunk_len;
-          store_output_row_pair<false>(
-              row_base_o_ptr, row_hi_o_ptr, OUTPUT_TMEM_COL, qh_stage_tmem,
-              lane_col, row_base_active, row_hi_active, gp_row_base, gp_row_hi,
-              alpha, scale);
+          store_output_row_pair<false>(row_base_o_ptr, row_hi_o_ptr,
+                                       OUTPUT_TMEM_COL, qh_stage_tmem, lane_col,
+                                       row_base_active, row_hi_active,
+                                       gp_row_base, gp_row_hi, alpha, scale);
         }
 
         tcgen05_fence_before_thread_sync();
