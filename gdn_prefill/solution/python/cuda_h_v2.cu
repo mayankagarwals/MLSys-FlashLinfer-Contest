@@ -423,6 +423,7 @@ void h_v2_kernel_cutlass(
           if (chunk_id == 0) {
             // H0 smem layout: [K_dim/32, BV, 32]
             // each j iter:    [       1, 16,  8]
+            // NOTE: since we have to pack 2x FP32 to 1x BF16, we can't use ldmatrix
             for (int j = 0; j < 32 / 8; j++) {
               const int row = warp_id_ * 16 + (lane_id / 4);
               const int col = ((j * 2 + (lane_id % 4) / 2) ^ (lane_id / 4)) * 16 + (lane_id % 2) * 8;
@@ -460,9 +461,8 @@ void h_v2_kernel_cutlass(
 
           if (chunk_id == 0) {
             // load H0 from smem for 1st chunk
-            // natural shape:  [N, H, V_dim, K_dim]
-            // permuted shape: [N*H, K_dim/32, V_dim, 32]
-            // box shape:      [K_dim/32, V_dim, 32] with swizzling
+            // smem layout: [K_dim/32, BV, 32] with swizzling
+            // each j iter: [       1, 32,  4]
             for (int j = 0; j < 32 / 4; j++) {
               const int col = j ^ (tid_ % 8);
               lds_f32x4(h_f32 + j * 4, H0_f32_smem + i * V_dim * 128 + tid_ * 128 + col * 16);
@@ -475,31 +475,34 @@ void h_v2_kernel_cutlass(
 
           for (int j = 0; j < 32; j++)
             h_f32[j] *= h_scale;
-          tcgen05_st<SHAPE::_32x32b, 32>(warp_id_ * 32, vk_tmem + i * 32, h_f32);  // for vk MMA
+          tcgen05_st<SHAPE::_32x32b, 32>(warp_id_ * 32, vk_tmem + i * 32, h_f32);
         }
       }
       if constexpr (BV == 64) {
-        for (int i = 0; i < K_dim / 32; i++) {
-          float h_f32[16];
+        if (chunk_id == 0) {
+          for (int i = 0; i < K_dim / 32; i++) {
+            float h_f32[16];
 
-          // TODO: since we don't need packing, we can use ldmatrix here
-          if (chunk_id == 0) {
+            // NOTE: since we don't need FP32->BF16 packing, we can use ldmatrix here
             // H0 smem layout: [K_dim/32, BV, 32]
-            // each warp:      [K_dim/32, 16, 32]
+            // each j iter:    [       1, 16,  8]
             for (int j = 0; j < 32 / 8; j++) {
-              const int row = warp_id_ * 16 + (lane_id / 4);
-              const int col = ((j * 2 + (lane_id % 4) / 2) ^ (lane_id / 4)) * 16 + (lane_id % 2) * 8;
-              lds_f32x2(h_f32 + j * 4 + 0, H0_f32_smem + i * BV * 128 + (row + 0) * 128 + col);  // lower [8, 8]
-              lds_f32x2(h_f32 + j * 4 + 2, H0_f32_smem + i * BV * 128 + (row + 8) * 128 + col);  // upper [8, 8]
+              const int row = warp_id_ * 16 + (lane_id % 16);
+              const int col = (j * 2 + (lane_id / 16)) ^ (lane_id % 8);
+              ldmatrix<4>(h_f32 + j * 4, H0_f32_smem + i * BV * 128 + row * 128 + col * 16);
             }
-          }
-          else {
-            tcgen05_ld<SHAPE::_16x256b, 4>(h_f32, warp_id_ * 32, vk_tmem + i * 32);
-          }
 
-          for (int j = 0; j < 16; j++)
+            for (int j = 0; j < 16; j++)
+              h_f32[j] *= h_scale;
+            tcgen05_st<SHAPE::_16x128b, 8>(warp_id_ * 32, vk_tmem + i * 32, h_f32);
+          }
+        }
+        else {
+          float h_f32[K_dim / 2];
+          tcgen05_ld<SHAPE::_16x256b, K_dim / 8>(h_f32, warp_id_ * 32, vk_tmem);
+          for (int j = 0; j < K_dim / 2; j++)
             h_f32[j] *= h_scale;
-          tcgen05_st<SHAPE::_16x256b, 4>(warp_id_ * 32, vk_tmem + i * 32, h_f32);
+          tcgen05_st<SHAPE::_16x256b, K_dim / 8>(warp_id_ * 32, vk_tmem, h_f32);
         }
       }
       tcgen05_wait_st();
