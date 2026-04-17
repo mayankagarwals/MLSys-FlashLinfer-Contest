@@ -41,15 +41,13 @@ static_assert(kItersPerTile == 2);
 // Device helpers
 // ============================================================================
 
-static constexpr float kLog2E = 1.4426950408889634f;
-
 __device__ __forceinline__ float SoftplusStable(float x) {
   const float abs_x = fabsf(x);
   return log1pf(expf(-abs_x)) + fmaxf(x, 0.0f);
 }
 
 __device__ __forceinline__ float Sigmoid(float x) {
-  return 1.0f / (1.0f + exp2f(-x * kLog2E));
+  return fmaf(0.5f, tanhf(x * 0.5f), 0.5f);
 }
 
 __device__ __forceinline__ float WarpAllReduceSum(float value) {
