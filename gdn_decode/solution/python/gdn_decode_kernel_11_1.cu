@@ -102,13 +102,6 @@ __device__ __forceinline__ void CpAsyncWaitAll() {
   asm volatile("cp.async.wait_all;" ::: "memory");
 }
 
-// ============================================================================
-// Pipelined kernel: 4 CTAs per (batch, head), each handling 4 v-tiles.
-// Optimizations vs v11_1: int32 indices, hoisted loop-invariant terms,
-// bv=beta*v_scalar before smem read (shorter live range), __ldg hints,
-// shfl_down for second reduce (lane 0 only), L2 persistence in host dispatch.
-// ============================================================================
-
 struct SmemPipelined {
   float sData[kNumStages][kTileV][kHeadSize];
 };
