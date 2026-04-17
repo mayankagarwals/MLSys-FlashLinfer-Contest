@@ -19,7 +19,7 @@ lib_path = tvm_ffi.cpp.build(
         str(CURRENT_DIR / "cuda_prep_meta_v2.cu"),
         str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
         str(CURRENT_DIR / "cuda_inv_uw_v0.cu"),
-        str(CURRENT_DIR / "cuda_h_v2.cu"),
+        str(CURRENT_DIR / "cuda_h_v2b.cu"),
         str(CURRENT_DIR / "cuda_o_v1.cu"),
     ],
     extra_cflags=["-O3"],
@@ -104,7 +104,7 @@ def run(
     # uncomment to enable profiling
     profiler = None
     # profiler = torch.zeros(148, 10, 1 + 1000 * 2, dtype=torch.int64, device="cuda")
-    mod.h_v2(
+    mod.h_v2b(
         k,
         u,
         w,
