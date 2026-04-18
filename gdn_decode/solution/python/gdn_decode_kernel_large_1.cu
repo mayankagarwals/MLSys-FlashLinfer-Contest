@@ -47,10 +47,12 @@ __device__ __forceinline__ float Sigmoid(float x) {
 }
 
 __device__ __forceinline__ float WarpAllReduceSum(float value) {
-#pragma unroll
-  for (int mask = kWarpSize / 2; mask > 0; mask >>= 1) {
-    value += __shfl_xor_sync(kFullWarpMask, value, mask);
-  }
+  float tmp;
+  asm volatile("shfl.sync.bfly.b32 %0,%1,16,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
+  asm volatile("shfl.sync.bfly.b32 %0,%1, 8,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
+  asm volatile("shfl.sync.bfly.b32 %0,%1, 4,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
+  asm volatile("shfl.sync.bfly.b32 %0,%1, 2,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
+  asm volatile("shfl.sync.bfly.b32 %0,%1, 1,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
   return value;
 }
 
