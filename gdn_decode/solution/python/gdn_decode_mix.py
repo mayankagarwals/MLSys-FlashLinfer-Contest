@@ -22,6 +22,14 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
         )
         return output, new_state
 
+    if B >= 48:
+        output = torch.empty_like(v)
+        new_state = torch.empty_like(state)
+        b48_kernel_run(
+            q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state,
+        )
+        return output, new_state
+
     if B >= 16:
         output = torch.empty_like(v)
         new_state = torch.empty_like(state)
