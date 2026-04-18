@@ -18,11 +18,15 @@ constexpr int kWarpsPerBlock = 2;
 constexpr int kNumThreads = kWarpSize * kWarpsPerBlock;
 constexpr int kElemsPerLane = kHeadSize / kWarpSize;
 
-constexpr int kTileV = 8;
+constexpr int kTileV = 4;
 constexpr int kNumVTiles = kHeadSize / kTileV;
 constexpr int kRowsPerIter = kWarpsPerBlock;
 constexpr int kItersPerTile = kTileV / kRowsPerIter;
-constexpr int kNumStages = 1;
+constexpr int kNumStages = 2;
+
+constexpr int kNumCTAs4 = 5;
+constexpr int kNumCTAs3 = 4;
+constexpr int kNumCTAs  = kNumCTAs4 + kNumCTAs3;
 
 constexpr int kQGroupSize = kNumVHeads / kNumQHeads;
 constexpr int kKGroupSize = kNumVHeads / kNumKHeads;
@@ -31,11 +35,8 @@ constexpr unsigned kFullWarpMask = 0xffffffffu;
 static_assert(kHeadSize == 128);
 static_assert(kNumThreads == 64);
 static_assert(kElemsPerLane == 4);
-static_assert(kItersPerTile == 4);
-
-// ============================================================================
-// Device helpers
-// ============================================================================
+static_assert(kItersPerTile == 2);
+static_assert(kNumCTAs4 * 16 + kNumCTAs3 * 12 == kHeadSize);
 
 __device__ __forceinline__ float SoftplusStable(float x) {
   const float abs_x = fabsf(x);
@@ -47,12 +48,9 @@ __device__ __forceinline__ float Sigmoid(float x) {
 }
 
 __device__ __forceinline__ float WarpAllReduceSum(float value) {
-  float tmp;
-  asm volatile("shfl.sync.bfly.b32 %0,%1,16,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
-  asm volatile("shfl.sync.bfly.b32 %0,%1, 8,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
-  asm volatile("shfl.sync.bfly.b32 %0,%1, 4,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
-  asm volatile("shfl.sync.bfly.b32 %0,%1, 2,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
-  asm volatile("shfl.sync.bfly.b32 %0,%1, 1,31,0xffffffff;" : "=f"(tmp) : "f"(value)); value += tmp;
+#pragma unroll
+  for (int mask = kWarpSize / 2; mask > 0; mask >>= 1)
+    value += __shfl_xor_sync(kFullWarpMask, value, mask);
   return value;
 }
 
@@ -72,201 +70,163 @@ LoadBf16x4GlobalNc(const __nv_bfloat16 *__restrict__ ptr) {
   return out;
 }
 
-__device__ __forceinline__ void
-StoreF32x4Global(float *addr, const float4 &value) {
-  asm volatile(
-      "st.global.wt.v4.f32 [%0], {%1, %2, %3, %4};"
-      :
-      : "l"(addr), "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w));
+__device__ __forceinline__ void StoreF32x4Global(float *addr, const float4 &v) {
+  asm volatile("st.global.wt.v4.f32 [%0], {%1, %2, %3, %4};"
+               : : "l"(addr), "f"(v.x), "f"(v.y), "f"(v.z), "f"(v.w));
 }
 
-__device__ __forceinline__ void CpAsyncCg16(float *smem_ptr,
-                                            const float *gmem_ptr) {
-  const uint32_t smem_addr =
-      static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
-  asm volatile(
-      "cp.async.cg.shared.global [%0], [%1], 16;"
-      :
-      : "r"(smem_addr), "l"(gmem_ptr)
-      : "memory");
+__device__ __forceinline__ void CpAsyncCg16(float *smem_ptr, const float *gmem_ptr) {
+  const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" : : "r"(s), "l"(gmem_ptr) : "memory");
 }
 
-__device__ __forceinline__ void CpAsyncCommit() {
-  asm volatile("cp.async.commit_group;" ::: "memory");
-}
+__device__ __forceinline__ void CpAsyncCommit()  { asm volatile("cp.async.commit_group;" ::: "memory"); }
+__device__ __forceinline__ void CpAsyncWaitAll() { asm volatile("cp.async.wait_all;" ::: "memory"); }
 
-__device__ __forceinline__ void CpAsyncWaitAll() {
-  asm volatile("cp.async.wait_all;" ::: "memory");
-}
-
-struct SmemTile {
-  float sData[kTileV][kHeadSize];
-};
+struct SmemPipelined { float sData[kNumStages][kTileV][kHeadSize]; };
 
 __device__ __forceinline__ void IssueTileAsyncCopy(
     float sData_stage[][kHeadSize], const float *__restrict__ state,
     int hv_base, int v_start_global, int warp_id, int lane) {
 #pragma unroll
   for (int pass = 0; pass < kItersPerTile; ++pass) {
-    const int row_in_tile = pass * kRowsPerIter + warp_id;
-    const int global_v = v_start_global + row_in_tile;
-    const int row_base = (hv_base * kHeadSize + global_v) * kHeadSize;
-    CpAsyncCg16(&sData_stage[row_in_tile][lane * kElemsPerLane],
-                state + row_base + lane * kElemsPerLane);
+    const int row = pass * kRowsPerIter + warp_id;
+    const int gbase = (hv_base * kHeadSize + v_start_global + row) * kHeadSize;
+    CpAsyncCg16(&sData_stage[row][lane * kElemsPerLane], state + gbase + lane * kElemsPerLane);
   }
 }
 
-// kNumCTAs is templated so the tile loop is fully unrolled at compile time.
-// kNumCTAs=8  → kVTilesPerCTA=2 (B>=48)
-// kNumCTAs=16 → kVTilesPerCTA=1 (B=8..32, more blocks/SM)
-template<int kNumCTAs>
-__global__ void GdnDecodePipelinedV11(
-    const __nv_bfloat16 *__restrict__ q, const __nv_bfloat16 *__restrict__ k,
-    const __nv_bfloat16 *__restrict__ v, const float *__restrict__ state,
-    const float *__restrict__ A_log, const __nv_bfloat16 *__restrict__ a,
-    const float *__restrict__ dt_bias, const __nv_bfloat16 *__restrict__ b,
-    float scale, __nv_bfloat16 *__restrict__ output,
-    float *__restrict__ new_state) {
+template <int kVTilesPerCTA>
+__device__ __noinline__ void RunBlock(
+    SmemPipelined &smem,
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *state, const float *A_log, const __nv_bfloat16 *a,
+    const float *dt_bias, const __nv_bfloat16 *b, float scale,
+    __nv_bfloat16 *output, float *new_state,
+    int hv_base, int v_start, int q_base, int k_base, int hv_idx,
+    int warp_id, int lane) {
 
-  constexpr int kVTilesPerCTA = kNumVTiles / kNumCTAs;
-
-  extern __shared__ char smem_raw[];
-  SmemTile &smem = *reinterpret_cast<SmemTile *>(smem_raw);
-
-  const int block_linear = static_cast<int>(blockIdx.x);
-  const int cta_idx = block_linear % kNumCTAs;
-  const int bh = block_linear / kNumCTAs;
-
-  const int batch_idx = bh / kNumVHeads;
-  const int hv_idx = bh % kNumVHeads;
-
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & (kWarpSize - 1);
-
-  const int q_head = hv_idx / kQGroupSize;
-  const int k_head = hv_idx / kKGroupSize;
-  const int q_base = (batch_idx * kNumQHeads + q_head) * kHeadSize;
-  const int k_base = (batch_idx * kNumKHeads + k_head) * kHeadSize;
-  const int hv_base = batch_idx * kNumVHeads + hv_idx;
-
-  const int v_start = cta_idx * kVTilesPerCTA * kTileV;
-
-  // Prefetch tile 0 — overlaps with q/k/g/beta loads below
-  IssueTileAsyncCopy(smem.sData, state, hv_base, v_start, warp_id, lane);
+  IssueTileAsyncCopy(smem.sData[0], state, hv_base, v_start, warp_id, lane);
   CpAsyncCommit();
 
-  const float r_A_log = A_log[hv_idx];
-  const float r_a = __bfloat162float(a[hv_base]);
+  const float r_A_log   = A_log[hv_idx];
+  const float r_a       = __bfloat162float(a[hv_base]);
   const float r_dt_bias = dt_bias[hv_idx];
-  const float r_b = __bfloat162float(b[hv_base]);
+  const float r_b       = __bfloat162float(b[hv_base]);
 
-  const int kk_base = lane * kElemsPerLane;
-  float4 q_vec = LoadBf16x4GlobalNc(q + q_base + kk_base);
-  const float4 k_vec = LoadBf16x4GlobalNc(k + k_base + kk_base);
+  const int kk = lane * kElemsPerLane;
+  float4 q_vec = LoadBf16x4GlobalNc(q + q_base + kk);
+  const float4 k_vec = LoadBf16x4GlobalNc(k + k_base + kk);
 
-  const float neg_exp_A = -expf(r_A_log);
-  const float g    = expf(neg_exp_A * SoftplusStable(r_a + r_dt_bias));
+  const float g    = expf(-expf(r_A_log) * SoftplusStable(r_a + r_dt_bias));
   const float beta = Sigmoid(r_b);
-
-  q_vec.x *= scale; q_vec.y *= scale;
-  q_vec.z *= scale; q_vec.w *= scale;
+  q_vec.x *= scale; q_vec.y *= scale; q_vec.z *= scale; q_vec.w *= scale;
 
 #pragma unroll
   for (int tile = 0; tile < kVTilesPerCTA; ++tile) {
-    const int tile_v_start = v_start + tile * kTileV;
+    const int stage = tile % kNumStages;
+    const int tv_start = v_start + tile * kTileV;
 
     CpAsyncWaitAll();
     __syncwarp(kFullWarpMask);
 
     if (tile + 1 < kVTilesPerCTA) {
-      IssueTileAsyncCopy(smem.sData, state, hv_base,
-                         v_start + (tile + 1) * kTileV, warp_id, lane);
+      IssueTileAsyncCopy(smem.sData[(tile+1)%kNumStages], state, hv_base,
+                         v_start + (tile+1)*kTileV, warp_id, lane);
       CpAsyncCommit();
     }
 
 #pragma unroll
     for (int iter = 0; iter < kItersPerTile; ++iter) {
-      const int row_in_tile = iter * kRowsPerIter + warp_id;
-      const int global_v    = tile_v_start + row_in_tile;
-      const int v_offset_i  = hv_base * kHeadSize + global_v;
-      const int state_row_i = v_offset_i * kHeadSize;
+      const int row = iter * kRowsPerIter + warp_id;
+      const int gv  = tv_start + row;
+      const int voi = hv_base * kHeadSize + gv;
 
-      const float v_scalar = __bfloat162float(v[v_offset_i]);
-      const float4 sv = *reinterpret_cast<const float4 *>(
-          &smem.sData[row_in_tile][lane * kElemsPerLane]);
+      const float vs  = __bfloat162float(v[voi]);
+      const float4 sv = *reinterpret_cast<const float4*>(&smem.sData[stage][row][kk]);
 
-      float sum_hk; float4 h;
-      h.x = g * sv.x; sum_hk  = k_vec.x * h.x;
-      h.y = g * sv.y; sum_hk  = fmaf(k_vec.y, h.y, sum_hk);
-      h.z = g * sv.z; sum_hk  = fmaf(k_vec.z, h.z, sum_hk);
-      h.w = g * sv.w; sum_hk  = fmaf(k_vec.w, h.w, sum_hk);
-      const float old_v = WarpAllReduceSum(sum_hk);
+      float shk; float4 h;
+      h.x = g*sv.x; shk  = k_vec.x*h.x;
+      h.y = g*sv.y; shk  = fmaf(k_vec.y, h.y, shk);
+      h.z = g*sv.z; shk  = fmaf(k_vec.z, h.z, shk);
+      h.w = g*sv.w; shk  = fmaf(k_vec.w, h.w, shk);
+      const float delta = beta * (vs - WarpAllReduceSum(shk));
 
-      const float delta = beta * (v_scalar - old_v);
+      float shq;
+      h.x = fmaf(k_vec.x, delta, h.x); shq  = q_vec.x*h.x;
+      h.y = fmaf(k_vec.y, delta, h.y); shq  = fmaf(q_vec.y, h.y, shq);
+      h.z = fmaf(k_vec.z, delta, h.z); shq  = fmaf(q_vec.z, h.z, shq);
+      h.w = fmaf(k_vec.w, delta, h.w); shq  = fmaf(q_vec.w, h.w, shq);
 
-      float sum_hq;
-      h.x = fmaf(k_vec.x, delta, h.x); sum_hq  = q_vec.x * h.x;
-      h.y = fmaf(k_vec.y, delta, h.y); sum_hq  = fmaf(q_vec.y, h.y, sum_hq);
-      h.z = fmaf(k_vec.z, delta, h.z); sum_hq  = fmaf(q_vec.z, h.z, sum_hq);
-      h.w = fmaf(k_vec.w, delta, h.w); sum_hq  = fmaf(q_vec.w, h.w, sum_hq);
-
-      StoreF32x4Global(new_state + state_row_i + lane * kElemsPerLane, h);
-
-      const float out_acc = WarpAllReduceSum(sum_hq);
-      if (lane == 0) output[v_offset_i] = __float2bfloat16_rn(out_acc);
+      StoreF32x4Global(new_state + voi*kHeadSize + kk, h);
+      if (lane == 0) output[voi] = __float2bfloat16_rn(WarpAllReduceSum(shq));
     }
   }
 }
 
-// ============================================================================
-// Host dispatch
-// ============================================================================
+__global__ void GdnDecodeLarge1(
+    const __nv_bfloat16 *q, const __nv_bfloat16 *k, const __nv_bfloat16 *v,
+    const float *state, const float *A_log, const __nv_bfloat16 *a,
+    const float *dt_bias, const __nv_bfloat16 *b, float scale,
+    __nv_bfloat16 *output, float *new_state, int bh_count) {
 
-__host__ __forceinline__ float ResolveScale(double scale) {
-  float scale_f = static_cast<float>(scale);
-  if (scale_f == 0.0f) {
-    scale_f = 1.0f / sqrtf(static_cast<float>(kHeadSize));
+  extern __shared__ char smem_raw[];
+  SmemPipelined &smem = *reinterpret_cast<SmemPipelined*>(smem_raw);
+
+  const int bl = static_cast<int>(blockIdx.x);
+  const int warp_id = threadIdx.x >> 5;
+  const int lane    = threadIdx.x & (kWarpSize - 1);
+
+  int bh, v_start;
+  if (bl < bh_count * kNumCTAs4) {
+    bh = bl / kNumCTAs4; v_start = (bl % kNumCTAs4) * 16;
+  } else {
+    const int adj = bl - bh_count * kNumCTAs4;
+    bh = adj / kNumCTAs3; v_start = 80 + (adj % kNumCTAs3) * 12;
   }
-  return scale_f;
+
+  const int bi = bh / kNumVHeads, hv = bh % kNumVHeads;
+  const int hv_base = bi * kNumVHeads + hv;
+  const int q_base  = (bi * kNumQHeads + hv / kQGroupSize) * kHeadSize;
+  const int k_base  = (bi * kNumKHeads + hv / kKGroupSize) * kHeadSize;
+
+  if (bl < bh_count * kNumCTAs4)
+    RunBlock<4>(smem, q,k,v,state,A_log,a,dt_bias,b,scale,output,new_state,
+                hv_base, v_start, q_base, k_base, hv, warp_id, lane);
+  else
+    RunBlock<3>(smem, q,k,v,state,A_log,a,dt_bias,b,scale,output,new_state,
+                hv_base, v_start, q_base, k_base, hv, warp_id, lane);
+}
+
+__host__ __forceinline__ float ResolveScale(double s) {
+  float f = static_cast<float>(s);
+  return f == 0.0f ? 1.0f/sqrtf(static_cast<float>(kHeadSize)) : f;
 }
 
 void RunGdnDecodeKernel11(TensorView q, TensorView k, TensorView v,
-                         TensorView state, TensorView A_log, TensorView a,
-                         TensorView dt_bias, TensorView b, double scale,
-                         TensorView output, TensorView new_state) {
-  gdn_decode::ValidateShapesAndTypes(q, k, v, state, A_log, a, dt_bias, b,
-                                     output, new_state);
-
-  const int64_t B = q.size(0);
-  const float scale_f = ResolveScale(scale);
-
+                          TensorView state, TensorView A_log, TensorView a,
+                          TensorView dt_bias, TensorView b, double scale,
+                          TensorView output, TensorView new_state) {
+  gdn_decode::ValidateShapesAndTypes(q,k,v,state,A_log,a,dt_bias,b,output,new_state);
+  const int B = static_cast<int>(q.size(0));
   ffi::CUDADeviceGuard guard(q.device().device_id);
   const cudaStream_t stream = get_cuda_stream(q.device());
-
-  const float *state_ptr = static_cast<const float *>(state.data_ptr());
-  const __nv_bfloat16 *q_ptr = static_cast<const __nv_bfloat16 *>(q.data_ptr());
-  const __nv_bfloat16 *k_ptr = static_cast<const __nv_bfloat16 *>(k.data_ptr());
-  const __nv_bfloat16 *v_ptr = static_cast<const __nv_bfloat16 *>(v.data_ptr());
-  const float *A_log_ptr     = static_cast<const float *>(A_log.data_ptr());
-  const __nv_bfloat16 *a_ptr = static_cast<const __nv_bfloat16 *>(a.data_ptr());
-  const float *dt_bias_ptr   = static_cast<const float *>(dt_bias.data_ptr());
-  const __nv_bfloat16 *b_ptr = static_cast<const __nv_bfloat16 *>(b.data_ptr());
-  __nv_bfloat16 *output_ptr  = static_cast<__nv_bfloat16 *>(output.data_ptr());
-  float *new_state_ptr       = static_cast<float *>(new_state.data_ptr());
-
-  const size_t smem_bytes = sizeof(SmemTile);
-
-  const dim3 grid(B * kNumVHeads * 8, 1, 1);
-  GdnDecodePipelinedV11<8><<<grid, kNumThreads, smem_bytes, stream>>>(
-      q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
-      scale_f, output_ptr, new_state_ptr);
-
+  const int BH = B * kNumVHeads;
+  GdnDecodeLarge1<<<BH*kNumCTAs, kNumThreads, sizeof(SmemPipelined), stream>>>(
+      static_cast<const __nv_bfloat16*>(q.data_ptr()),
+      static_cast<const __nv_bfloat16*>(k.data_ptr()),
+      static_cast<const __nv_bfloat16*>(v.data_ptr()),
+      static_cast<const float*>(state.data_ptr()),
+      static_cast<const float*>(A_log.data_ptr()),
+      static_cast<const __nv_bfloat16*>(a.data_ptr()),
+      static_cast<const float*>(dt_bias.data_ptr()),
+      static_cast<const __nv_bfloat16*>(b.data_ptr()),
+      ResolveScale(scale),
+      static_cast<__nv_bfloat16*>(output.data_ptr()),
+      static_cast<float*>(new_state.data_ptr()), BH);
   const cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    TVM_FFI_THROW(RuntimeError)
-        << "GdnDecodeKernel11 launch failed: " << cudaGetErrorString(err);
-  }
+  if (err != cudaSuccess)
+    TVM_FFI_THROW(RuntimeError) << "GdnDecodeLarge1 failed: " << cudaGetErrorString(err);
 }
 
 } // namespace
