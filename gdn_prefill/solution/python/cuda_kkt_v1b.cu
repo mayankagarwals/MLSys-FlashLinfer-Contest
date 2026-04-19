@@ -1,3 +1,5 @@
+// support FP32, BF16, and FP16 A stores.
+//
 // for global_chunk_id in range(pid, num_chunks, num_programs):
 //   seq_id, chunk_id = chunk_indices[global_chunk_id]
 //
@@ -38,7 +40,7 @@ constexpr int NUM_WARPS = 4 + 2;
 constexpr int WARP_SIZE = 32;
 constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 
-template <int NUM_STAGES>
+template <int NUM_STAGES, typename TypeA>
 __global__
 __block_size__((TB_SIZE, 1, 1))
 void kkt_v1b_kernel_cutlass(
@@ -49,7 +51,7 @@ void kkt_v1b_kernel_cutlass(
   const nv_bfloat16 *b_ptr,                    // [total_T, H]
         float       *g_cu_ptr,                 // [total_T, H]
         float       *beta_ptr,                 // [total_T, H]
-        float       *A_ptr,                    // [total_T, H, BT]
+        TypeA       *A_ptr,                    // [total_T, H, BT]
   const int64_t     *cu_seqlens_ptr,           // [N+1]
   const int32_t     *chunk_indices_ptr,        // [total_num_chunks, 2]
   const int32_t     *total_num_chunks_ptr      // points to chunk_offsets[N] on GPU
@@ -184,8 +186,6 @@ void kkt_v1b_kernel_cutlass(
     float A = -__expf(A_log_ptr[head_id]);
     float dt_bias = dt_bias_ptr[head_id];
 
-    float kkt[BT];
-
     int stage_id = 0;
     int mma_parity = 0;
 
@@ -249,6 +249,7 @@ void kkt_v1b_kernel_cutlass(
 
       // load MMA result
       // only lower half warp contains result
+      float kkt[BT];
       tcgen05_ld<SHAPE::_32x32b, 64>(kkt, 0, stage_id * BT);
       tcgen05_wait_ld();
       tcgen05_fence_before_thread_sync();
@@ -269,8 +270,26 @@ void kkt_v1b_kernel_cutlass(
 
       // store A to gmem
       if (off_t < eos) {
-        for (int i = 0; i < BT / 8; i++)
-          stg_u32x8_fast(A_ptr + (off_t * H * BT + head_id * BT + i * 8), kkt + i * 8);
+        if constexpr (std::is_same_v<TypeA, float>) {
+          for (int i = 0; i < BT / 8; i++)
+            stg_u32x8_fast(A_ptr + (off_t * H * BT + head_id * BT + i * 8), kkt + i * 8);
+        }
+        if constexpr (std::is_same_v<TypeA, nv_bfloat16>) {
+          for (int i = 0; i < BT / 16; i++) {
+            nv_bfloat162 tmp[8];
+            for (int j = 0; j < 8; j++)
+              tmp[j] = __float22bfloat162_rn({kkt[i * 16 + j * 2], kkt[i * 16 + j * 2 + 1]});
+            stg_u32x8_fast(A_ptr + (off_t * H * BT + head_id * BT + i * 16), tmp);
+          }
+        }
+        if constexpr (std::is_same_v<TypeA, half>) {
+          for (int i = 0; i < BT / 16; i++) {
+            half2 tmp[8];
+            for (int j = 0; j < 8; j++)
+              tmp[j] = __float22half2_rn({kkt[i * 16 + j * 2], kkt[i * 16 + j * 2 + 1]});
+            stg_u32x8_fast(A_ptr + (off_t * H * BT + head_id * BT + i * 16), tmp);
+          }
+        }
       }
 
       stage_id = (stage_id + 1) % NUM_STAGES;
@@ -330,7 +349,6 @@ void kkt_v1b(
   auto *b_ptr                  = reinterpret_cast<const nv_bfloat16 *>(b.data_ptr());
   auto *g_cu_ptr               = reinterpret_cast<float *>(g_cu.data_ptr());
   auto *beta_ptr               = reinterpret_cast<float *>(beta.data_ptr());
-  auto *A_ptr                  = reinterpret_cast<float *>(A.data_ptr());
   auto *cu_seqlens_ptr         = reinterpret_cast<const int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_indices_ptr      = reinterpret_cast<const int32_t *>(chunk_indices.data_ptr());
   auto *total_num_chunks_ptr   = reinterpret_cast<const int32_t *>(chunk_offsets_end.data_ptr());
@@ -341,14 +359,27 @@ void kkt_v1b(
                           + 3 * NUM_STAGES * 8
                           + 4;
 
-  auto kernel = kkt_v1b_kernel_cutlass<NUM_STAGES>;
-  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
-
   dim3 grid(148 / Hg, Hg);
-  kernel<<<grid, TB_SIZE, smem_size>>>(
-    K_tmap, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
-    g_cu_ptr, beta_ptr, A_ptr,
-    cu_seqlens_ptr, chunk_indices_ptr, total_num_chunks_ptr);
+
+#define DISPATCH(type) { \
+  auto *A_ptr = reinterpret_cast<type *>(A.data_ptr()); \
+  auto kernel = kkt_v1b_kernel_cutlass<NUM_STAGES, type>; \
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size); \
+  kernel<<<grid, TB_SIZE, smem_size>>>( \
+    K_tmap, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr, \
+    g_cu_ptr, beta_ptr, A_ptr, \
+    cu_seqlens_ptr, chunk_indices_ptr, total_num_chunks_ptr); \
+}
+
+  auto A_type = A.dtype();
+  if (A_type.code == kDLFloat && A_type.bits == 32)
+    DISPATCH(float) // fp32
+  else if (A_type.code == kDLFloat && A_type.bits == 16)
+    DISPATCH(half) // fp16
+  else if (A_type.code == kDLBfloat && A_type.bits == 16)
+    DISPATCH(nv_bfloat16)  // bf16
+
+#undef DISPATCH
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(kkt_v1b, kkt_v1b);
