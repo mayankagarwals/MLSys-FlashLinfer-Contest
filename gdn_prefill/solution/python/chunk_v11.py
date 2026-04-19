@@ -1,4 +1,4 @@
-# from chunk_v7, but use chunk_v6c inverse kernel
+# from chunk_v10b, but with CUDA inv kernel v1
 
 import os
 from pathlib import Path
