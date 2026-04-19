@@ -234,26 +234,18 @@ void inv_uw_v1_kernel_cutlass(
         mbarrier_wait(tma_mbar + stage_id * 8, parity);
       bar_sync<1>(128);
 
-      // compute inverse
-      //
-      // Neumann series
-      // init:
-      //   An = A
-      //   Ai = I-A
-      // iterate:
-      //   new_An = An @ An
-      //   new_Ai = Ai @ (I + new_An)
-      //
-      // Newton-Schulz iteration
-      // init
-      //   Ai = I-A
-      // iterate:
-      //   MAi = (I+A) @ Ai
-      //   new_Ai = Ai @ (2I - MAi)
+      // compute address for [16,16] ldmatrix BF16 tile
+      // row16 and col16 is row and col for [16,16] tile within [64,64] tile.
+      // A smem layout: [BT/64, BT, 64] = [BT, 64]
+      auto compute_addr = [&](uint32_t row16, uint32_t col16) {
+        const uint32_t row = row16 * 16 + (lane_id % 16);
+        const uint32_t col = (col16 * 2 + (lane_id / 16)) ^ (lane_id % 8);
+        return A_smem + row * 128 + col * 16;
+      };
 
+      // compute inverse
       {
         // each warp compute inverse of 16x16 diagonal tiles
-        // A smem layout: [BT/64, BT, 64] = [BT, 64]
 
         // set diagonal of a [16,16] ldmatrix BF16 tile held by a warp to 1
         auto set_diagonal_bf16 = [&](uint32_t *A) {
@@ -267,60 +259,29 @@ void inv_uw_v1_kernel_cutlass(
           }
         };
 
-        // compute address for [16,16] ldmatrix BF16 tile
-        // row16 and col16 is row and col for [16,16] tile within [64,64] tile.
-        auto compute_addr = [&](uint32_t row16, uint32_t col16) {
-          const uint32_t row = row16 * 16 + (lane_id % 16);
-          const uint32_t col = (col16 * 2 + (lane_id / 16)) ^ (lane_id % 8);
-          return A_smem + row * 128 + col * 16;
-        };
-        const uint32_t diag_addr = compute_addr(warp_id_, warp_id_);
-
-        // uint32_t M[4], Ai[4], mma_B[4];
-        // float acc[8], zeros[4] = {};
-        // ldmatrix<4>(M, diag_addr);
-        // set_diagonal_bf16(M);  // I+A
-
-        // ldmatrix<4>(Ai, diag_addr);
-        // for (int i = 0; i < 4; i++)
-        //   Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -A
-        // set_diagonal_bf16(Ai);  // I-A
-
-        // for (int i = 0; i < 3; i++) {
-        //   // MAi = (I+A) @ Ai
-        //   stmatrix<4>(diag_addr, Ai);
-        //   __syncwarp();
-        //   ldmatrix_trans<4>(mma_B, diag_addr);
-        //   mma_bf16(acc + 0, M, mma_B + 0, zeros);
-        //   mma_bf16(acc + 4, M, mma_B + 2, zeros);
-
-        //   // pack to BF16, then store back to smem
-        //   for (int j = 0; j < 4; j++)
-        //     mma_B[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
-        //   for (int i = 0; i < 4; i++)
-        //     mma_B[i] ^= 0x80008000U;  // flip sign bit i.e. -MAi
-        //   set_diagonal_bf16(mma_B);  // 2I-MAi
-        //   stmatrix<4>(diag_addr, mma_B);
-        //   __syncwarp();
-
-        //   ldmatrix_trans<4>(mma_B, diag_addr);
-        //   mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
-        //   mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
-
-        //   // pack to BF16
-        //   for (int j = 0; j < 4; j++)
-        //     Ai[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
-        // }
-
         // init Ai
         uint32_t Ai[4], An[4], mma_B[4];
         float acc[8], zeros[4] = {};
+
+        const uint32_t diag_addr = compute_addr(warp_id_, warp_id_);
         ldmatrix<4>(Ai, diag_addr);  // A
         for (int i = 0; i < 4; i++)
           Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -A
         set_diagonal_bf16(Ai);  // I-A
 
-        for (int i = 0; i < 3; i++) {
+        // init M = I+A, for Newton-Schulz
+        uint32_t M[4];
+        ldmatrix<4>(M, diag_addr);
+        set_diagonal_bf16(M);  // I+A
+
+        // Neumann series
+        // init:
+        //   An = A
+        //   Ai = I-A
+        // iterate:
+        //   new_An = An @ An
+        //   new_Ai = Ai @ (I + new_An)
+        for (int i = 0; i < 0; i++) {
           // new_An = An @ An
           ldmatrix<4>(An, diag_addr);
           ldmatrix_trans<4>(mma_B, diag_addr);
@@ -344,6 +305,39 @@ void inv_uw_v1_kernel_cutlass(
           for (int j = 0; j < 4; j++)
             Ai[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
         }
+
+        // Newton-Schulz iteration
+        // init
+        //   Ai = I-A
+        // iterate:
+        //   MAi = (I+A) @ Ai
+        //   new_Ai = Ai @ (2I - MAi)
+        for (int i = 0; i < 3; i++) {
+          // MAi = (I+A) @ Ai
+          stmatrix<4>(diag_addr, Ai);
+          __syncwarp();
+          ldmatrix_trans<4>(mma_B, diag_addr);
+          mma_bf16(acc + 0, M, mma_B + 0, zeros);
+          mma_bf16(acc + 4, M, mma_B + 2, zeros);
+
+          // pack to BF16, then store back to smem
+          for (int j = 0; j < 4; j++)
+            mma_B[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
+          for (int i = 0; i < 4; i++)
+            mma_B[i] ^= 0x80008000U;  // flip sign bit i.e. -MAi
+          set_diagonal_bf16(mma_B);  // 2I-MAi
+          stmatrix<4>(diag_addr, mma_B);
+          __syncwarp();
+
+          ldmatrix_trans<4>(mma_B, diag_addr);
+          mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
+          mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
+
+          // pack to BF16
+          for (int j = 0; j < 4; j++)
+            Ai[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
+        }
+
         stmatrix<4>(diag_addr, Ai);
         bar_sync<1>(128);
 
@@ -461,25 +455,22 @@ void inv_uw_v1_kernel_cutlass(
       for (int i = 0; i < 64 / 16; i++) {
         uint32_t Ai[4], Ab[4], Abg[4];
         float beta[4], g_cu[4];
+        ldmatrix<4>(Ai, compute_addr(warp_id_, i));
 
-        const int row = warp_id_ * 16 + (lane_id % 16);
-        const int col = (i * 2 + (lane_id / 16)) ^ (lane_id % 8);
-        ldmatrix<4>(Ai, A_smem + row * 128 + col * 16);
-
-        const int scale_col = i * 16 + (lane_id % 4) * 2;
-        lds_f32x2(beta + 0, beta_smem + (scale_col + 0) * 4);
-        lds_f32x2(beta + 2, beta_smem + (scale_col + 8) * 4);
-        lds_f32x2(g_cu + 0, g_cu_smem + (scale_col + 0) * 4);
-        lds_f32x2(g_cu + 2, g_cu_smem + (scale_col + 8) * 4);
+        const int col = i * 16 + (lane_id % 4) * 2;
+        lds_f32x2(beta + 0, beta_smem + (col + 0) * 4);
+        lds_f32x2(beta + 2, beta_smem + (col + 8) * 4);
+        lds_f32x2(g_cu + 0, g_cu_smem + (col + 0) * 4);
+        lds_f32x2(g_cu + 2, g_cu_smem + (col + 8) * 4);
 
         float tmp[8];
         for (int j = 0; j < 4; j++) {
           bf16x2_to_fp32x2(tmp + j * 2, Ai[j]);
-
           tmp[j * 2 + 0] *= beta[j / 2 * 2 + 0];
           tmp[j * 2 + 1] *= beta[j / 2 * 2 + 1];
           Ab[j] = fp32x2_to_bf16x2(tmp[j * 2], tmp[j * 2 + 1]);
 
+          // bf16x2_to_fp32x2(tmp + j * 2, Ab[j]);
           tmp[j * 2 + 0] *= g_cu[j / 2 * 2 + 0];
           tmp[j * 2 + 1] *= g_cu[j / 2 * 2 + 1];
           Abg[j] = fp32x2_to_bf16x2(tmp[j * 2], tmp[j * 2 + 1]);
