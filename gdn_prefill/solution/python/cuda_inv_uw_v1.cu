@@ -219,7 +219,8 @@ void inv_uw_v1_kernel_cutlass(
 
     // set Ai_smem to zeros
     // layout: [64,64] BF16
-    for (int i = 0; i < 4; i++) {
+    // only need to fill the top [48,64]
+    for (int i = 0; i < 3; i++) {
       uint32_t zeros[4] = {};
       const uint32_t row = i * 16 + warp_id_ * 4 + (lane_id / 8);
       const uint32_t col = lane_id % 8;
@@ -303,7 +304,7 @@ void inv_uw_v1_kernel_cutlass(
         // iterate:
         //   new_An = An @ An
         //   new_Ai = Ai @ (I + new_An)
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < 0; i++) {
           // new_An = An @ An
           ldmatrix_trans<4>(mma_B, diag_addr);
           mma_bf16(acc + 0, An, mma_B + 0, zeros);
@@ -326,7 +327,7 @@ void inv_uw_v1_kernel_cutlass(
         // Newton-Schulz iteration
         //   AiM = Ai @ (I+A)
         //   new_Ai = 2Ai - AiM @ Ai
-        for (int i = 0; i < 1; i++) {
+        for (int i = 0; i < 3; i++) {
           // -AiM = Ai @ -M
           stmatrix<4>(diag_addr, Ai);
           __syncwarp();
