@@ -1,3 +1,5 @@
+# from chunk_v10, but uses BF16 for A gmem
+
 import os
 from pathlib import Path
 
@@ -16,7 +18,7 @@ lib_path = tvm_ffi.cpp.build(
     name="gdn_prefill_chunk_10_cuda_o_v1_v1",
     cuda_files=[
         str(CURRENT_DIR / "cuda_prep_meta_v2.cu"),
-        str(CURRENT_DIR / "cuda_kkt_v2.cu"),
+        str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
         str(CURRENT_DIR / "cuda_h_v2.cu"),
         str(CURRENT_DIR / "cuda_o_v1.cu"),
     ],
@@ -57,10 +59,11 @@ def run(
 
     mod.prep_meta_v2(cu_seqlens, chunk_indices, chunk_offsets)
 
+    # use BF16 for A
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
-    A = torch.empty(T, H, BT, device=k.device, dtype=torch.bfloat16)
-    mod.kkt_v2(
+    A = q.new_empty(T, H, BT, dtype=torch.bfloat16)
+    mod.kkt_v1b(
         k,
         A_log,
         a,
