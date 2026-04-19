@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .chunk_v10 import run as chunk_v10
+from .chunk_v10b import run as chunk_v10b
 from .cuda_parallel_v4 import run as cuda_v4
 
 
@@ -28,7 +28,7 @@ def run(
 
     # chunk_v9 pipeline for T>=525
     if T >= 525:
-        return chunk_v10(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+        return chunk_v10b(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA v4 for medium workloads
     if T >= 64 or (N == 1 and T >= 46):
