@@ -77,8 +77,7 @@ void inv_uw_v1_kernel_cutlass(
   extern __shared__ __align__(1024) char smem_ptr[];
   const uint32_t smem = __cvta_generic_to_shared(smem_ptr);
 
-  const uint32_t Ai_smem   = smem + NUM_STAGES * STAGE_SIZE;
-  const uint32_t U_smem    = Ai_smem + A_size;
+  const uint32_t U_smem    = smem + NUM_STAGES * STAGE_SIZE;
   const uint32_t W_smem    = U_smem + V_size;
   const uint32_t beta_smem = W_smem + K_size;
   const uint32_t g_cu_smem = beta_smem + BT * (uint32_t)sizeof(float);
@@ -207,7 +206,6 @@ void inv_uw_v1_kernel_cutlass(
     int stage_id = 0;
     int parity = 0;
 
-    float *Ai_smem_ptr = reinterpret_cast<float *>(smem_ptr + (Ai_smem - smem));
     float *beta_smem_ptr = reinterpret_cast<float *>(smem_ptr + (beta_smem - smem));
     float *g_cu_smem_ptr = reinterpret_cast<float *>(smem_ptr + (g_cu_smem - smem));
 
@@ -256,18 +254,16 @@ void inv_uw_v1_kernel_cutlass(
       {
         // each warp compute inverse of 16x16 diagonal tiles
         // A smem layout: [BT/64, BT, 64] = [BT, 64]
-        uint32_t Ai[4], An[4], mma_B[4];
-        float acc[8], zeros[4] = {};
 
         // set diagonal of a [16,16] ldmatrix BF16 tile held by a warp to 1
-        auto set_diagonal = [&](uint32_t *A) {
+        auto set_diagonal_bf16 = [&](uint32_t *A) {
           if (lane_id % 9 == 0) {  // 0, 9, 18, 27
-            A[0] |= 0x3F80U;  // top left [8,8] tile
-            A[3] |= 0x3F80U;  // bottom right [8,8] tile
+            A[0] = (A[0] & 0xFFFF0000U) | 0x3F80U;  // top left [8,8] tile
+            A[3] = (A[3] & 0xFFFF0000U) | 0x3F80U;  // bottom right [8,8] tile
           }
           else if (lane_id % 9 == 4) {  // 4, 13, 22, 31
-            A[0] |= 0x3F800000U;
-            A[3] |= 0x3F800000U;
+            A[0] = (A[0] & 0xFFFFU) | 0x3F800000U;
+            A[3] = (A[3] & 0xFFFFU) | 0x3F800000U;
           }
         };
 
@@ -278,13 +274,51 @@ void inv_uw_v1_kernel_cutlass(
           const uint32_t col = (col16 * 2 + (lane_id / 16)) ^ (lane_id % 8);
           return A_smem + row * 128 + col * 16;
         };
+        const uint32_t diag_addr = compute_addr(warp_id_, warp_id_);
+
+        // uint32_t M[4], Ai[4], mma_B[4];
+        // float acc[8], zeros[4] = {};
+        // ldmatrix<4>(M, diag_addr);
+        // set_diagonal_bf16(M);  // I+A
+
+        // ldmatrix<4>(Ai, diag_addr);
+        // for (int i = 0; i < 4; i++)
+        //   Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -A
+        // set_diagonal_bf16(Ai);  // I-A
+
+        // for (int i = 0; i < 3; i++) {
+        //   // MAi = (I+A) @ Ai
+        //   stmatrix<4>(diag_addr, Ai);
+        //   __syncwarp();
+        //   ldmatrix_trans<4>(mma_B, diag_addr);
+        //   mma_bf16(acc + 0, M, mma_B + 0, zeros);
+        //   mma_bf16(acc + 4, M, mma_B + 2, zeros);
+
+        //   // pack to BF16, then store back to smem
+        //   for (int j = 0; j < 4; j++)
+        //     mma_B[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
+        //   for (int i = 0; i < 4; i++)
+        //     mma_B[i] ^= 0x80008000U;  // flip sign bit i.e. -MAi
+        //   set_diagonal_bf16(mma_B);  // 2I-MAi
+        //   stmatrix<4>(diag_addr, mma_B);
+        //   __syncwarp();
+
+        //   ldmatrix_trans<4>(mma_B, diag_addr);
+        //   mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
+        //   mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
+
+        //   // pack to BF16
+        //   for (int j = 0; j < 4; j++)
+        //     Ai[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
+        // }
 
         // init Ai
-        const uint32_t diag_addr = compute_addr(warp_id_, warp_id_);
+        uint32_t Ai[4], An[4], mma_B[4];
+        float acc[8], zeros[4] = {};
         ldmatrix<4>(Ai, diag_addr);  // A
         for (int i = 0; i < 4; i++)
           Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -A
-        set_diagonal(Ai);  // I-A
+        set_diagonal_bf16(Ai);  // I-A
 
         for (int i = 0; i < 3; i++) {
           // new_An = An @ An
@@ -302,7 +336,7 @@ void inv_uw_v1_kernel_cutlass(
           // new_Ai = Ai @ (I + new_An)
           // separate acc registers?
           ldmatrix_trans<4>(mma_B, diag_addr);
-          set_diagonal(mma_B);  // I+An
+          set_diagonal_bf16(mma_B);  // I+An
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
 
@@ -433,10 +467,10 @@ void inv_uw_v1_kernel_cutlass(
         ldmatrix<4>(Ai, A_smem + row * 128 + col * 16);
 
         const int scale_col = i * 16 + (lane_id % 4) * 2;
-        lds_f32x2(beta + 0, beta_smem + scale_col * 4);
-        lds_f32x2(beta + 2, beta_smem + scale_col * 4 + 8);
-        lds_f32x2(g_cu + 0, g_cu_smem + scale_col * 4);
-        lds_f32x2(g_cu + 2, g_cu_smem + scale_col * 4 + 8);
+        lds_f32x2(beta + 0, beta_smem + (scale_col + 0) * 4);
+        lds_f32x2(beta + 2, beta_smem + (scale_col + 8) * 4);
+        lds_f32x2(g_cu + 0, g_cu_smem + (scale_col + 0) * 4);
+        lds_f32x2(g_cu + 2, g_cu_smem + (scale_col + 8) * 4);
 
         float tmp[8];
         for (int j = 0; j < 4; j++) {
@@ -602,7 +636,7 @@ void inv_uw_v1(
 
   constexpr int NUM_STAGES = 2;
   constexpr int smem_size = NUM_STAGES * STAGE_SIZE
-                          + A_size + V_size + K_size  // Ai, U, W
+                          + V_size + K_size  // U, W
                           + 2 * BT * sizeof(float)    // beta and g_cu
                           + 4 * NUM_STAGES * 8        // tma, inv, mma, epi mbar
                           + 4;                        // taddr
