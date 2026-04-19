@@ -18,7 +18,7 @@ lib_path = tvm_ffi.cpp.build(
     cuda_files=[
         str(CURRENT_DIR / "cuda_prep_meta_v2.cu"),
         str(CURRENT_DIR / "cuda_kkt_v1b.cu"),
-        str(CURRENT_DIR / "cuda_inv_uw_v0.cu"),
+        str(CURRENT_DIR / "cuda_inv_uw_v1.cu"),
         str(CURRENT_DIR / "cuda_h_v2b.cu"),
         str(CURRENT_DIR / "cuda_o_v1.cu"),
     ],
@@ -61,7 +61,8 @@ def run(
 
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
-    A = q.new_empty(T, H, BT, dtype=torch.float32)
+    # A = q.new_empty(T, H, BT, dtype=torch.float32)
+    A = q.new_empty(T, H, BT, dtype=torch.bfloat16)
     mod.kkt_v1b(
         k,
         A_log,
@@ -82,7 +83,7 @@ def run(
     pad_T = upper_bound_chunks * BT
     u = q.new_empty(pad_T, H, V_dim)
     w = q.new_empty(pad_T, H, V_dim)
-    mod.inv_uw_v0(
+    mod.inv_uw_v1(
         A,
         k,
         v,
