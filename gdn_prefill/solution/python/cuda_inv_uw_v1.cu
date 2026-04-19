@@ -292,6 +292,8 @@ void inv_uw_v1_kernel_cutlass(
         uint32_t M[4];
         ldmatrix<4>(M, diag_addr);
         set_diagonal_bf16(M);  // I+A
+        for (int i = 0; i < 4; i++)
+          M[i] ^= 0x80008000U;  // flip sign bit i.e. -M
 
         // Neumann series
         // init:
@@ -330,7 +332,7 @@ void inv_uw_v1_kernel_cutlass(
         //   MAi = (I+A) @ Ai
         //   new_Ai = Ai @ (2I - MAi)
         for (int i = 0; i < 1; i++) {
-          // MAi = (I+A) @ Ai
+          // -MAi = -(I+A) @ Ai
           stmatrix<4>(diag_addr, Ai);
           __syncwarp();
           ldmatrix_trans<4>(mma_B, diag_addr);
@@ -340,8 +342,6 @@ void inv_uw_v1_kernel_cutlass(
           // pack to BF16, then store back to smem
           for (int j = 0; j < 4; j++)
             mma_B[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
-          for (int i = 0; i < 4; i++)
-            mma_B[i] ^= 0x80008000U;  // flip sign bit i.e. -MAi
           stmatrix<4>(diag_addr, mma_B);
           __syncwarp();
 
@@ -645,7 +645,7 @@ void inv_uw_v1(
   auto *chunk_indices_ptr = reinterpret_cast<int32_t *>(chunk_indices.data_ptr());
   auto *total_chunks_ptr  = reinterpret_cast<int32_t *>(total_chunks.data_ptr());
 
-  constexpr int NUM_STAGES = 2;
+  constexpr int NUM_STAGES = 3;
   constexpr int smem_size = NUM_STAGES * STAGE_SIZE
                           + A_size + V_size + K_size  // Ai, U, W
                           + 2 * BT * sizeof(float)    // beta and g_cu
