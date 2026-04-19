@@ -291,7 +291,7 @@ void inv_uw_v1_kernel_cutlass(
 
         // init M = I+A, for Newton-Schulz
         uint32_t M[4];
-        ldmatrix<4>(M, diag_addr);
+        ldmatrix_trans<4>(M, diag_addr);
         set_diagonal_bf16(M);  // I+A
         for (int i = 0; i < 4; i++)
           M[i] ^= 0x80008000U;  // flip sign bit i.e. -M
@@ -319,41 +319,28 @@ void inv_uw_v1_kernel_cutlass(
           ldmatrix_trans<4>(mma_B, diag_addr);
           mma_bf16(Ai_f32 + 0, Ai, mma_B + 0, Ai_f32 + 0);
           mma_bf16(Ai_f32 + 4, Ai, mma_B + 2, Ai_f32 + 4);
-
-          // pack to BF16 (persist to next iter)
           for (int j = 0; j < 4; j++)
             Ai[j] = fp32x2_to_bf16x2(Ai_f32[j * 2], Ai_f32[j * 2 + 1]);
         }
 
         // Newton-Schulz iteration
-        // init
-        //   Ai = I-A
-        // iterate:
-        //   MAi = (I+A) @ Ai
-        //   new_Ai = Ai @ (2I - MAi)
+        //   AiM = Ai @ (I+A)
+        //   new_Ai = 2Ai - AiM @ Ai
         for (int i = 0; i < 1; i++) {
-          // -MAi = -(I+A) @ Ai
+          // -AiM = Ai @ -M
           stmatrix<4>(diag_addr, Ai);
           __syncwarp();
-          ldmatrix_trans<4>(mma_B, diag_addr);
-          mma_bf16(acc + 0, M, mma_B + 0, zeros);
-          mma_bf16(acc + 4, M, mma_B + 2, zeros);
-
-          // pack to BF16, then store back to smem
+          mma_bf16(acc + 0, Ai, M + 0, zeros);
+          mma_bf16(acc + 4, Ai, M + 2, zeros);
           for (int j = 0; j < 4; j++)
-            mma_B[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
-          stmatrix<4>(diag_addr, mma_B);
-          __syncwarp();
+            Ai[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
 
-          // new_Ai = Ai @ (2I - MAi)
-          //        = 2AI - Ai @ MAi
+          // new_Ai = 2AI - AiM @ Ai
           for (int j = 0; j < 8; j++)
             Ai_f32[j] *= 2.0f;
           ldmatrix_trans<4>(mma_B, diag_addr);
           mma_bf16(Ai_f32 + 0, Ai, mma_B + 0, Ai_f32 + 0);
           mma_bf16(Ai_f32 + 4, Ai, mma_B + 2, Ai_f32 + 4);
-
-          // pack to BF16
           for (int j = 0; j < 4; j++)
             Ai[j] = fp32x2_to_bf16x2(Ai_f32[j * 2], Ai_f32[j * 2 + 1]);
         }
