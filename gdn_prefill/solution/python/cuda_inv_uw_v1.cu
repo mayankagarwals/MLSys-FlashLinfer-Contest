@@ -342,18 +342,20 @@ void inv_uw_v1_kernel_cutlass(
             mma_B[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
           for (int i = 0; i < 4; i++)
             mma_B[i] ^= 0x80008000U;  // flip sign bit i.e. -MAi
-          set_diagonal_bf16(mma_B);  // 2I-MAi
           stmatrix<4>(diag_addr, mma_B);
           __syncwarp();
 
           // new_Ai = Ai @ (2I - MAi)
+          //        = 2AI - Ai @ MAi
+          for (int j = 0; j < 8; j++)
+            Ai_f32[j] *= 2.0f;
           ldmatrix_trans<4>(mma_B, diag_addr);
-          mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
-          mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
+          mma_bf16(Ai_f32 + 0, Ai, mma_B + 0, Ai_f32 + 0);
+          mma_bf16(Ai_f32 + 4, Ai, mma_B + 2, Ai_f32 + 4);
 
           // pack to BF16
           for (int j = 0; j < 4; j++)
-            Ai[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
+            Ai[j] = fp32x2_to_bf16x2(Ai_f32[j * 2], Ai_f32[j * 2 + 1]);
         }
 
         stmatrix<4>(Ai_smem + compute_offset(warp_id_, warp_id_), Ai);
