@@ -61,7 +61,7 @@ def run(
 
     g_cu = torch.empty_like(a, dtype=torch.float32)
     beta = torch.empty_like(b, dtype=torch.float32)
-    A = torch.empty(T, H, BT, device=k.device, dtype=torch.float32)
+    A = q.new_empty(T, H, BT, dtype=torch.float32)
     mod.kkt_v1b(
         k,
         A_log,
