@@ -276,11 +276,12 @@ void inv_uw_v1_kernel_cutlass(
           }
         };
 
-        // init Ai
         uint32_t Ai[4], An[4], mma_B[4];
         float acc[8], zeros[4] = {}, Ai_f32[8];
 
+        // init An and Ai
         const uint32_t diag_addr = A_smem + compute_offset(warp_id_, warp_id_);
+        ldmatrix<4>(An, diag_addr);  // A
         ldmatrix<4>(Ai, diag_addr);  // A
         for (int i = 0; i < 4; i++)
           Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -A
@@ -304,15 +305,14 @@ void inv_uw_v1_kernel_cutlass(
         //   new_Ai = Ai @ (I + new_An)
         for (int i = 0; i < 2; i++) {
           // new_An = An @ An
-          ldmatrix<4>(An, diag_addr);
           ldmatrix_trans<4>(mma_B, diag_addr);
           mma_bf16(acc + 0, An, mma_B + 0, zeros);
           mma_bf16(acc + 4, An, mma_B + 2, zeros);
 
-          // pack to BF16, then store back to smem
+          // pack to BF16, then store back to smem (persist to next iter)
           for (int j = 0; j < 4; j++)
-            mma_B[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
-          stmatrix<4>(diag_addr, mma_B);
+            An[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
+          stmatrix<4>(diag_addr, An);
           __syncwarp();  // do we need this?
 
           // new_Ai = Ai + Ai @ new_An
@@ -320,7 +320,7 @@ void inv_uw_v1_kernel_cutlass(
           mma_bf16(Ai_f32 + 0, Ai, mma_B + 0, Ai_f32 + 0);
           mma_bf16(Ai_f32 + 4, Ai, mma_B + 2, Ai_f32 + 4);
 
-          // pack to BF16
+          // pack to BF16 (persist to next iter)
           for (int j = 0; j < 4; j++)
             Ai[j] = fp32x2_to_bf16x2(Ai_f32[j * 2], Ai_f32[j * 2 + 1]);
         }
