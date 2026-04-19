@@ -18,7 +18,8 @@ from pathlib import Path
 import pandas as pd
 from flashinfer_bench.bench.evaluators import DefaultEvaluator
 from flashinfer_bench.bench.evaluators.utils import allocate_outputs
-from flashinfer_bench.bench.utils import ResolvedEvalConfig, gen_inputs, load_safetensors
+from flashinfer_bench.bench.utils import gen_inputs, load_safetensors
+from flashinfer_bench.bench import BenchmarkConfig as ResolvedEvalConfig
 from flashinfer_bench.compile import BuilderRegistry
 from flashinfer_bench.data import Definition, Solution, Workload
 from pack_solution import pack_solution

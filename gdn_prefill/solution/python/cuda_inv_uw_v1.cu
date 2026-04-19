@@ -347,6 +347,19 @@ void inv_uw_v1_kernel_cutlass(
         // [   A20,   A21, I+A22        ]
         // [   A30,   A31,   A32, I+A33 ]
 
+        // Save original A tiles before off-diag-1 overwrites them in smem.
+        // off-diag-2 needs original A[2,1] (warp0) and A[3,2] (warp1).
+        // off-diag-3 needs original A[3,1] and A[3,2] (warp0).
+        uint32_t A_offdiag2_B[4] = {}, A_31_B[4] = {}, A_32_B[4] = {};
+        if (warp_id_ == 0) {
+          ldmatrix<4>(A_offdiag2_B, compute_addr(2, 1));
+          ldmatrix<4>(A_31_B,       compute_addr(3, 1));
+          ldmatrix<4>(A_32_B,       compute_addr(3, 2));
+        } else if (warp_id_ == 1) {
+          ldmatrix<4>(A_offdiag2_B, compute_addr(3, 2));
+        }
+        bar_sync<1>(128);  // ensure saves finish before off-diag-1 writes
+
         // off-diagonal by 1
         //   Ai10 = -Ai11 @ A10 @ Ai00
         //   Ai21 = -Ai22 @ A21 @ Ai11
@@ -383,7 +396,8 @@ void inv_uw_v1_kernel_cutlass(
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
 
-          ldmatrix<4>(Ai, compute_addr(warp_id_ + 2, warp_id_ + 1));
+          // Use saved original A tile (overwritten in smem by off-diag-1)
+          for (int i = 0; i < 4; i++) Ai[i] = A_offdiag2_B[i];
           ldmatrix_trans<4>(mma_B, compute_addr(warp_id_ + 1, warp_id_));
           mma_bf16(acc + 0, Ai, mma_B + 0, acc + 0);
           mma_bf16(acc + 4, Ai, mma_B + 2, acc + 4);
@@ -414,12 +428,13 @@ void inv_uw_v1_kernel_cutlass(
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
 
-          ldmatrix<4>(Ai, compute_addr(3, 1));
+          // Use saved original A tiles (A[3,1] and A[3,2] overwritten by off-diag-1/2)
+          for (int i = 0; i < 4; i++) Ai[i] = A_31_B[i];
           ldmatrix_trans<4>(mma_B, compute_addr(1, 0));
           mma_bf16(acc + 0, Ai, mma_B + 0, acc + 0);
           mma_bf16(acc + 4, Ai, mma_B + 2, acc + 4);
 
-          ldmatrix<4>(Ai, compute_addr(3, 2));
+          for (int i = 0; i < 4; i++) Ai[i] = A_32_B[i];
           ldmatrix_trans<4>(mma_B, compute_addr(2, 0));
           mma_bf16(acc + 0, Ai, mma_B + 0, acc + 0);
           mma_bf16(acc + 4, Ai, mma_B + 2, acc + 4);
