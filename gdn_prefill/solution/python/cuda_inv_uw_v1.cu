@@ -278,13 +278,15 @@ void inv_uw_v1_kernel_cutlass(
 
         // init Ai
         uint32_t Ai[4], An[4], mma_B[4];
-        float acc[8], zeros[4] = {};
+        float acc[8], zeros[4] = {}, Ai_f32[8];
 
         const uint32_t diag_addr = A_smem + compute_offset(warp_id_, warp_id_);
         ldmatrix<4>(Ai, diag_addr);  // A
         for (int i = 0; i < 4; i++)
           Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -A
         set_diagonal_bf16(Ai);  // I-A
+        for (int i = 0; i < 4; i++)
+          bf16x2_to_fp32x2(Ai_f32 + i * 2, Ai[i]);
 
         // init M = I+A, for Newton-Schulz
         uint32_t M[4];
@@ -298,7 +300,7 @@ void inv_uw_v1_kernel_cutlass(
         // iterate:
         //   new_An = An @ An
         //   new_Ai = Ai @ (I + new_An)
-        for (int i = 0; i < 0; i++) {
+        for (int i = 0; i < 2; i++) {
           // new_An = An @ An
           ldmatrix<4>(An, diag_addr);
           ldmatrix_trans<4>(mma_B, diag_addr);
@@ -311,16 +313,14 @@ void inv_uw_v1_kernel_cutlass(
           stmatrix<4>(diag_addr, mma_B);
           __syncwarp();  // do we need this?
 
-          // new_Ai = Ai @ (I + new_An)
-          // separate acc registers?
+          // new_Ai = Ai + Ai @ new_An
           ldmatrix_trans<4>(mma_B, diag_addr);
-          set_diagonal_bf16(mma_B);  // I+An
-          mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
-          mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
+          mma_bf16(Ai_f32 + 0, Ai, mma_B + 0, Ai_f32 + 0);
+          mma_bf16(Ai_f32 + 4, Ai, mma_B + 2, Ai_f32 + 4);
 
           // pack to BF16
           for (int j = 0; j < 4; j++)
-            Ai[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
+            Ai[j] = fp32x2_to_bf16x2(Ai_f32[j * 2], Ai_f32[j * 2 + 1]);
         }
 
         // Newton-Schulz iteration
@@ -329,7 +329,7 @@ void inv_uw_v1_kernel_cutlass(
         // iterate:
         //   MAi = (I+A) @ Ai
         //   new_Ai = Ai @ (2I - MAi)
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < 1; i++) {
           // MAi = (I+A) @ Ai
           stmatrix<4>(diag_addr, Ai);
           __syncwarp();
@@ -346,6 +346,7 @@ void inv_uw_v1_kernel_cutlass(
           stmatrix<4>(diag_addr, mma_B);
           __syncwarp();
 
+          // new_Ai = Ai @ (2I - MAi)
           ldmatrix_trans<4>(mma_B, diag_addr);
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
