@@ -24,6 +24,13 @@ void lds_f32x2(float *data, uint32_t addr) {
   asm volatile("ld.shared.v2.f32 {%0, %1}, [%2];" : "=f"(data[0]), "=f"(data[1]) : "r"(addr));
 };
 
+__device__ inline
+void sts_b32x4(uint32_t addr, const uint32_t *data) {
+  asm volatile("st.shared.v4.b32 [%0], {%1, %2, %3, %4};"
+              :: "r"(addr),
+                 "r"(data[0]), "r"(data[1]), "r"(data[2]), "r"(data[3]));
+};
+
 __device__ __forceinline__
 void mma_bf16(float d[4], uint32_t a[4], uint32_t b[2], float c[4]) {
   asm volatile(
@@ -77,7 +84,8 @@ void inv_uw_v1_kernel_cutlass(
   extern __shared__ __align__(1024) char smem_ptr[];
   const uint32_t smem = __cvta_generic_to_shared(smem_ptr);
 
-  const uint32_t U_smem    = smem + NUM_STAGES * STAGE_SIZE;
+  const uint32_t Ai_smem   = smem + NUM_STAGES * STAGE_SIZE;
+  const uint32_t U_smem    = Ai_smem + A_size;
   const uint32_t W_smem    = U_smem + V_size;
   const uint32_t beta_smem = W_smem + K_size;
   const uint32_t g_cu_smem = beta_smem + BT * (uint32_t)sizeof(float);
@@ -209,6 +217,15 @@ void inv_uw_v1_kernel_cutlass(
     float *beta_smem_ptr = reinterpret_cast<float *>(smem_ptr + (beta_smem - smem));
     float *g_cu_smem_ptr = reinterpret_cast<float *>(smem_ptr + (g_cu_smem - smem));
 
+    // set Ai_smem to zeros
+    // layout: [64,64] BF16
+    for (int i = 0; i < 4; i++) {
+      uint32_t zeros[4] = {};
+      const uint32_t row = i * 16 + warp_id_ * 4 + (lane_id / 8);
+      const uint32_t col = lane_id % 8;
+      sts_b32x4(Ai_smem + row * 128 + col * 16, zeros);
+    }
+
     for (int global_chunk_id = bid; global_chunk_id < total_chunks; global_chunk_id += gridDim.y) {
       const int2 tmp = reinterpret_cast<const int2 *>(chunk_indices_ptr)[global_chunk_id];
       const int seq_id = tmp.x;
@@ -237,10 +254,10 @@ void inv_uw_v1_kernel_cutlass(
       // compute address for [16,16] ldmatrix BF16 tile
       // row16 and col16 is row and col for [16,16] tile within [64,64] tile.
       // A smem layout: [BT/64, BT, 64] = [BT, 64]
-      auto compute_addr = [&](uint32_t row16, uint32_t col16) {
+      auto compute_offset = [&](uint32_t row16, uint32_t col16) {
         const uint32_t row = row16 * 16 + (lane_id % 16);
         const uint32_t col = (col16 * 2 + (lane_id / 16)) ^ (lane_id % 8);
-        return A_smem + row * 128 + col * 16;
+        return row * 128 + col * 16;
       };
 
       // compute inverse
@@ -263,7 +280,7 @@ void inv_uw_v1_kernel_cutlass(
         uint32_t Ai[4], An[4], mma_B[4];
         float acc[8], zeros[4] = {};
 
-        const uint32_t diag_addr = compute_addr(warp_id_, warp_id_);
+        const uint32_t diag_addr = A_smem + compute_offset(warp_id_, warp_id_);
         ldmatrix<4>(Ai, diag_addr);  // A
         for (int i = 0; i < 4; i++)
           Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -A
@@ -338,7 +355,7 @@ void inv_uw_v1_kernel_cutlass(
             Ai[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
         }
 
-        stmatrix<4>(diag_addr, Ai);
+        stmatrix<4>(Ai_smem + compute_offset(warp_id_, warp_id_), Ai);
         bar_sync<1>(128);
 
         // compute inverse for off-diagonal tiles
@@ -356,21 +373,21 @@ void inv_uw_v1_kernel_cutlass(
             Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -Ai
 
           // warp1 loads A10, warp2 loads A21, warp3 loads A32
-          ldmatrix_trans<4>(mma_B, compute_addr(warp_id_, warp_id_ - 1));
+          ldmatrix_trans<4>(mma_B, A_smem + compute_offset(warp_id_, warp_id_ - 1));
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
           for (int i = 0; i < 4; i++)
             Ai[i] = fp32x2_to_bf16x2(acc[i * 2], acc[i * 2 + 1]);
 
           // warp1 loads Ai00, warp2 loads Ai11, warp3 loads Ai22
-          ldmatrix_trans<4>(mma_B, compute_addr(warp_id_ - 1, warp_id_ - 1));
+          ldmatrix_trans<4>(mma_B, Ai_smem + compute_offset(warp_id_ - 1, warp_id_ - 1));
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
           for (int i = 0; i < 4; i++)
             Ai[i] = fp32x2_to_bf16x2(acc[i * 2], acc[i * 2 + 1]);
 
           // warp1 stores Ai10, warp2 stores Ai21, warp3 stores Ai32
-          stmatrix<4>(compute_addr(warp_id_, warp_id_ - 1), Ai);
+          stmatrix<4>(Ai_smem + compute_offset(warp_id_, warp_id_ - 1), Ai);
         }
         bar_sync<1>(128);
 
@@ -378,67 +395,67 @@ void inv_uw_v1_kernel_cutlass(
         //   Ai20 = -Ai22 @ (A20 @ Ai00 + A21 @ Ai10)
         //   Ai31 = -Ai33 @ (A31 @ Ai11 + A32 @ Ai21)
         if (warp_id_ < 2) {
-          ldmatrix<4>(Ai, compute_addr(warp_id_ + 2, warp_id_));
-          ldmatrix_trans<4>(mma_B, diag_addr);
+          ldmatrix<4>(Ai, A_smem + compute_offset(warp_id_ + 2, warp_id_));
+          ldmatrix_trans<4>(mma_B, Ai_smem + compute_offset(warp_id_, warp_id_));
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
 
-          ldmatrix<4>(Ai, compute_addr(warp_id_ + 2, warp_id_ + 1));
-          ldmatrix_trans<4>(mma_B, compute_addr(warp_id_ + 1, warp_id_));
+          ldmatrix<4>(Ai, A_smem + compute_offset(warp_id_ + 2, warp_id_ + 1));
+          ldmatrix_trans<4>(mma_B, Ai_smem + compute_offset(warp_id_ + 1, warp_id_));
           mma_bf16(acc + 0, Ai, mma_B + 0, acc + 0);
           mma_bf16(acc + 4, Ai, mma_B + 2, acc + 4);
 
           // NOTE: we can swap A and B operand to avoid transposing via smem
           for (int i = 0; i < 4; i++)
             mma_B[i] = fp32x2_to_bf16x2(acc[i * 2], acc[i * 2 + 1]);
-          stmatrix<4>(compute_addr(warp_id_ + 2, warp_id_), mma_B);
+          stmatrix<4>(Ai_smem + compute_offset(warp_id_ + 2, warp_id_), mma_B);
           __syncwarp();
 
-          ldmatrix<4>(Ai, compute_addr(warp_id_ + 2, warp_id_ + 2));
+          ldmatrix<4>(Ai, Ai_smem + compute_offset(warp_id_ + 2, warp_id_ + 2));
           for (int i = 0; i < 4; i++)
             Ai[i] ^= 0x80008000U;  // flip sign bit
-          ldmatrix_trans<4>(mma_B, compute_addr(warp_id_ + 2, warp_id_));
+          ldmatrix_trans<4>(mma_B, Ai_smem + compute_offset(warp_id_ + 2, warp_id_));
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
           for (int i = 0; i < 4; i++)
             mma_B[i] = fp32x2_to_bf16x2(acc[i * 2], acc[i * 2 + 1]);
-          stmatrix<4>(compute_addr(warp_id_ + 2, warp_id_), mma_B);
+          stmatrix<4>(Ai_smem + compute_offset(warp_id_ + 2, warp_id_), mma_B);
         }
         bar_sync<1>(128);
 
         // off-diagonal by 3
         //   Ai30 = -Ai33 @ (A30 @ Ai00 + A31 @ Ai10 + A32 @ Ai20)
         if (warp_id_ == 0) {
-          ldmatrix<4>(Ai, compute_addr(3, 0));
-          ldmatrix_trans<4>(mma_B, diag_addr);
+          ldmatrix<4>(Ai, A_smem + compute_offset(3, 0));
+          ldmatrix_trans<4>(mma_B, Ai_smem + compute_offset(0, 0));
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
 
-          ldmatrix<4>(Ai, compute_addr(3, 1));
-          ldmatrix_trans<4>(mma_B, compute_addr(1, 0));
+          ldmatrix<4>(Ai, A_smem + compute_offset(3, 1));
+          ldmatrix_trans<4>(mma_B, Ai_smem + compute_offset(1, 0));
           mma_bf16(acc + 0, Ai, mma_B + 0, acc + 0);
           mma_bf16(acc + 4, Ai, mma_B + 2, acc + 4);
 
-          ldmatrix<4>(Ai, compute_addr(3, 2));
-          ldmatrix_trans<4>(mma_B, compute_addr(2, 0));
+          ldmatrix<4>(Ai, A_smem + compute_offset(3, 2));
+          ldmatrix_trans<4>(mma_B, Ai_smem + compute_offset(2, 0));
           mma_bf16(acc + 0, Ai, mma_B + 0, acc + 0);
           mma_bf16(acc + 4, Ai, mma_B + 2, acc + 4);
 
           // NOTE: we can swap A and B operand to avoid transposing via smem
           for (int i = 0; i < 4; i++)
             mma_B[i] = fp32x2_to_bf16x2(acc[i * 2], acc[i * 2 + 1]);
-          stmatrix<4>(compute_addr(3, 0), mma_B);
+          stmatrix<4>(Ai_smem + compute_offset(3, 0), mma_B);
           __syncwarp();
 
-          ldmatrix<4>(Ai, compute_addr(3, 3));
+          ldmatrix<4>(Ai, Ai_smem + compute_offset(3, 3));
           for (int i = 0; i < 4; i++)
             Ai[i] ^= 0x80008000U;  // flip sign bit
-          ldmatrix_trans<4>(mma_B, compute_addr(3, 0));
+          ldmatrix_trans<4>(mma_B, Ai_smem + compute_offset(3, 0));
           mma_bf16(acc + 0, Ai, mma_B + 0, zeros);
           mma_bf16(acc + 4, Ai, mma_B + 2, zeros);
           for (int i = 0; i < 4; i++)
             mma_B[i] = fp32x2_to_bf16x2(acc[i * 2], acc[i * 2 + 1]);
-          stmatrix<4>(compute_addr(3, 0), mma_B);
+          stmatrix<4>(Ai_smem + compute_offset(3, 0), mma_B);
         }
         // bar_sync<1>(128);
       }
@@ -455,7 +472,7 @@ void inv_uw_v1_kernel_cutlass(
       for (int i = 0; i < 64 / 16; i++) {
         uint32_t Ai[4], Ab[4], Abg[4];
         float beta[4], g_cu[4];
-        ldmatrix<4>(Ai, compute_addr(warp_id_, i));
+        ldmatrix<4>(Ai, Ai_smem + compute_offset(warp_id_, i));
 
         const int col = i * 16 + (lane_id % 4) * 2;
         lds_f32x2(beta + 0, beta_smem + (col + 0) * 4);
@@ -627,7 +644,7 @@ void inv_uw_v1(
 
   constexpr int NUM_STAGES = 2;
   constexpr int smem_size = NUM_STAGES * STAGE_SIZE
-                          + V_size + K_size  // U, W
+                          + A_size + V_size + K_size  // Ai, U, W
                           + 2 * BT * sizeof(float)    // beta and g_cu
                           + 4 * NUM_STAGES * 8        // tma, inv, mma, epi mbar
                           + 4;                        // taddr
