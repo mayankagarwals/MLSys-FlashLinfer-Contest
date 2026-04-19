@@ -277,12 +277,14 @@ void inv_uw_v1_kernel_cutlass(
           }
         };
 
-        uint32_t Ai[4], An[4], mma_B[4];
+        uint32_t Ai[4], An[4], mma_B[4], M[4];
         float acc[8], zeros[4] = {}, Ai_f32[8];
 
-        // init An and Ai
+        constexpr int NUM_NEUMANN = 0;
+        constexpr int NUM_NEWTON = 3 - NUM_NEUMANN;
+
+        // init Ai
         const uint32_t diag_addr = A_smem + compute_offset(warp_id_, warp_id_);
-        ldmatrix<4>(An, diag_addr);  // A
         ldmatrix<4>(Ai, diag_addr);  // A
         for (int i = 0; i < 4; i++)
           Ai[i] ^= 0x80008000U;  // flip sign bit i.e. -A
@@ -290,12 +292,19 @@ void inv_uw_v1_kernel_cutlass(
         for (int i = 0; i < 4; i++)
           bf16x2_to_fp32x2(Ai_f32 + i * 2, Ai[i]);
 
-        // init M = I+A, for Newton-Schulz
-        uint32_t M[4];
-        ldmatrix_trans<4>(M, diag_addr);
-        set_diagonal_bf16(M);  // I+A
-        for (int i = 0; i < 4; i++)
-          M[i] ^= 0x80008000U;  // flip sign bit i.e. -M
+        // init An
+        if constexpr (NUM_NEUMANN > 0) {
+          ldmatrix<4>(An, diag_addr);  // A
+          ldmatrix_trans<4>(mma_B, diag_addr);  // A
+        }
+
+        // init M = I+A
+        if constexpr (NUM_NEWTON > 0) {
+          ldmatrix_trans<4>(M, diag_addr);
+          set_diagonal_bf16(M);  // I+A
+          for (int i = 0; i < 4; i++)
+            M[i] ^= 0x80008000U;  // flip sign bit i.e. -M
+        }
 
         // Neumann series
         // init:
@@ -303,21 +312,18 @@ void inv_uw_v1_kernel_cutlass(
         //   Ai = I-A
         // iterate:
         //   new_An = An @ An
-        //   new_Ai = Ai @ (I + new_An)
-        for (int i = 0; i < 0; i++) {
+        //   new_Ai = Ai + Ai @ new_An
+        for (int i = 0; i < NUM_NEUMANN; i++) {
           // new_An = An @ An
-          ldmatrix_trans<4>(mma_B, diag_addr);
           mma_bf16(acc + 0, An, mma_B + 0, zeros);
           mma_bf16(acc + 4, An, mma_B + 2, zeros);
-
-          // pack to BF16, then store back to smem (persist to next iter)
-          for (int j = 0; j < 4; j++)
+          for (int j = 0; j < 4; j++)  // persist An to next iter
             An[j] = fp32x2_to_bf16x2(acc[j * 2], acc[j * 2 + 1]);
           stmatrix<4>(diag_addr, An);
           __syncwarp();  // do we need this?
 
           // new_Ai = Ai + Ai @ new_An
-          ldmatrix_trans<4>(mma_B, diag_addr);
+          ldmatrix_trans<4>(mma_B, diag_addr);  // persist An to next iter
           mma_bf16(Ai_f32 + 0, Ai, mma_B + 0, Ai_f32 + 0);
           mma_bf16(Ai_f32 + 4, Ai, mma_B + 2, Ai_f32 + 4);
           for (int j = 0; j < 4; j++)
@@ -327,7 +333,7 @@ void inv_uw_v1_kernel_cutlass(
         // Newton-Schulz iteration
         //   AiM = Ai @ (I+A)
         //   new_Ai = 2Ai - AiM @ Ai
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < NUM_NEWTON; i++) {
           // -AiM = Ai @ -M
           stmatrix<4>(diag_addr, Ai);
           __syncwarp();
