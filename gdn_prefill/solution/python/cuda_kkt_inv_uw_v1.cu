@@ -1,8 +1,5 @@
 // Fused kkt_v1b + inv_uw_v1 kernel.
 //
-// Grid: dim3(H=8, 148/H=18) = 144 blocks. Each block = (v_head, chunk_bucket).
-// KKT is redundantly computed within paired v_heads (same k_head).
-//
 // Math (per chunk, per head; BT=64, K_dim=V_dim=128):
 //
 //   beta   = sigmoid(b)                                    in  [BT]
