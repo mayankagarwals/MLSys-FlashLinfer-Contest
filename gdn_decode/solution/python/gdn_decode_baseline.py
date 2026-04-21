@@ -10,11 +10,9 @@ from cutlass.cute.runtime import from_dlpack
 # ============================================================================
 # Constants for PRETRANSPOSE version ([B*HV, V, K])
 # ============================================================================
-TILE_V = 8
 TILE_K = 128
 NUM_STAGES = 2
 NUM_THREADS = 128  # 4 warps
-NUM_BLOCKS_PER_STATE = 8
 
 
 @cute.kernel
@@ -24,6 +22,8 @@ def gdn_decode_kernel_small_batch_pretranspose(
     smem_layout_staged: cute.Layout,
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
+    num_blocks_per_state: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
     A_log: cute.Tensor,  # [HV]
     a: cute.Tensor,  # [B, T, HV]
     dt_bias: cute.Tensor,  # [HV]
@@ -45,9 +45,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     block_idx, _, _ = cute.arch.block_idx()
-    batch_idx = block_idx // NUM_BLOCKS_PER_STATE
-    batch_inner = block_idx % NUM_BLOCKS_PER_STATE
-    num_v_tiles_per_block = num_v_tiles // NUM_BLOCKS_PER_STATE
+    batch_idx = block_idx // num_blocks_per_state
+    batch_inner = block_idx % num_blocks_per_state
+    num_v_tiles_per_block = num_v_tiles // num_blocks_per_state
     i_n = batch_idx // HV
     i_hv = batch_idx % HV
     i_h = i_hv // (HV // H)
@@ -102,11 +102,11 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
     # Get current batch
     gSrc_batch = h0_source[(state_idx, None, None)]  # (V, K)
-    gDst = cute.local_tile(h0_source, (1, TILE_V, TILE_K), (state_idx, None, 0))
+    gDst = cute.local_tile(h0_source, (1, tile_v, TILE_K), (state_idx, None, 0))
     # Tile along V dimension
     gSrc = cute.local_tile(
-        gSrc_batch, (TILE_V, TILE_K), (None, 0)
-    )  # (TILE_V, TILE_K, num_v_tiles)
+        gSrc_batch, (tile_v, TILE_K), (None, 0)
+    )  # (tile_v, TILE_K, num_v_tiles)
 
     # Partition for load
     thr_copy_load = tiled_copy_load.get_slice(tidx)
@@ -209,7 +209,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
             cute.arch.cp_async_commit_group()
 
         # Step 3: Compute using data from current stage (contiguous access pattern)
-        for row in cutlass.range_constexpr(0, TILE_V, 4):
+        for row in cutlass.range_constexpr(0, tile_v, 4):
             row_offset = tidx // 32
             sum_hk = 0.0
 
@@ -228,7 +228,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
                     sum_hk, offset=offset, mask=-1, mask_and_clamp=31
                 )
 
-            v_new = sV[v_tiles * TILE_V + row + row_offset] - sum_hk
+            v_new = sV[v_tiles * tile_v + row + row_offset] - sum_hk
             v_new = v_new * r_beta
 
             sum_hq = 0.0
@@ -247,7 +247,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
                     sum_hq, offset=offset, mask=-1, mask_and_clamp=31
                 )
 
-            o_idx = v_tiles * TILE_V + row + row_offset
+            o_idx = v_tiles * tile_v + row + row_offset
             if lane_id == 0 and o_idx < V:
                 sOutput[o_idx] = cutlass.BFloat16(sum_hq)
 
@@ -256,7 +256,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     # All threads write (V=128, NUM_THREADS=128)
     # ===================================================================
     cute.arch.barrier()  # Ensure all writes to sOutput are complete
-    if tidx >= start_v_tiles * TILE_V and tidx < end_v_tiles * TILE_V:
+    if tidx >= start_v_tiles * tile_v and tidx < end_v_tiles * tile_v:
         o[(i_n, i_t, i_hv, tidx)] = sOutput[tidx]
 
 
@@ -277,6 +277,8 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
+    num_blocks_per_state: cutlass.Constexpr[int],
+    tile_v: cutlass.Constexpr[int],
     stream: cuda.CUstream = None,
 ):
     """Launch original pipelined kernel for small batch pretranspose."""
@@ -296,20 +298,20 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
 
     tiled_copy_load = cute.make_tiled_copy_tv(copy_atom, thread_layout, val_layout)
 
-    num_v_tiles = cute.ceil_div(V, TILE_V)
+    num_v_tiles = cute.ceil_div(V, tile_v)
 
     # Each thread in a warp processes this many elements (always 4 for TILE_K=128)
     vec_size = TILE_K // 32
 
     # Create SMEM layout
     smem_layout_staged = cute.make_layout(
-        (TILE_V, TILE_K, NUM_STAGES), stride=(TILE_K, 1, TILE_V * TILE_K)
+        (tile_v, TILE_K, NUM_STAGES), stride=(TILE_K, 1, tile_v * TILE_K)
     )
 
-    # sData: TILE_V * TILE_K * NUM_STAGES * 4 bytes (Float32)
+    # sData: tile_v * TILE_K * NUM_STAGES * 4 bytes (Float32)
     # sV: K * 4 bytes (Float32)
     # sOutput: V * 2 bytes (BFloat16)
-    smem_bytes = 4 * TILE_V * TILE_K * NUM_STAGES + 4 * K + 2 * V + 32
+    smem_bytes = 4 * tile_v * TILE_K * NUM_STAGES + 4 * K + 2 * V + 32
 
     gdn_decode_kernel_small_batch_pretranspose(
         tiled_copy_load,
@@ -317,6 +319,8 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         smem_layout_staged,
         vec_size,
         num_v_tiles,
+        num_blocks_per_state,
+        tile_v,
         A_log,
         a,
         dt_bias,
@@ -332,7 +336,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         K,
         V,
     ).launch(
-        grid=(grid_batch * NUM_BLOCKS_PER_STATE, 1, 1),
+        grid=(grid_batch * num_blocks_per_state, 1, 1),
         block=[NUM_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -353,6 +357,14 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     cache_key = (B, H, HV, K, V, q.dtype)
     if cache_key not in kernel_cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+        num_blocks_per_state = 16
+        if B >= 48:
+            num_blocks_per_state = 4
+        elif B >= 16:
+            num_blocks_per_state = 8
+
+        tile_v = 4 if B <= 8 else 8
 
         # Convert tensors to CuTe format for compilation only
         h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
@@ -383,6 +395,8 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
             H=H,
             K=K,
             V=V,
+            num_blocks_per_state=num_blocks_per_state,
+            tile_v=tile_v,
             stream=stream,
             options="--enable-tvm-ffi",
         )
