@@ -139,7 +139,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     cute.autovec_copy(v_tile, r_v_bf16)
 
     for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = cutlass.Float32(r_q_bf16[i]) * scale
+        r_q[i] = cutlass.Float32(r_q_bf16[i])
         r_k[i] = cutlass.Float32(r_k_bf16[i])
         sV[k_start + i] = cutlass.Float32(r_v_bf16[i])
 
@@ -243,7 +243,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
 
             o_idx = v_tiles * tile_v + row + row_offset
             if lane_id == 0 and o_idx < V:
-                sOutput[o_idx] = cutlass.BFloat16(sum_hq)
+                sOutput[o_idx] = cutlass.BFloat16(sum_hq * scale)
 
     # ===================================================================
     # Final writeback: Copy output from shared memory to global memory
