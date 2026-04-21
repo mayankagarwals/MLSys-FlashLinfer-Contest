@@ -86,24 +86,25 @@ def gdn_decode_kernel_small_batch_gmem(
     # All lanes compute identical g / beta (uniform inputs → no warp shuffle).
     x = r_a + r_dt_bias
     beta_x = x
-    softplus_x = 0.0
-    if beta_x <= 20.0:
-        exp_beta_x = cute.exp(beta_x, fastmath=True)
-        log_input = cutlass.Float32(1.0 + exp_beta_x)
-        log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
-        softplus_x = log_result
-    else:
-        softplus_x = x
+    # softplus_x = x
+    # if beta_x <= 20.0:
+    exp_beta_x = cute.exp(beta_x, fastmath=True)
+    log_input = cutlass.Float32(1.0 + exp_beta_x)
+    log_result = cutlass.Float32(cute.log(log_input, fastmath=True))
+    softplus_x = log_result
+    # else:
+        # softplus_x = x
     r_g_value = -cute.exp(r_A_log, fastmath=True) * softplus_x
     r_beta = 1.0 / (1.0 + cute.exp(-r_b, fastmath=True))
     r_g = cute.exp(r_g_value, fastmath=True)
 
     sum_hk = 0.0
-    for i in cutlass.range_constexpr(vec_size):
-        r_q[i] = cutlass.Float32(r_q_bf16[i]) * scale
+    for i in cutlass.range_constexpr(vec_size, unroll=True):
+        r_q[i] = cutlass.Float32(r_q_bf16[i])
         r_k[i] = cutlass.Float32(r_k_bf16[i])
         r_h[i] = r_h[i] * r_g
         sum_hk += r_h[i] * r_k[i]
+
     for offset in [16, 8, 4, 2, 1]:
         sum_hk += cute.arch.shuffle_sync_bfly(
             sum_hk, offset=offset, mask=-1, mask_and_clamp=31
@@ -118,7 +119,7 @@ def gdn_decode_kernel_small_batch_gmem(
     v_new = (v_scalar - sum_hk) * r_beta
 
     sum_hq = 0.0
-    for i in cutlass.range_constexpr(vec_size):
+    for i in cutlass.range_constexpr(vec_size, unroll=True):
         r_h[i] += r_k[i] * v_new
         sum_hq += r_h[i] * r_q[i]
 
@@ -131,7 +132,7 @@ def gdn_decode_kernel_small_batch_gmem(
     cute.autovec_copy(r_h, g_out)
 
     if lane_id == 0 and v_row < V:
-        o[i_n, i_t, i_hv, v_row] = cutlass.BFloat16(sum_hq)
+        o[i_n, i_t, i_hv, v_row] = cutlass.BFloat16(sum_hq * scale)
 
 
 @cute.jit

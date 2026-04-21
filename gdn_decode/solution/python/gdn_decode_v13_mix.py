@@ -16,7 +16,7 @@ ctypes.CDLL("libcudart.so", mode=ctypes.RTLD_GLOBAL)
 
 
 from .gdn_decode_baseline import run as baseline_run
-from .gdn_decode_cutedsl_small_batch_gmem import run as cutedsl_small_batch_gmem_run
+from .gdn_decode_v13_asm_small_batch import run as v13_asm_small_batch_run
 
 
 def run(q, k, v, state, A_log, a, dt_bias, b, scale):
@@ -25,4 +25,4 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     if B >= 8:
         # CuTe baseline with tuned num_blocks_per_state
         return baseline_run(q, k, v, state, A_log, a, dt_bias, b, scale)
-    return cutedsl_small_batch_gmem_run(q, k, v, state, A_log, a, dt_bias, b, scale)
+    return v13_asm_small_batch_run(q, k, v, state, A_log, a, dt_bias, b, scale)
