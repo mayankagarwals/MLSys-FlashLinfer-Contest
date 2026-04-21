@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 
 from .cuda_recurrent_v1 import run as cuda_recurrent_v1
-from .chunk_v11 import run as chunk_v11
+from .chunk_v12 import run as chunk_v12
 
 
 def run(
@@ -25,9 +25,9 @@ def run(
     T = q.shape[0]
     N = cu_seqlens.shape[0] - 1
 
-    # chunk_v11 for medium/large workloads
+    # chunk_v12 for medium/large workloads
     if T >= 64 or (N == 1 and T >= 46):
-        return chunk_v11(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+        return chunk_v12(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
 
     # CUDA recurrent for tiny/small workloads
     o = torch.empty_like(v)
