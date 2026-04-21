@@ -40,7 +40,7 @@ def gdn_decode_kernel_small_batch_gmem(
 ):
     """One block = one V-tile of ROWS_PER_BLOCK rows; state read/write in registers / GMEM."""
     tidx, _, _ = cute.arch.thread_idx()
-    lane_id = cute.arch.lane_idx()
+    lane_id = tidx % 32
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     block_idx, _, _ = cute.arch.block_idx()
@@ -110,10 +110,10 @@ def gdn_decode_kernel_small_batch_gmem(
         )
 
     v_scalar_bf16 = cutlass.BFloat16(0.0)
-    if lane_id == 0 and v_row < V:
+    v_scalar = 0.0
+    if v_row < V:
         v_scalar_bf16 = v[i_n, i_t, i_hv, v_row]
-    v_scalar = cutlass.Float32(v_scalar_bf16)
-    v_scalar = cute.arch.shuffle_sync(v_scalar, 0)
+        v_scalar = cutlass.Float32(v_scalar_bf16)
 
     v_new = (v_scalar - sum_hk) * r_beta
 
@@ -121,6 +121,7 @@ def gdn_decode_kernel_small_batch_gmem(
     for i in cutlass.range_constexpr(vec_size):
         r_h[i] += r_k[i] * v_new
         sum_hq += r_h[i] * r_q[i]
+
     for offset in [16, 8, 4, 2, 1]:
         sum_hq += cute.arch.shuffle_sync_bfly(
             sum_hq, offset=offset, mask=-1, mask_and_clamp=31

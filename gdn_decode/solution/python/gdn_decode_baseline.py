@@ -137,6 +137,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     # Load v into BF16 registers using autovec_copy, convert to FP32, store to sV
     v_tile = cute.local_tile(v, (1, 1, 1, vec_size), (i_n, i_t, i_hv, lane_id))
     cute.autovec_copy(v_tile, r_v_bf16)
+
     for i in cutlass.range_constexpr(vec_size):
         r_q[i] = cutlass.Float32(r_q_bf16[i]) * scale
         r_k[i] = cutlass.Float32(r_k_bf16[i])
