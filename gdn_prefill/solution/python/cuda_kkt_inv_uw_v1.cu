@@ -227,7 +227,6 @@ void kkt_inv_uw_v1_kernel_cutlass(
     if (elect_sync()) {
       int stage_id = 0;
       int tma_parity = 0;
-      int inv_parity = 0;
       int epi_parity = 1;
 
       for (int global_chunk_id = bid; global_chunk_id < total_chunks; global_chunk_id += gridDim.y) {
@@ -265,7 +264,7 @@ void kkt_inv_uw_v1_kernel_cutlass(
 
         // --- MMA #2: U = Ab @ V, W = Abg @ K ---
         // Wait inv_mbar: inv has finished reading KKT AND produced Ab/Abg.
-        mbarrier_wait(inv_mbar + stage_id * 8, inv_parity);
+        mbarrier_wait(inv_mbar + stage_id * 8, tma_parity);
         tcgen05_fence_after_thread_sync();
 
         constexpr uint32_t u_idesc = make_tcgen05_idesc(BT, V_dim) | (1U << 16U);
@@ -286,7 +285,6 @@ void kkt_inv_uw_v1_kernel_cutlass(
         stage_id = (stage_id + 1) % NUM_STAGES;
         if (stage_id == 0) {
           tma_parity ^= 1;
-          inv_parity ^= 1;
           epi_parity ^= 1;
         }
       }
