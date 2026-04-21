@@ -186,7 +186,6 @@ __global__ void GdnDecodePipelinedV11(
     const int tile_v_start = v_start + tile * kTileV;
 
     CpAsyncWaitAll();
-    __syncwarp(kFullWarpMask);
 
     if (tile + 1 < kVTilesPerCTA) {
       const int next_stage = (tile + 1) % kNumStages;
