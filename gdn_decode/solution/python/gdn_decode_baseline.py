@@ -14,7 +14,6 @@ TILE_V = 8
 TILE_K = 128
 NUM_STAGES = 2
 NUM_THREADS = 128  # 4 warps
-NUM_BLOCKS_PER_STATE = 8
 
 
 @cute.kernel
@@ -24,6 +23,7 @@ def gdn_decode_kernel_small_batch_pretranspose(
     smem_layout_staged: cute.Layout,
     vec_size: cutlass.Constexpr[int],
     num_v_tiles: cutlass.Constexpr[int],
+    num_blocks_per_state: cutlass.Constexpr[int],
     A_log: cute.Tensor,  # [HV]
     a: cute.Tensor,  # [B, T, HV]
     dt_bias: cute.Tensor,  # [HV]
@@ -45,9 +45,9 @@ def gdn_decode_kernel_small_batch_pretranspose(
     warp_idx = cute.arch.warp_idx()
     warp_idx = cute.arch.make_warp_uniform(warp_idx)
     block_idx, _, _ = cute.arch.block_idx()
-    batch_idx = block_idx // NUM_BLOCKS_PER_STATE
-    batch_inner = block_idx % NUM_BLOCKS_PER_STATE
-    num_v_tiles_per_block = num_v_tiles // NUM_BLOCKS_PER_STATE
+    batch_idx = block_idx // num_blocks_per_state
+    batch_inner = block_idx % num_blocks_per_state
+    num_v_tiles_per_block = num_v_tiles // num_blocks_per_state
     i_n = batch_idx // HV
     i_hv = batch_idx % HV
     i_h = i_hv // (HV // H)
@@ -277,6 +277,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
     H: cutlass.Constexpr[int],
     K: cutlass.Constexpr[int],
     V: cutlass.Constexpr[int],
+    num_blocks_per_state: cutlass.Constexpr[int],
     stream: cuda.CUstream = None,
 ):
     """Launch original pipelined kernel for small batch pretranspose."""
@@ -317,6 +318,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         smem_layout_staged,
         vec_size,
         num_v_tiles,
+        num_blocks_per_state,
         A_log,
         a,
         dt_bias,
@@ -332,7 +334,7 @@ def run_gdn_decode_kernel_small_batch_pretranspose(
         K,
         V,
     ).launch(
-        grid=(grid_batch * NUM_BLOCKS_PER_STATE, 1, 1),
+        grid=(grid_batch * num_blocks_per_state, 1, 1),
         block=[NUM_THREADS, 1, 1],
         smem=smem_bytes,
         stream=stream,
@@ -354,6 +356,11 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
     if cache_key not in kernel_cache:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+        num_blocks_per_state = 16
+        if B >= 48:
+            num_blocks_per_state = 4
+        elif B >= 16:
+            num_blocks_per_state = 8
         # Convert tensors to CuTe format for compilation only
         h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
@@ -383,6 +390,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, scale):
             H=H,
             K=K,
             V=V,
+            num_blocks_per_state=num_blocks_per_state,
             stream=stream,
             options="--enable-tvm-ffi",
         )
