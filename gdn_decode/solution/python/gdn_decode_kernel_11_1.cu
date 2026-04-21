@@ -136,16 +136,15 @@ __global__ void GdnDecodePipelinedV11(
   extern __shared__ char smem_raw[];
   SmemPipelined &smem = *reinterpret_cast<SmemPipelined *>(smem_raw);
 
-  const int block_linear = static_cast<int>(blockIdx.x);
-  const int cta_idx = block_linear % kNumCTAs;
-  const int bh = block_linear / kNumCTAs;
+  // const int block_linear = static_cast<int>(blockIdx.x);
+  const int cta_idx = blockIdx.x % kNumCTAs;
+  const int bh = blockIdx.x / kNumCTAs;
 
   const int batch_idx = bh / kNumVHeads;
   const int hv_idx = bh % kNumVHeads;
 
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & (kWarpSize - 1);
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & (kWarpSize - 1);
 
   const int q_head = hv_idx / kQGroupSize;
   const int k_head = hv_idx / kKGroupSize;
@@ -155,15 +154,15 @@ __global__ void GdnDecodePipelinedV11(
 
   const int v_start = cta_idx * kVTilesPerCTA * kTileV;
 
-  // Read gate scalars early (hides latency behind cp.async)
+  // Prefetch first tile (stage 0)
+  IssueTileAsyncCopy(smem.sData[0], state, hv_base, v_start, warp_id, lane);
+  CpAsyncCommit();
+
+  // Issue cp.async early to overlap the scalar read
   const float r_A_log = A_log[hv_idx];
   const float r_a = __bfloat162float(a[hv_base]);
   const float r_dt_bias = dt_bias[hv_idx];
   const float r_b = __bfloat162float(b[hv_base]);
-
-  // Prefetch first tile (stage 0)
-  IssueTileAsyncCopy(smem.sData[0], state, hv_base, v_start, warp_id, lane);
-  CpAsyncCommit();
 
   // Load q, k while cp.async is in flight
   const int kk_base = lane * kElemsPerLane;
@@ -186,7 +185,6 @@ __global__ void GdnDecodePipelinedV11(
     const int tile_v_start = v_start + tile * kTileV;
 
     CpAsyncWaitAll();
-    __syncwarp(kFullWarpMask);
 
     if (tile + 1 < kVTilesPerCTA) {
       const int next_stage = (tile + 1) % kNumStages;
