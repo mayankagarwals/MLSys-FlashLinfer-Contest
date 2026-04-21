@@ -212,7 +212,6 @@ def gdn_decode_kernel_small_batch_pretranspose(
                 sData, (1, vec_size, 1), (row + row_offset, lane_id, stage)
             )
             cute.autovec_copy(sData_tile, r_h)
-            sum_hq = 0.0
 
             for i in cutlass.range_constexpr(vec_size):
                 r_h[i] = r_h[i] * r_g
