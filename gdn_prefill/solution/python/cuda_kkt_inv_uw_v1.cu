@@ -16,7 +16,7 @@
 //   W      = (Ai * beta[j] * exp(g_cu[j])) @ K             in  [BT, K_dim]
 //
 // Inputs (gmem):  K, V, a, b, A_log, dt_bias
-// Outputs (gmem): U, W (bf16), beta, g_cu (fp32, used by downstream H/O kernels)
+// Outputs (gmem): U, W (bf16), g_cu (fp32, used by downstream H/O kernels)
 // Intermediate A lives only in smem — it does not round-trip through HBM.
 //
 // Warp specialization (10 warps = 320 threads per CTA):
@@ -33,7 +33,7 @@
 //   TMA:    load K, V                            [mma_mbar wait → tma_mbar arrive]
 //   MMA #1: KKT = K @ K^T                        [tma_mbar + epi_mbar wait → kkt_mbar arrive]
 //   INV P1: beta, g_cu from a, b, A_log          (parallel with KKT MMA)
-//             beta  = sigmoid(b), writes to beta_smem + gmem beta_ptr
+//             beta  = sigmoid(b), writes to beta_smem
 //             g_cu  = cumsum(-exp(A_log)*softplus(a+dt_bias)) via warp scan
 //             stores g_cu to gmem + exp(g_cu) to g_cu_smem
 //   INV P2: wait kkt_mbar, tcgen05_ld KKT from tmem into regs,
@@ -132,7 +132,6 @@ void kkt_inv_uw_v1_kernel_cutlass(
   const float       *dt_bias_ptr,              // [H]
   const nv_bfloat16 *b_ptr,                    // [total_T, H]
         float       *g_cu_ptr,                 // [total_T, H]
-        float       *beta_ptr,                 // [total_T, H]
   const int64_t     *cu_seqlens_ptr,           // [N+1]
   const int32_t     *chunk_indices_ptr,        // [total_num_chunks, 2]
   const int32_t     *total_chunks_ptr
@@ -343,9 +342,6 @@ void kkt_inv_uw_v1_kernel_cutlass(
       float g_val    = A_log_val * __logf(1.0f + __expf(a_val + dt_bias_val));
       if (!in_range) g_val = 0.0f;
 
-      if (is_active && in_range) {
-        beta_ptr[off_t * H + head_id] = beta_val;
-      }
       if (is_active) {
         beta_smem_ptr[my_row] = beta_val;
       }
@@ -691,7 +687,6 @@ void kkt_inv_uw_v1(
   TensorView dt_bias,
   TensorView b,
   TensorView g_cu,
-  TensorView beta,
   TensorView cu_seqlens,
   TensorView chunk_indices,
   TensorView total_chunks
@@ -708,7 +703,6 @@ void kkt_inv_uw_v1(
   auto *dt_bias_ptr = reinterpret_cast<const float *>(dt_bias.data_ptr());
   auto *b_ptr       = reinterpret_cast<const nv_bfloat16 *>(b.data_ptr());
   auto *g_cu_ptr    = reinterpret_cast<float *>(g_cu.data_ptr());
-  auto *beta_ptr    = reinterpret_cast<float *>(beta.data_ptr());
   auto *cu_seqlens_ptr    = reinterpret_cast<int64_t *>(cu_seqlens.data_ptr());
   auto *chunk_indices_ptr = reinterpret_cast<int32_t *>(chunk_indices.data_ptr());
   auto *total_chunks_ptr  = reinterpret_cast<int32_t *>(total_chunks.data_ptr());
@@ -728,7 +722,7 @@ void kkt_inv_uw_v1(
   kernel<<<grid, TB_SIZE, smem_size>>>(
     K_tmap, V_tmap, U_tmap, W_tmap,
     A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
-    g_cu_ptr, beta_ptr,
+    g_cu_ptr,
     cu_seqlens_ptr, chunk_indices_ptr, total_chunks_ptr);
 }
 

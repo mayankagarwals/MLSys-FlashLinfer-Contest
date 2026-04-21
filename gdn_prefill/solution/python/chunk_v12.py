@@ -60,7 +60,6 @@ def run(
     mod.prep_meta_v2(cu_seqlens, chunk_indices, chunk_offsets)
 
     g_cu = torch.empty_like(a, dtype=torch.float32)
-    beta = torch.empty_like(b, dtype=torch.float32)
 
     # fused KKT + inverse + UW (no A in gmem)
     u = q.new_empty(pad_T, H, V_dim)
@@ -75,7 +74,6 @@ def run(
         dt_bias,
         b,
         g_cu,
-        beta,
         cu_seqlens,
         chunk_indices,
         total_chunks_ptr,
