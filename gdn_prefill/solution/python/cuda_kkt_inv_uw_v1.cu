@@ -30,7 +30,7 @@
 //                and drives the TMA->smem pipeline stages.
 //
 // How it works (per chunk, steady state):
-//   TMA:    load K, V                            [mma_mbar wait → tma_mbar arrive]
+//   TMA:    load K, V                            [uw_mbar wait → tma_mbar arrive]
 //   MMA #1: KKT = K @ K^T                        [tma_mbar + epi_mbar wait → kkt_mbar arrive]
 //   INV P1: beta, g_cu from a, b, A_log          (parallel with KKT MMA)
 //             beta  = sigmoid(b), writes to beta_smem
@@ -44,11 +44,11 @@
 //             - off-diag by 1 (warps 1..3): Ai_{i,i-1} = -Ai_{i,i} @ A_{i,i-1} @ Ai_{i-1,i-1}
 //             - off-diag by 2 (warps 0..1): Ai_{2,0}, Ai_{3,1} with 2-term sum
 //             - off-diag by 3 (warp 0):     Ai_{3,0} with 3-term sum
-//   INV P4: Ab = Ai*β[j], Abg = Ab*exp(g_cu[j])  [mma_mbar wait (prev) → inv_mbar arrive]
+//   INV P4: Ab = Ai*β[j], Abg = Ab*exp(g_cu[j])  [uw_mbar wait (prev) → inv_mbar arrive]
 //             ldmatrix Ai_smem → scale by beta/g_cu → tcgen05_st into Ab/Abg tmem
-//   MMA #2: U = Ab@V, W = Abg@K                  [inv_mbar wait → mma_mbar arrive]
+//   MMA #2: U = Ab@V, W = Abg@K                  [inv_mbar wait → uw_mbar arrive]
 //             tcgen05_mma_tmem: A-operand lives in tmem (Ab/Abg), B in smem (V/K)
-//   EPI:    tmem → smem → TMA store U, W         [mma_mbar wait → epi_mbar arrive]
+//   EPI:    tmem → smem → TMA store U, W         [uw_mbar wait → epi_mbar arrive]
 //             tcgen05_ld U/W (fp32) → fp32x2_to_bf16x2 pack → stmatrix into
 //             swizzled U_smem/W_smem → tma_store_4d to gmem
 //
@@ -110,10 +110,11 @@ constexpr int BT = 64;
 constexpr int K_dim = 128;
 constexpr int V_dim = 128;
 
-constexpr int A_size = BT * BT * sizeof(nv_bfloat16);
 constexpr int K_size = BT * K_dim * sizeof(nv_bfloat16);
 constexpr int V_size = BT * V_dim * sizeof(nv_bfloat16);
-constexpr int STAGE_SIZE = A_size + K_size + V_size;
+constexpr int STAGE_SIZE = K_size + V_size;
+
+constexpr int A_size = BT * BT * sizeof(nv_bfloat16);
 
 constexpr int NUM_WARPS = 4 + 4 + 2;
 constexpr int WARP_SIZE = 32;
@@ -122,7 +123,7 @@ constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 template <int NUM_STAGES>
 __global__
 __block_size__((TB_SIZE, 1, 1))
-void kkt_inv_uw_v1_kernel_cutlass(
+void kkt_inv_uw_v2_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,  // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,  // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap U_tmap,  // [pad_T, H, V_dim]
@@ -147,19 +148,19 @@ void kkt_inv_uw_v1_kernel_cutlass(
   extern __shared__ __align__(1024) char smem_ptr[];
   const uint32_t smem = __cvta_generic_to_shared(smem_ptr);
 
-  const uint32_t Ai_smem       = smem + NUM_STAGES * STAGE_SIZE;
-  const uint32_t U_smem        = Ai_smem + A_size;
-  const uint32_t W_smem        = U_smem + V_size;
-  const uint32_t beta_smem     = W_smem + K_size;
-  const uint32_t g_cu_smem     = beta_smem + BT * (uint32_t)sizeof(float);
-  const uint32_t g_raw_smem    = g_cu_smem + BT * (uint32_t)sizeof(float);
-  const uint32_t g_scratch_smem = g_raw_smem + BT * (uint32_t)sizeof(float);
+  const uint32_t A_smem     = smem + NUM_STAGES * STAGE_SIZE;
+  const uint32_t Ai_smem    = A_smem + A_size;
+  const uint32_t U_smem     = Ai_smem + A_size;
+  const uint32_t W_smem     = U_smem + V_size;
+  const uint32_t beta_smem  = W_smem + K_size;
+  const uint32_t g_cu_smem  = beta_smem + BT * (uint32_t)sizeof(float);
+  const uint32_t g_raw_smem = g_cu_smem + BT * (uint32_t)sizeof(float);
 
-  const uint32_t tma_mbar = g_scratch_smem + 16 * (uint32_t)sizeof(float);
+  const uint32_t tma_mbar = g_raw_smem + BT * (uint32_t)sizeof(float);
   const uint32_t kkt_mbar = tma_mbar + NUM_STAGES * 8;
   const uint32_t inv_mbar = kkt_mbar + NUM_STAGES * 8;
-  const uint32_t mma_mbar = inv_mbar + NUM_STAGES * 8;
-  const uint32_t epi_mbar = mma_mbar + NUM_STAGES * 8;
+  const uint32_t uw_mbar  = inv_mbar + NUM_STAGES * 8;
+  const uint32_t epi_mbar = uw_mbar + NUM_STAGES * 8;
 
   const uint32_t taddr = epi_mbar + NUM_STAGES * 8;
 
@@ -173,7 +174,7 @@ void kkt_inv_uw_v1_kernel_cutlass(
         mbarrier_init(tma_mbar + i * 8, 1);
         mbarrier_init(kkt_mbar + i * 8, 1);
         mbarrier_init(inv_mbar + i * 8, 128);
-        mbarrier_init(mma_mbar + i * 8, 1);
+        mbarrier_init(uw_mbar + i * 8, 1);
         mbarrier_init(epi_mbar + i * 8, 128);
       }
       fence_mbarrier_init();
@@ -201,15 +202,13 @@ void kkt_inv_uw_v1_kernel_cutlass(
         const int chunk_id = tmp.y;
         const int bos = cu_seqlens_ptr[seq_id];
 
-        const uint32_t A_smem = smem + stage_id * STAGE_SIZE;
-        const uint32_t V_smem = A_smem + A_size;
+        const uint32_t V_smem = smem + stage_id * STAGE_SIZE;
         const uint32_t K_smem = V_smem + V_size;
 
         const int off_t = bos + chunk_id * BT;
         const int mbar = tma_mbar + stage_id * 8;
 
-        mbarrier_wait(mma_mbar + stage_id * 8, parity);
-
+        mbarrier_wait(uw_mbar + stage_id * 8, parity);
         tma_load_4d(V_smem, &V_tmap, 0, off_t, 0, head_id, mbar, EVICT_FIRST);
         tma_load_4d(K_smem, &K_tmap, 0, off_t, 0, k_head_id, mbar);
         mbarrier_arrive_expect_tx(mbar, K_size + V_size);
@@ -226,12 +225,10 @@ void kkt_inv_uw_v1_kernel_cutlass(
 
     if (elect_sync()) {
       int stage_id = 0;
-      int tma_parity = 0;
-      int epi_parity = 1;
+      int parity = 0;
 
       for (int global_chunk_id = bid; global_chunk_id < total_chunks; global_chunk_id += gridDim.y) {
-        const uint32_t A_smem = smem + stage_id * STAGE_SIZE;
-        const uint32_t V_smem = A_smem + A_size;
+        const uint32_t V_smem = smem + stage_id * STAGE_SIZE;
         const uint32_t K_smem = V_smem + V_size;
 
         const uint32_t this_U_tmem = U_tmem + V_dim * stage_id;
@@ -244,27 +241,25 @@ void kkt_inv_uw_v1_kernel_cutlass(
         // --- MMA #1: KKT = K @ K^T ---
         // Wait for TMA (K) ready AND for prev iter's U/W drained by epi.
         // epi_mbar guards the aliased U tmem cols.
-        mbarrier_wait(tma_mbar + stage_id * 8, tma_parity);
-        mbarrier_wait(epi_mbar + stage_id * 8, epi_parity);
+        mbarrier_wait(epi_mbar + stage_id * 8, parity ^ 1);
+        mbarrier_wait(tma_mbar + stage_id * 8, parity);
         tcgen05_fence_after_thread_sync();
 
-        {
-          constexpr uint32_t kkt_idesc = make_tcgen05_idesc(BT, BT);
-          constexpr uint64_t desc_base = (desc_encode(8 * 128) << 32ULL)
-                                        | (1ULL << 46ULL) | (2ULL << 61ULL);
+        constexpr uint32_t kkt_idesc = make_tcgen05_idesc(BT, BT);
+        constexpr uint64_t kdesc_base = (desc_encode(8 * 128) << 32ULL)
+                                      | (1ULL << 46ULL) | (2ULL << 61ULL);
 
-          for (int i = 0; i < K_dim / 64; i++)
-            for (int j = 0; j < 64 / 16; j++) {
-              const uint64_t k_desc = desc_base | ((K_smem + i * BT * 128 + j * 32) >> 4);
-              const int enable_input = (i > 0) || (j > 0);
-              tcgen05_mma(this_kkt_tmem, k_desc, k_desc, kkt_idesc, enable_input);
-            }
-        }
+        for (int i = 0; i < K_dim / 64; i++)
+          for (int j = 0; j < 64 / 16; j++) {
+            const uint64_t k_desc = kdesc_base | ((K_smem + i * BT * 128 + j * 32) >> 4);
+            const int enable_input = (i > 0) || (j > 0);
+            tcgen05_mma(this_kkt_tmem, k_desc, k_desc, kkt_idesc, enable_input);
+          }
         tcgen05_commit(kkt_mbar + stage_id * 8);
 
         // --- MMA #2: U = Ab @ V, W = Abg @ K ---
         // Wait inv_mbar: inv has finished reading KKT AND produced Ab/Abg.
-        mbarrier_wait(inv_mbar + stage_id * 8, tma_parity);
+        mbarrier_wait(inv_mbar + stage_id * 8, parity);
         tcgen05_fence_after_thread_sync();
 
         constexpr uint32_t u_idesc = make_tcgen05_idesc(BT, V_dim) | (1U << 16U);
@@ -280,13 +275,11 @@ void kkt_inv_uw_v1_kernel_cutlass(
           tcgen05_mma_tmem(this_U_tmem, this_Ab_tmem + i * 8, v_desc, u_idesc, i > 0);
           tcgen05_mma_tmem(this_W_tmem, this_Abg_tmem + i * 8, k_desc, w_idesc, i > 0);
         }
-        tcgen05_commit(mma_mbar + stage_id * 8);
+        tcgen05_commit(uw_mbar + stage_id * 8);
 
         stage_id = (stage_id + 1) % NUM_STAGES;
-        if (stage_id == 0) {
-          tma_parity ^= 1;
-          epi_parity ^= 1;
-        }
+        if (stage_id == 0)
+          parity ^= 1;
       }
     }
   }
@@ -296,13 +289,11 @@ void kkt_inv_uw_v1_kernel_cutlass(
     int warp_id_ = warp_id % 4;
 
     int stage_id = 0;
-    int kkt_parity = 0;
-    int mma_parity = 0;
+    int parity = 0;
 
-    float *beta_smem_ptr      = reinterpret_cast<float *>(smem_ptr + (beta_smem      - smem));
-    float *g_cu_smem_ptr      = reinterpret_cast<float *>(smem_ptr + (g_cu_smem      - smem));
-    float *g_raw_smem_ptr     = reinterpret_cast<float *>(smem_ptr + (g_raw_smem     - smem));
-    float *g_scratch_smem_ptr = reinterpret_cast<float *>(smem_ptr + (g_scratch_smem - smem));
+    float *beta_smem_ptr  = reinterpret_cast<float *>(smem_ptr + (beta_smem  - smem));
+    float *g_cu_smem_ptr  = reinterpret_cast<float *>(smem_ptr + (g_cu_smem  - smem));
+    float *g_raw_smem_ptr = reinterpret_cast<float *>(smem_ptr + (g_raw_smem - smem));
 
     const float A_log_val   = -__expf(A_log_ptr[head_id]);
     const float dt_bias_val = dt_bias_ptr[head_id];
@@ -322,92 +313,90 @@ void kkt_inv_uw_v1_kernel_cutlass(
       const int bos = cu_seqlens_ptr[seq_id];
       const int eos = cu_seqlens_ptr[seq_id + 1];
 
-      const uint32_t A_smem = smem + stage_id * STAGE_SIZE;
-
       // -------- Phase 1: beta, g_cu --------
-      const int my_row = warp_id_ * 16 + (lane_id % 16);
-      const int off_t = bos + chunk_id * BT + my_row;
-      const bool in_range = off_t < eos;
-      const bool is_active = (lane_id < 16);
+      {
+        const int t = bos + chunk_id * BT + tid_;
+        if (tid_ < BT) {
+          float beta_val = 0.0f, g_val = 0.0f;
 
-      float b_val = 0.0f, a_val = 0.0f;
-      if (is_active && in_range) {
-        b_val = __bfloat162float(b_ptr[off_t * H + head_id]);
-        a_val = __bfloat162float(a_ptr[off_t * H + head_id]);
-      }
+          if (t < eos) {
+            float b_val = __bfloat162float(b_ptr[t * H + head_id]);
+            float a_val = __bfloat162float(a_ptr[t * H + head_id]);
 
-      float beta_val = __frcp_rn(1.0f + __expf(-b_val));
-      float g_val    = A_log_val * __logf(1.0f + __expf(a_val + dt_bias_val));
-      if (!in_range) g_val = 0.0f;
+            beta_val = __frcp_rn(1.0f + __expf(-b_val));
+            g_val    = A_log_val * __logf(1.0f + __expf(a_val + dt_bias_val));
+          }
+          beta_smem_ptr[tid_] = beta_val;
 
-      if (is_active) {
-        beta_smem_ptr[my_row] = beta_val;
-      }
+          // parallel scan g within warp
+          for (int i = 1; i < WARP_SIZE; i *= 2) {
+            float lower = __shfl_up_sync(0xFFFF'FFFF, g_val, i);
+            if (lane_id >= i)
+              g_val += lower;
+          }
+          // store warp sum
+          if (lane_id == 31)
+            g_raw_smem_ptr[warp_id_] = g_val;
+          bar_sync<3>(BT);
 
-      // parallel scan g among lower 16 lanes
-      for (int i = 1; i < 16; i *= 2) {
-        float lower = __shfl_up_sync(0xFFFF'FFFF, g_val, i);
-        if ((lane_id % 16) >= i)
-          g_val += lower;
-      }
-      if (is_active && (lane_id % 16) == 15) {
-        g_scratch_smem_ptr[warp_id_] = g_val;
-      }
-      bar_sync<1>(128);
+          // add warp sum from lower warps
+          for (int i = 1; i < BT / WARP_SIZE; i++)
+            if (warp_id_ >= i) g_val += g_raw_smem_ptr[i-1];
+          bar_sync<3>(BT);  // prevent lower warps overwrite smem before read
 
-      if (is_active) {
-        if (warp_id_ >= 1) g_val += g_scratch_smem_ptr[0];
-        if (warp_id_ >= 2) g_val += g_scratch_smem_ptr[1];
-        if (warp_id_ >= 3) g_val += g_scratch_smem_ptr[2];
+          // store to gmem for H and O kernels
+          if (t < eos)
+            g_cu_ptr[t * H + head_id] = g_val;
 
-        if (in_range) {
-          g_cu_ptr[off_t * H + head_id] = g_val;
+          g_raw_smem_ptr[tid_] = g_val;
+          g_cu_smem_ptr[tid_]  = t < eos ? __expf(g_val) : 0.0f;
         }
-        g_raw_smem_ptr[my_row] = g_val;
-        g_cu_smem_ptr[my_row]  = in_range ? __expf(g_val) : 0.0f;
+        // bar_sync<1>(128);  // bar.sync after kkt MMA later
       }
-      bar_sync<1>(128);
 
       // -------- Phase 2: wait KKT, mask, write A to A_smem --------
       if (warp_id_ == 0)
-        mbarrier_wait(kkt_mbar + stage_id * 8, kkt_parity);
+        mbarrier_wait(kkt_mbar + stage_id * 8, parity);
       bar_sync<1>(128);
       tcgen05_fence_after_thread_sync();
 
-      // KKT at U_tmem + V_dim*stage_id (low 64 cols)
-      const uint32_t kkt_tmem_addr = U_tmem + V_dim * stage_id;
-      float kkt[BT];
-      tcgen05_ld<SHAPE::_32x32b, 64>(kkt, 0, kkt_tmem_addr);
-      tcgen05_wait_ld();
-      tcgen05_fence_before_thread_sync();
+      {
+        const int row0 = warp_id_ * 16 + (lane_id / 4);
+        const int row1 = row0 + 8;
+        const float beta0 = beta_smem_ptr[row0];  // top 8 rows (low address)
+        const float beta1 = beta_smem_ptr[row1];  // bottom 8 rows (high address)
+        const float g0 = g_raw_smem_ptr[row0];
+        const float g1 = g_raw_smem_ptr[row1];
 
-      const float my_beta = beta_val;
-      const float my_g    = g_val;
-      for (int col = 0; col < BT; col++) {
-        kkt[col] = __shfl_up_sync(0xFFFF'FFFF, kkt[col], 16);
-        if (my_row > col && bos + chunk_id * BT + col < eos) {
-          kkt[col] *= my_beta * __expf(my_g - g_raw_smem_ptr[col]);
-        } else {
-          kkt[col] = 0.0f;
-        }
-      }
+        for (int i = 0; i < BT / 16; i++) {
+          float kkt[8];
+          const uint32_t kkt_tmem_addr = U_tmem + V_dim * stage_id + i * 16;
+          tcgen05_ld<SHAPE::_16x256b, 2>(kkt, 0, kkt_tmem_addr);
 
-      // Write A to A_smem in 128B-swizzle bf16 layout (matches ldmatrix reads).
-      if (is_active) {
-        const uint32_t row_base = A_smem + my_row * 128;
-        const int row_mask = my_row & 7;
-        #pragma unroll
-        for (int bank = 0; bank < 8; bank++) {
-          const int phys_bank = bank ^ row_mask;
-          const uint32_t bank_addr = row_base + phys_bank * 16;
-          uint32_t packed[4];
-          #pragma unroll
-          for (int j = 0; j < 4; j++) {
-            const int c0 = bank * 8 + j * 2;
-            const int c1 = bank * 8 + j * 2 + 1;
-            packed[j] = fp32x2_to_bf16x2_fuse(kkt[c0], kkt[c1]);
-          }
-          sts_b32x4_fuse(bank_addr, packed);
+          // strict lower and T mask
+          // first 8 columns
+          const int col0 = i * 16 + (lane_id % 4) * 2;
+          kkt[0] = row0 > col0 + 0 && bos + chunk_id * BT + col0 + 0 < eos ? kkt[0] * beta0 * __expf(g0 - g_raw_smem_ptr[col0 + 0]) : 0.0f;
+          kkt[1] = row0 > col0 + 1 && bos + chunk_id * BT + col0 + 1 < eos ? kkt[1] * beta0 * __expf(g0 - g_raw_smem_ptr[col0 + 1]) : 0.0f;
+          kkt[2] = row1 > col0 + 0 && bos + chunk_id * BT + col0 + 0 < eos ? kkt[2] * beta1 * __expf(g1 - g_raw_smem_ptr[col0 + 0]) : 0.0f;
+          kkt[3] = row1 > col0 + 1 && bos + chunk_id * BT + col0 + 1 < eos ? kkt[3] * beta1 * __expf(g1 - g_raw_smem_ptr[col0 + 1]) : 0.0f;
+
+          // next 8 columns
+          const int col1 = col0 + 8;
+          kkt[4] = row0 > col1 + 0 && bos + chunk_id * BT + col1 + 0 < eos ? kkt[4] * beta0 * __expf(g0 - g_raw_smem_ptr[col1 + 0]) : 0.0f;
+          kkt[5] = row0 > col1 + 1 && bos + chunk_id * BT + col1 + 1 < eos ? kkt[5] * beta0 * __expf(g0 - g_raw_smem_ptr[col1 + 1]) : 0.0f;
+          kkt[6] = row1 > col1 + 0 && bos + chunk_id * BT + col1 + 0 < eos ? kkt[6] * beta1 * __expf(g1 - g_raw_smem_ptr[col1 + 0]) : 0.0f;
+          kkt[7] = row1 > col1 + 1 && bos + chunk_id * BT + col1 + 1 < eos ? kkt[7] * beta1 * __expf(g1 - g_raw_smem_ptr[col1 + 1]) : 0.0f;
+
+          // pack to BF16 and store to smem
+          uint32_t tmp[4];
+          for (int j = 0; j < 4; j++)
+            tmp[j] = fp32x2_to_bf16x2_fuse(kkt[j * 2], kkt[j * 2 + 1]);
+
+          // A smem layout: [BT/64, BT, 64] = [BT, 64]
+          const uint32_t s_row = warp_id_ * 16 + (lane_id % 16);
+          const uint32_t s_col = (i * 2 + (lane_id / 16)) ^ (lane_id % 8);
+          stmatrix<4>(A_smem + s_row * 128 + s_col * 16, tmp);
         }
       }
       bar_sync<1>(128);
@@ -546,7 +535,7 @@ void kkt_inv_uw_v1_kernel_cutlass(
 
       // -------- Phase 4: Compute Ab, Abg → tmem --------
       if (warp_id_ == 3)
-        mbarrier_wait(mma_mbar + stage_id * 8, mma_parity ^ 1);
+        mbarrier_wait(uw_mbar + stage_id * 8, parity ^ 1);
       bar_sync<1>(128);
 
       for (int i = 0; i < 64 / 16; i++) {
@@ -581,10 +570,8 @@ void kkt_inv_uw_v1_kernel_cutlass(
       mbarrier_arrive(inv_mbar + stage_id * 8);
 
       stage_id = (stage_id + 1) % NUM_STAGES;
-      if (stage_id == 0) {
-        kkt_parity ^= 1;
-        mma_parity ^= 1;
-      }
+      if (stage_id == 0)
+        parity ^= 1;
     }
   }
   else {
@@ -596,7 +583,7 @@ void kkt_inv_uw_v1_kernel_cutlass(
       const uint32_t this_U_tmem = U_tmem + V_dim * stage_id;
 
       if (warp_id == 0)
-        mbarrier_wait(mma_mbar + stage_id * 8, parity);
+        mbarrier_wait(uw_mbar + stage_id * 8, parity);
       else if (warp_id == 1) {
         if (elect_sync())
           cp_async_bulk_wait_group_read<0>();
@@ -675,7 +662,7 @@ CUtensorMap encode_tma_kkt_fuse(void *ptr, uint64_t T, uint64_t H_, uint64_t dim
   return tmap;
 }
 
-void kkt_inv_uw_v1(
+void kkt_inv_uw_v2(
   TensorView K,
   TensorView V,
   TensorView U,
@@ -707,13 +694,12 @@ void kkt_inv_uw_v1(
 
   constexpr int NUM_STAGES = 3;
   constexpr int smem_size = NUM_STAGES * STAGE_SIZE
-                          + A_size + V_size + K_size
+                          + A_size * 2 + V_size + K_size  // A, Ai, U, W
                           + 3 * BT * sizeof(float)
-                          + 16 * sizeof(float)
                           + 5 * NUM_STAGES * 8
                           + 4;
 
-  auto kernel = kkt_inv_uw_v1_kernel_cutlass<NUM_STAGES>;
+  auto kernel = kkt_inv_uw_v2_kernel_cutlass<NUM_STAGES>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
   const dim3 grid(H, 148 / H);
@@ -724,4 +710,4 @@ void kkt_inv_uw_v1(
     cu_seqlens_ptr, chunk_indices_ptr, total_chunks_ptr);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(kkt_inv_uw_v1, kkt_inv_uw_v1);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kkt_inv_uw_v2, kkt_inv_uw_v2);
