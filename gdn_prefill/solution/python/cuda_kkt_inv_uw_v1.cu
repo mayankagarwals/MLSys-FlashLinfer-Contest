@@ -123,7 +123,7 @@ constexpr int TB_SIZE = NUM_WARPS * WARP_SIZE;
 template <int NUM_STAGES>
 __global__
 __block_size__((TB_SIZE, 1, 1))
-void kkt_inv_uw_v2_kernel_cutlass(
+void kkt_inv_uw_v1_kernel_cutlass(
   const __grid_constant__ CUtensorMap K_tmap,  // [total_T, Hg, K_dim]
   const __grid_constant__ CUtensorMap V_tmap,  // [total_T, H, V_dim]
   const __grid_constant__ CUtensorMap U_tmap,  // [pad_T, H, V_dim]
@@ -662,7 +662,7 @@ CUtensorMap encode_tma_kkt_fuse(void *ptr, uint64_t T, uint64_t H_, uint64_t dim
   return tmap;
 }
 
-void kkt_inv_uw_v2(
+void kkt_inv_uw_v1(
   TensorView K,
   TensorView V,
   TensorView U,
@@ -699,7 +699,7 @@ void kkt_inv_uw_v2(
                           + 5 * NUM_STAGES * 8
                           + 4;
 
-  auto kernel = kkt_inv_uw_v2_kernel_cutlass<NUM_STAGES>;
+  auto kernel = kkt_inv_uw_v1_kernel_cutlass<NUM_STAGES>;
   cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size);
 
   const dim3 grid(H, 148 / H);
@@ -710,4 +710,4 @@ void kkt_inv_uw_v2(
     cu_seqlens_ptr, chunk_indices_ptr, total_chunks_ptr);
 }
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(kkt_inv_uw_v2, kkt_inv_uw_v2);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(kkt_inv_uw_v1, kkt_inv_uw_v1);
