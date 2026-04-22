@@ -241,8 +241,8 @@ void kkt_inv_uw_v2_kernel_cutlass(
         // --- MMA #1: KKT = K @ K^T ---
         // Wait for TMA (K) ready AND for prev iter's U/W drained by epi.
         // epi_mbar guards the aliased U tmem cols.
-        mbarrier_wait(tma_mbar + stage_id * 8, parity);
         mbarrier_wait(epi_mbar + stage_id * 8, parity ^ 1);
+        mbarrier_wait(tma_mbar + stage_id * 8, parity);
         tcgen05_fence_after_thread_sync();
 
         constexpr uint32_t kkt_idesc = make_tcgen05_idesc(BT, BT);
