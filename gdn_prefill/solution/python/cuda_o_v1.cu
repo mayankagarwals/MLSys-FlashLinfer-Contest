@@ -30,8 +30,9 @@ Pipeline sketch for `o_v1`
     That alias is only legal after all of the following are true:
       1. CUDA has finished reading QK and arrived
          `qk_tmem_release_barrier`
-      2. MMA has finished head0 QH and head0 OV and both commits have completed
-         (`qh_mma_barrier` and `ov_mma_barrier`)
+      2. MMA has finished head0 QH and head0 OV for the current chunk phase and
+         both per-head commits have completed
+         (`qh_mma_barriers[head0]` and `ov_mma_barriers[head0]`)
       3. The previous chunk has finished draining head1 OUT+QH and arrived
          `output_tmem_release_barrier`
 
@@ -44,28 +45,29 @@ Pipeline sketch for `o_v1`
 
   1. TMA makes the SMEM stages visible.
      - q/k uses `qk_tma_barriers[qk_stage]`
-     - h uses `h_tma_barrier[head]`
-     - v uses `v_tma_barrier[head]`
+     - h uses `h_tma_barriers[head]`
+     - v uses `v_tma_barriers[head]`
 
   2. MMA builds QK in TMEM from q/k.
-     - Commit: `mma_barrier`
-     - CUDA waits on `mma_barrier`, reads QK to registers, then arrives
+     - Commit: `qk_mma_barrier`
+     - CUDA waits on `qk_mma_barrier`, reads QK to registers, then arrives
        `qk_tmem_release_barrier`
 
   3. CUDA materializes ATTN0 from the QK registers.
      - ATTN0 becomes visible via `attn_ready_barriers[head0]`
-     - In parallel, MMA builds QH0 from q + h0 and commits `qh_mma_barrier`
+     - In parallel, MMA builds QH0 from q + h0 and commits
+       `qh_mma_barriers[head0]`
 
   4. MMA consumes ATTN0 + v0 into the shared OUT bank.
-     - Commit: `ov_mma_barrier`
+     - Commit: `ov_mma_barriers[head0]`
      - While that is in flight, CUDA materializes ATTN1 from the same QK regs
        and arrives `attn_ready_barriers[head1]`
 
   5. MMA builds QH1 in the aliased [QK | ATTN0] region.
      Gate before the alias is reused:
        - `qk_tmem_release_barrier`
-       - head0 `qh_mma_barrier`
-       - head0 `ov_mma_barrier`
+       - head0 `qh_mma_barriers[head0]` for the current `qk_phase`
+       - head0 `ov_mma_barriers[head0]` for the current `qk_phase`
      Releases caused by this transition:
        - h0/v0 SMEM stages are returned through `h_reuse_barriers[head0]` and
          `v_reuse_barriers[head0]`
@@ -73,7 +75,8 @@ Pipeline sketch for `o_v1`
          `h_reuse_barriers[head1]` and `qk_reuse_barriers[qk_stage]`
 
   6. CUDA drains head0 by reading OUT + QH0 into registers.
-     - CUDA waits on head0 `ov_mma_barrier` and `qh_mma_barrier`
+     - CUDA waits on head0 `ov_mma_barriers[head0]` and
+       `qh_mma_barriers[head0]` for the current `qk_phase`
      - On the final TMEM read, CUDA arrives `head0_release_barrier`
      - Only after that may head1 OV reuse the shared OUT bank
 
@@ -625,12 +628,12 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
   const uint32_t g_reduce_min_smem = smem + OFFSET_G_REDUCE_MIN;
   const uint32_t g_reduce_max_smem = smem + OFFSET_G_REDUCE_MAX;
   const uint32_t qk_tma_barriers = smem + OFFSET_QK_TMA_BAR;
-  const uint32_t v_tma_barrier = smem + OFFSET_V_TMA_BAR;
-  const uint32_t h_tma_barrier = smem + OFFSET_H_TMA_BAR;
+  const uint32_t v_tma_barriers = smem + OFFSET_V_TMA_BAR;
+  const uint32_t h_tma_barriers = smem + OFFSET_H_TMA_BAR;
   const uint32_t qk_reuse_barriers = smem + OFFSET_QK_REUSE_BAR;
   const uint32_t h_reuse_barriers = smem + OFFSET_H_REUSE_BAR;
   const uint32_t v_reuse_barriers = smem + OFFSET_V_REUSE_BAR;
-  const uint32_t mma_barrier = smem + OFFSET_MMA_BAR;
+  const uint32_t qk_mma_barrier = smem + OFFSET_MMA_BAR;
   const uint32_t attn_ready_barriers = smem + OFFSET_ATTN_READY_BAR;
   const uint32_t head0_release_barrier = smem + OFFSET_HEAD0_RELEASE_BAR;
   const uint32_t qh_mma_barriers = smem + OFFSET_QH_MMA_BAR;
@@ -665,13 +668,13 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
 #pragma unroll
       for (uint32_t head_offset = 0; head_offset < HEADS_PER_QK_HEAD;
            ++head_offset) {
-        mbarrier_init(v_tma_barrier + head_offset * 8U, 1);
-        mbarrier_init(h_tma_barrier + head_offset * 8U, 1);
+        mbarrier_init(v_tma_barriers + head_offset * 8U, 1);
+        mbarrier_init(h_tma_barriers + head_offset * 8U, 1);
         mbarrier_init(h_reuse_barriers + head_offset * 8U, 1);
         mbarrier_init(v_reuse_barriers + head_offset * 8U, 1);
         mbarrier_init(attn_ready_barriers + head_offset * 8U, NUM_CUDA_WARPS);
       }
-      mbarrier_init(mma_barrier, 1);
+      mbarrier_init(qk_mma_barrier, 1);
       mbarrier_init(head0_release_barrier, NUM_CUDA_WARPS);
       for (uint32_t head_offset = 0; head_offset < HEADS_PER_QK_HEAD;
            ++head_offset) {
@@ -727,12 +730,12 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         const uint32_t h_outer = blockIdx.y * NUM_OUTPUT_HEADS + head_id;
         tma_load_4d(v_smem + head_offset * V_SMEM_SIZE, &v_tmap, 0,
                     first_v_chunk_start_i32, v_tile, head_id,
-                    v_tma_barrier + head_offset * 8U);
+                    v_tma_barriers + head_offset * 8U);
         tma_load_4d(h_smem + head_offset * H_SMEM_SIZE, &h_tmap, 0, v_start, 0,
-                    h_outer, h_tma_barrier + head_offset * 8U);
-        mbarrier_arrive_expect_tx(v_tma_barrier + head_offset * 8U,
+                    h_outer, h_tma_barriers + head_offset * 8U);
+        mbarrier_arrive_expect_tx(v_tma_barriers + head_offset * 8U,
                                   V_SMEM_SIZE);
-        mbarrier_arrive_expect_tx(h_tma_barrier + head_offset * 8U,
+        mbarrier_arrive_expect_tx(h_tma_barriers + head_offset * 8U,
                                   H_SMEM_SIZE);
       }
       uint32_t qk_prod_slot = 1U;
@@ -775,28 +778,28 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         mbarrier_wait(h_reuse_barriers + HEAD0_STAGE_INDEX * 8U, stage_phase);
         tma_load_4d(h_smem + HEAD0_STAGE_INDEX * H_SMEM_SIZE, &h_tmap, 0,
                     v_start, 0, next_h_outer_base + next_head0_id,
-                    h_tma_barrier + HEAD0_STAGE_INDEX * 8U);
-        mbarrier_arrive_expect_tx(h_tma_barrier + HEAD0_STAGE_INDEX * 8U,
+                    h_tma_barriers + HEAD0_STAGE_INDEX * 8U);
+        mbarrier_arrive_expect_tx(h_tma_barriers + HEAD0_STAGE_INDEX * 8U,
                                   H_SMEM_SIZE);
         mbarrier_wait(v_reuse_barriers + HEAD0_STAGE_INDEX * 8U, stage_phase);
         tma_load_4d(v_smem + HEAD0_STAGE_INDEX * V_SMEM_SIZE, &v_tmap, 0,
                     next_v_chunk_start_i32, v_tile, next_head0_id,
-                    v_tma_barrier + HEAD0_STAGE_INDEX * 8U);
-        mbarrier_arrive_expect_tx(v_tma_barrier + HEAD0_STAGE_INDEX * 8U,
+                    v_tma_barriers + HEAD0_STAGE_INDEX * 8U);
+        mbarrier_arrive_expect_tx(v_tma_barriers + HEAD0_STAGE_INDEX * 8U,
                                   V_SMEM_SIZE);
 
         const uint32_t next_head1_id = head_id_base + HEAD1_STAGE_INDEX;
         mbarrier_wait(h_reuse_barriers + HEAD1_STAGE_INDEX * 8U, stage_phase);
         tma_load_4d(h_smem + HEAD1_STAGE_INDEX * H_SMEM_SIZE, &h_tmap, 0,
                     v_start, 0, next_h_outer_base + next_head1_id,
-                    h_tma_barrier + HEAD1_STAGE_INDEX * 8U);
-        mbarrier_arrive_expect_tx(h_tma_barrier + HEAD1_STAGE_INDEX * 8U,
+                    h_tma_barriers + HEAD1_STAGE_INDEX * 8U);
+        mbarrier_arrive_expect_tx(h_tma_barriers + HEAD1_STAGE_INDEX * 8U,
                                   H_SMEM_SIZE);
         mbarrier_wait(v_reuse_barriers + HEAD1_STAGE_INDEX * 8U, stage_phase);
         tma_load_4d(v_smem + HEAD1_STAGE_INDEX * V_SMEM_SIZE, &v_tmap, 0,
                     next_v_chunk_start_i32, v_tile, next_head1_id,
-                    v_tma_barrier + HEAD1_STAGE_INDEX * 8U);
-        mbarrier_arrive_expect_tx(v_tma_barrier + HEAD1_STAGE_INDEX * 8U,
+                    v_tma_barriers + HEAD1_STAGE_INDEX * 8U);
+        mbarrier_arrive_expect_tx(v_tma_barriers + HEAD1_STAGE_INDEX * 8U,
                                   V_SMEM_SIZE);
       }
     }
@@ -824,7 +827,7 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         tcgen05_fence_after_thread_sync();
         mma_swizzled<NUM_SWIZZLE_ATOMS>(QK_TMEM_COL, q_stage_smem,
                                         k_stage_smem);
-        tcgen05_commit(mma_barrier);
+        tcgen05_commit(qk_mma_barrier);
       }
 
 #pragma unroll
@@ -837,8 +840,8 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         const uint32_t qh_stage_tmem = qh_tmem_col_for_head(head_offset);
         const uint32_t attn_stage_barrier =
             attn_ready_barriers + head_offset * 8U;
-        const uint32_t v_stage_barrier = v_tma_barrier + head_offset * 8U;
-        const uint32_t h_stage_barrier = h_tma_barrier + head_offset * 8U;
+        const uint32_t v_stage_barrier = v_tma_barriers + head_offset * 8U;
+        const uint32_t h_stage_barrier = h_tma_barriers + head_offset * 8U;
         const uint32_t qh_stage_barrier = qh_mma_barriers + head_offset * 8U;
         const uint32_t ov_stage_barrier = ov_mma_barriers + head_offset * 8U;
 
@@ -951,9 +954,9 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
       bar_sync<1>(NUM_CUDA_WARPS * WARP_SIZE);
 
       // Step 2: wait for the QK MMA commit, then read QK from TMEM into CUDA
-      // registers. After this point the QK TMEM columns can be reused by head1
-      // QH, because CUDA no longer needs to touch QK in TMEM.
-      mbarrier_wait(mma_barrier, QK_MMA_PHASE ^ qk_phase);
+      // registers. After this point CUDA no longer needs QK in TMEM, so this
+      // satisfies the QK-consumer side of the later head1 alias gate.
+      mbarrier_wait(qk_mma_barrier, QK_MMA_PHASE ^ qk_phase);
       tcgen05_fence_after_thread_sync();
 
       float qk_reg_lo[REGS_PER_FRAGMENT];
