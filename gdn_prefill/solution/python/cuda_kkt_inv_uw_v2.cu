@@ -364,50 +364,48 @@ void kkt_inv_uw_v2_kernel_cutlass(
       }
 
       // -------- Phase 2: wait KKT, mask, write A to A_smem --------
-      const int my_row = warp_id_ * 16 + (lane_id % 16);
-      const int off_t = bos + chunk_id * BT + my_row;
-      const bool in_range = off_t < eos;
-      const bool is_active = (lane_id < 16);
-
       if (warp_id_ == 0)
         mbarrier_wait(kkt_mbar + stage_id * 8, kkt_parity);
       bar_sync<1>(128);
       tcgen05_fence_after_thread_sync();
 
-      // KKT at U_tmem + V_dim*stage_id (low 64 cols)
-      const uint32_t kkt_tmem_addr = U_tmem + V_dim * stage_id;
-      float kkt[BT];
-      tcgen05_ld<SHAPE::_32x32b, 64>(kkt, 0, kkt_tmem_addr);
-      tcgen05_wait_ld();
-      tcgen05_fence_before_thread_sync();
+      {
+        const int row0 = warp_id_ * 16 + (lane_id / 4);
+        const int row1 = row0 + 8;
+        const float beta0 = beta_smem_ptr[row0];  // top 8 rows (low address)
+        const float beta1 = beta_smem_ptr[row1];  // bottom 8 rows (high address)
+        const float g0 = g_raw_smem_ptr[row0];
+        const float g1 = g_raw_smem_ptr[row1];
 
-      const float my_beta = beta_smem_ptr[my_row];
-      const float my_g    = g_raw_smem_ptr[my_row];
-      for (int col = 0; col < BT; col++) {
-        kkt[col] = __shfl_up_sync(0xFFFF'FFFF, kkt[col], 16);
-        if (my_row > col && bos + chunk_id * BT + col < eos) {
-          kkt[col] *= my_beta * __expf(my_g - g_raw_smem_ptr[col]);
-        } else {
-          kkt[col] = 0.0f;
-        }
-      }
+        for (int i = 0; i < BT / 16; i++) {
+          float kkt[8];
+          const uint32_t kkt_tmem_addr = U_tmem + V_dim * stage_id + i * 16;
+          tcgen05_ld<SHAPE::_16x256b, 2>(kkt, 0, kkt_tmem_addr);
 
-      // Write A to A_smem in 128B-swizzle bf16 layout (matches ldmatrix reads).
-      if (is_active) {
-        const uint32_t row_base = A_smem + my_row * 128;
-        const int row_mask = my_row & 7;
-        #pragma unroll
-        for (int bank = 0; bank < 8; bank++) {
-          const int phys_bank = bank ^ row_mask;
-          const uint32_t bank_addr = row_base + phys_bank * 16;
-          uint32_t packed[4];
-          #pragma unroll
-          for (int j = 0; j < 4; j++) {
-            const int c0 = bank * 8 + j * 2;
-            const int c1 = bank * 8 + j * 2 + 1;
-            packed[j] = fp32x2_to_bf16x2_fuse(kkt[c0], kkt[c1]);
-          }
-          sts_b32x4_fuse(bank_addr, packed);
+          // strict lower and T mask
+          // first 8 columns
+          const int col0 = i * 16 + (lane_id % 4) * 2;
+          kkt[0] = row0 > col0 + 0 && bos + chunk_id * BT + col0 + 0 < eos ? kkt[0] * beta0 * __expf(g0 - g_raw_smem_ptr[col0 + 0]) : 0.0f;
+          kkt[1] = row0 > col0 + 1 && bos + chunk_id * BT + col0 + 1 < eos ? kkt[1] * beta0 * __expf(g0 - g_raw_smem_ptr[col0 + 1]) : 0.0f;
+          kkt[2] = row1 > col0 + 0 && bos + chunk_id * BT + col0 + 0 < eos ? kkt[2] * beta1 * __expf(g1 - g_raw_smem_ptr[col0 + 0]) : 0.0f;
+          kkt[3] = row1 > col0 + 1 && bos + chunk_id * BT + col0 + 1 < eos ? kkt[3] * beta1 * __expf(g1 - g_raw_smem_ptr[col0 + 1]) : 0.0f;
+
+          // next 8 columns
+          const int col1 = col0 + 8;
+          kkt[4] = row0 > col1 + 0 && bos + chunk_id * BT + col1 + 0 < eos ? kkt[4] * beta0 * __expf(g0 - g_raw_smem_ptr[col1 + 0]) : 0.0f;
+          kkt[5] = row0 > col1 + 1 && bos + chunk_id * BT + col1 + 1 < eos ? kkt[5] * beta0 * __expf(g0 - g_raw_smem_ptr[col1 + 1]) : 0.0f;
+          kkt[6] = row1 > col1 + 0 && bos + chunk_id * BT + col1 + 0 < eos ? kkt[6] * beta1 * __expf(g1 - g_raw_smem_ptr[col1 + 0]) : 0.0f;
+          kkt[7] = row1 > col1 + 1 && bos + chunk_id * BT + col1 + 1 < eos ? kkt[7] * beta1 * __expf(g1 - g_raw_smem_ptr[col1 + 1]) : 0.0f;
+
+          // pack to BF16 and store to smem
+          uint32_t tmp[4];
+          for (int j = 0; j < 4; j++)
+            tmp[j] = fp32x2_to_bf16x2_fuse(kkt[j * 2], kkt[j * 2 + 1]);
+
+          // A smem layout: [BT/64, BT, 64] = [BT, 64]
+          const uint32_t s_row = warp_id_ * 16 + (lane_id % 16);
+          const uint32_t s_col = (i * 2 + (lane_id / 16)) ^ (lane_id % 8);
+          stmatrix<4>(A_smem + s_row * 128 + s_col * 16, tmp);
         }
       }
       bar_sync<1>(128);
