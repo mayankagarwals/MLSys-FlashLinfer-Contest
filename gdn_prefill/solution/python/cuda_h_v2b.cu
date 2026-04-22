@@ -258,37 +258,38 @@ void h_v2b_kernel_cutlass(
     }
   }
   else if (warp_id == NUM_WARPS - 2) {
-    // MMA warp
+    // MMA warp: all 32 threads poll barriers; only the elected lane issues tcgen.
+    const uint32_t mma_warp_elected = elect_sync();
     tcgen05_alloc(taddr, 512);
 
-    if (elect_sync()) {
-      profiler.stamp(SETUP);
-      int stage_id = 0;
-      int parity = 0;
+    if (mma_warp_elected) profiler.stamp(SETUP);
+    int stage_id = 0;
+    int parity = 0;
 
-      for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
-        const uint32_t W_smem = smem + stage_id * STAGE_SIZE;
-        const uint32_t V_smem = W_smem + W_size;
-        const uint32_t K_smem = V_smem + V_size;
+    for (int chunk_id = 0; chunk_id < num_chunks; chunk_id++) {
+      const uint32_t W_smem = smem + stage_id * STAGE_SIZE;
+      const uint32_t V_smem = W_smem + W_size;
+      const uint32_t K_smem = V_smem + V_size;
 
-        // wh MMA
-        // H in tmem, W in smem. both are K-major
-        // [BV, K_dim] x [BT, K_dim] -> [BV, BT]
-        constexpr uint32_t wh_idesc = make_tcgen05_idesc(BV, BT) | (1U << 13U);  // negate A
+      // wh MMA
+      // H in tmem, W in smem. both are K-major
+      // [BV, K_dim] x [BT, K_dim] -> [BV, BT]
+      constexpr uint32_t wh_idesc = make_tcgen05_idesc(BV, BT) | (1U << 13U);  // negate A
 
-        // 128B swizzling
-        constexpr uint64_t w_desc_base = (desc_encode(8 * 128) << 32ULL)  // SBO
-                                       | (1ULL << 46ULL) | (2ULL << 61ULL);
+      // 128B swizzling
+      constexpr uint64_t w_desc_base = (desc_encode(8 * 128) << 32ULL)  // SBO
+                                     | (1ULL << 46ULL) | (2ULL << 61ULL);
 
-        // wait for TMA
-        mbarrier_wait(tma_mbar + stage_id * 8, parity);
-        profiler.stamp(WAIT_TMA);
+      // wait for TMA
+      mbarrier_wait(tma_mbar + stage_id * 8, parity);
+      if (mma_warp_elected) profiler.stamp(WAIT_TMA);
 
-        // wait for h(tmem, input) and v(tmem, acc)
-        mbarrier_wait(wh_in_mbar + stage_id * 8, parity);
-        profiler.stamp(WAIT_WH_IN);
-        tcgen05_fence_after_thread_sync();
+      // wait for h(tmem, input) and v(tmem, acc)
+      mbarrier_wait(wh_in_mbar + stage_id * 8, parity);
+      if (mma_warp_elected) profiler.stamp(WAIT_WH_IN);
+      tcgen05_fence_after_thread_sync();
 
+      if (mma_warp_elected) {
         // i selects the [BV/BT, 64] tile (increment 32 tmem columns for H, increment by BT x 128B for W)
         // j selects the [BV/BT, 16] tile (increment 8  tmem columns for H, increment by 32B due to swizzling for W)
         for (int i = 0; i < K_dim / 64; i++)
@@ -299,22 +300,24 @@ void h_v2b_kernel_cutlass(
           }
         tcgen05_commit(wh_done_mbar + stage_id * 8);
         profiler.stamp(ISSUE_WH_MMA);
+      }
 
-        // vk MMA
-        // scaled v_new in tmem, K in smem. K is MN-major
-        // [BV, BT] x [BT, K_dim] -> [BV, K_dim]
-        constexpr uint32_t vk_idesc = make_tcgen05_idesc(BV, K_dim) | (1U << 16U);  // transpose B
+      // vk MMA
+      // scaled v_new in tmem, K in smem. K is MN-major
+      // [BV, BT] x [BT, K_dim] -> [BV, K_dim]
+      constexpr uint32_t vk_idesc = make_tcgen05_idesc(BV, K_dim) | (1U << 16U);  // transpose B
 
-        // MN-major, 128B swizzling
-        constexpr uint64_t k_desc_base = (desc_encode(BT * 128) << 16ULL)  // LBO
-                                       | (desc_encode(8 * 128) << 32ULL)   // SBO
-                                       | (1ULL << 46ULL) | (2ULL << 61ULL);
+      // MN-major, 128B swizzling
+      constexpr uint64_t k_desc_base = (desc_encode(BT * 128) << 16ULL)  // LBO
+                                     | (desc_encode(8 * 128) << 32ULL)   // SBO
+                                     | (1ULL << 46ULL) | (2ULL << 61ULL);
 
-        // wait for scaled_h(tmem, acc) and scaled_v_new(tmem, input)
-        mbarrier_wait(vk_in_mbar + stage_id * 8, parity);
-        profiler.stamp(WAIT_VK_IN);
-        tcgen05_fence_after_thread_sync();
+      // wait for scaled_h(tmem, acc) and scaled_v_new(tmem, input)
+      mbarrier_wait(vk_in_mbar + stage_id * 8, parity);
+      if (mma_warp_elected) profiler.stamp(WAIT_VK_IN);
+      tcgen05_fence_after_thread_sync();
 
+      if (mma_warp_elected) {
         // k selects [V_dim/K_dim, 16] tile
         for (int k = 0; k < BT / 16; k++) {
           const int v_tmem = v_tmem_base + k * 8;
@@ -323,11 +326,11 @@ void h_v2b_kernel_cutlass(
         }
         tcgen05_commit(vk_done_mbar + stage_id * 8);
         profiler.stamp(ISSUE_VK_MMA);
-
-        stage_id = (stage_id + 1) % NUM_STAGES;
-        if (stage_id == 0)
-          parity ^= 1;
       }
+
+      stage_id = (stage_id + 1) % NUM_STAGES;
+      if (stage_id == 0)
+        parity ^= 1;
     }
   }
   else if (warp_id >= 4) {
