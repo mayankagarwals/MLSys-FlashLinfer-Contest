@@ -84,7 +84,7 @@ StoreF32x4RelaxedNoAllocate(float *addr, const float4 &value) {
       : "l"(addr), "f"(value.x), "f"(value.y), "f"(value.z), "f"(value.w));
 }
 
-__global__ void GdnDecodeSmallBatch(
+__global__ void GdnDecodeSmallBatch_cutlass(
     const __nv_bfloat16 *__restrict__ q, const __nv_bfloat16 *__restrict__ k,
     const __nv_bfloat16 *__restrict__ v, const float *__restrict__ state,
     const float *__restrict__ A_log, const __nv_bfloat16 *__restrict__ a,
@@ -186,7 +186,7 @@ void LaunchGdnDecodeSmallBatch(const __nv_bfloat16 *__restrict__ q_ptr,
   TVM_FFI_CHECK(B > 0, ValueError) << "batch size must be positive";
 
   const dim3 grid(B * kNumVHeads * kNumVTiles, 1, 1);
-  GdnDecodeSmallBatch<<<grid, kNumThreads, 0, stream>>>(
+  GdnDecodeSmallBatch_cutlass<<<grid, kNumThreads, 0, stream>>>(
       q_ptr, k_ptr, v_ptr, state_ptr, A_log_ptr, a_ptr, dt_bias_ptr, b_ptr,
       scale_f, output_ptr, new_state_ptr);
 }
