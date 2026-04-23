@@ -220,31 +220,32 @@ void kkt_inv_uw_v1_kernel_cutlass(
     }
   }
   else if (warp_id == NUM_WARPS - 2) {
-    // MMA warp
+    // MMA warp: all 32 threads poll barriers; only the elected lane issues tcgen.
+    const uint32_t mma_warp_elected = elect_sync();
     tcgen05_alloc(taddr, 512);
 
-    if (elect_sync()) {
-      int stage_id = 0;
-      int parity = 0;
+    int stage_id = 0;
+    int parity = 0;
 
-      for (int global_chunk_id = bid; global_chunk_id < total_chunks; global_chunk_id += gridDim.y) {
-        const uint32_t V_smem = smem + stage_id * STAGE_SIZE;
-        const uint32_t K_smem = V_smem + V_size;
+    for (int global_chunk_id = bid; global_chunk_id < total_chunks; global_chunk_id += gridDim.y) {
+      const uint32_t V_smem = smem + stage_id * STAGE_SIZE;
+      const uint32_t K_smem = V_smem + V_size;
 
-        const uint32_t this_U_tmem = U_tmem + V_dim * stage_id;
-        const uint32_t this_W_tmem = this_U_tmem | (16U << 16U);
-        const uint32_t this_Ab_tmem  = Ab_tmem + (BT / 2) * stage_id;
-        const uint32_t this_Abg_tmem = this_Ab_tmem | (16U << 16U);
-        // KKT aliases U slot
-        const uint32_t this_kkt_tmem = this_U_tmem;
+      const uint32_t this_U_tmem = U_tmem + V_dim * stage_id;
+      const uint32_t this_W_tmem = this_U_tmem | (16U << 16U);
+      const uint32_t this_Ab_tmem  = Ab_tmem + (BT / 2) * stage_id;
+      const uint32_t this_Abg_tmem = this_Ab_tmem | (16U << 16U);
+      // KKT aliases U slot
+      const uint32_t this_kkt_tmem = this_U_tmem;
 
-        // --- MMA #1: KKT = K @ K^T ---
-        // Wait for TMA (K) ready AND for prev iter's U/W drained by epi.
-        // epi_mbar guards the aliased U tmem cols.
-        mbarrier_wait(epi_mbar + stage_id * 8, parity ^ 1);
-        mbarrier_wait(tma_mbar + stage_id * 8, parity);
-        tcgen05_fence_after_thread_sync();
+      // --- MMA #1: KKT = K @ K^T ---
+      // Wait for TMA (K) ready AND for prev iter's U/W drained by epi.
+      // epi_mbar guards the aliased U tmem cols.
+      mbarrier_wait(epi_mbar + stage_id * 8, parity ^ 1);
+      mbarrier_wait(tma_mbar + stage_id * 8, parity);
+      tcgen05_fence_after_thread_sync();
 
+      if (mma_warp_elected) {
         constexpr uint32_t kkt_idesc = make_tcgen05_idesc(BT, BT);
         constexpr uint64_t kdesc_base = (desc_encode(8 * 128) << 32ULL)
                                       | (1ULL << 46ULL) | (2ULL << 61ULL);
@@ -256,12 +257,14 @@ void kkt_inv_uw_v1_kernel_cutlass(
             tcgen05_mma(this_kkt_tmem, k_desc, k_desc, kkt_idesc, enable_input);
           }
         tcgen05_commit(kkt_mbar + stage_id * 8);
+      }
 
-        // --- MMA #2: U = Ab @ V, W = Abg @ K ---
-        // Wait inv_mbar: inv has finished reading KKT AND produced Ab/Abg.
-        mbarrier_wait(inv_mbar + stage_id * 8, parity);
-        tcgen05_fence_after_thread_sync();
+      // --- MMA #2: U = Ab @ V, W = Abg @ K ---
+      // Wait inv_mbar: inv has finished reading KKT AND produced Ab/Abg.
+      mbarrier_wait(inv_mbar + stage_id * 8, parity);
+      tcgen05_fence_after_thread_sync();
 
+      if (mma_warp_elected) {
         constexpr uint32_t u_idesc = make_tcgen05_idesc(BT, V_dim) | (1U << 16U);
         constexpr uint32_t w_idesc = make_tcgen05_idesc(BT, K_dim) | (1U << 16U);
 
@@ -276,11 +279,11 @@ void kkt_inv_uw_v1_kernel_cutlass(
           tcgen05_mma_tmem(this_W_tmem, this_Abg_tmem + i * 8, k_desc, w_idesc, i > 0);
         }
         tcgen05_commit(uw_mbar + stage_id * 8);
-
-        stage_id = (stage_id + 1) % NUM_STAGES;
-        if (stage_id == 0)
-          parity ^= 1;
       }
+
+      stage_id = (stage_id + 1) % NUM_STAGES;
+      if (stage_id == 0)
+        parity ^= 1;
     }
   }
   else if (warp_id >= 4) {

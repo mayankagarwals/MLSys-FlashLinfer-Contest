@@ -821,10 +821,11 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         mbarrier_wait(output_tmem_release_barrier, 1U ^ qk_phase);
       }
 
+      // Step 2: all 32 MMA threads poll the q/k barrier; only the elected
+      // lane issues tcgen05.mma and tcgen05.commit.
+      mbarrier_wait(qk_tma_barrier, qk_tma_stage_phase);
+      tcgen05_fence_after_thread_sync();
       if (warp_elected) {
-        // Step 2: build QK in TMEM once the q/k stage is visible.
-        mbarrier_wait(qk_tma_barrier, qk_tma_stage_phase);
-        tcgen05_fence_after_thread_sync();
         mma_swizzled<NUM_SWIZZLE_ATOMS>(QK_TMEM_COL, q_stage_smem,
                                         k_stage_smem);
         tcgen05_commit(qk_mma_barrier);
@@ -845,50 +846,58 @@ __global__ __block_size__((NUM_THREADS, 1, 1)) void o_v1_kernel_cutlass(
         const uint32_t qh_stage_barrier = qh_mma_barriers + head_offset * 8U;
         const uint32_t ov_stage_barrier = ov_mma_barriers + head_offset * 8U;
 
-        if (warp_elected) {
-          if (head_offset == HEAD1_STAGE_INDEX) {
-            // Step 5 gate: head1 QH writes into cols [0..127], reusing this
-            // chunk's [QK | ATTN0] region. Wait until:
-            //   1. CUDA has finished reading QK from TMEM
-            //   2. head0 QH build has completed
-            //   3. head0 OV into the shared OUT bank has completed
-            // Only then is it safe to reuse those TMEM columns and return the
-            // head0 h/v SMEM stages to the TMA producer.
-            mbarrier_wait(qk_tmem_release_barrier, qk_phase);
-            mbarrier_wait(ov_mma_barriers + HEAD0_STAGE_INDEX * 8U, qk_phase);
-            mbarrier_wait(qh_mma_barriers + HEAD0_STAGE_INDEX * 8U, qk_phase);
+        if (head_offset == HEAD1_STAGE_INDEX) {
+          // Step 5 gate: head1 QH writes into cols [0..127], reusing this
+          // chunk's [QK | ATTN0] region. Wait until:
+          //   1. CUDA has finished reading QK from TMEM
+          //   2. head0 QH build has completed
+          //   3. head0 OV into the shared OUT bank has completed
+          // Only then is it safe to reuse those TMEM columns and return the
+          // head0 h/v SMEM stages to the TMA producer.
+          mbarrier_wait(qk_tmem_release_barrier, qk_phase);
+          mbarrier_wait(ov_mma_barriers + HEAD0_STAGE_INDEX * 8U, qk_phase);
+          mbarrier_wait(qh_mma_barriers + HEAD0_STAGE_INDEX * 8U, qk_phase);
+          if (warp_elected) {
             tcgen05_fence_before_thread_sync();
             mbarrier_arrive(h_reuse_barriers + HEAD0_STAGE_INDEX * 8U);
             mbarrier_arrive(v_reuse_barriers + HEAD0_STAGE_INDEX * 8U);
           }
-          // Step 3 / 5: build this head's QH tile once its h stage is visible.
-          mbarrier_wait(h_stage_barrier, qk_phase);
-          tcgen05_fence_after_thread_sync();
+        }
+        // Step 3 / 5: build this head's QH tile once its h stage is visible.
+        mbarrier_wait(h_stage_barrier, qk_phase);
+        tcgen05_fence_after_thread_sync();
+        if (warp_elected) {
           mma_swizzled_qh_64x128(qh_stage_tmem, q_stage_smem, h_stage_smem);
           tcgen05_commit(qh_stage_barrier);
-          mbarrier_wait(v_stage_barrier, qk_phase);
-          mbarrier_wait(attn_stage_barrier, qk_phase);
-          if (head_offset == HEAD1_STAGE_INDEX) {
-            // Step 5 release: once the QH1 build itself has completed, the
-            // q-stage input and h1 SMEM input are no longer needed. CUDA will
-            // later read QH1 from TMEM, but it will not touch those SMEM stages.
-            mbarrier_wait(qh_stage_barrier, qk_phase);
+        }
+        mbarrier_wait(v_stage_barrier, qk_phase);
+        mbarrier_wait(attn_stage_barrier, qk_phase);
+        if (head_offset == HEAD1_STAGE_INDEX) {
+          // Step 5 release: once the QH1 build itself has completed, the
+          // q-stage input and h1 SMEM input are no longer needed. CUDA will
+          // later read QH1 from TMEM, but it will not touch those SMEM stages.
+          mbarrier_wait(qh_stage_barrier, qk_phase);
+          if (warp_elected) {
             tcgen05_fence_before_thread_sync();
             mbarrier_arrive(h_reuse_barriers + HEAD1_STAGE_INDEX * 8U);
             mbarrier_arrive(qk_reuse_barriers + qk_stage * 8U);
-            // Step 6 gate: head0 and head1 share the OUT bank, so head1 OV
-            // cannot start until CUDA has finished the final head0 OUT+QH read.
-            mbarrier_wait(head0_release_barrier, qk_phase);
           }
-          // Step 4 / 7: once both ATTN and V are visible, consume them into the
-          // shared OUT bank for this head.
-          tcgen05_fence_after_thread_sync();
+          // Step 6 gate: head0 and head1 share the OUT bank, so head1 OV
+          // cannot start until CUDA has finished the final head0 OUT+QH read.
+          mbarrier_wait(head0_release_barrier, qk_phase);
+        }
+        // Step 4 / 7: once both ATTN and V are visible, consume them into the
+        // shared OUT bank for this head.
+        tcgen05_fence_after_thread_sync();
+        if (warp_elected) {
           mma_attn_v_tmem_64x128(OUTPUT_TMEM_COL, attn_stage_tmem,
                                  v_stage_smem);
           tcgen05_commit(ov_stage_barrier);
-          if (head_offset + 1U == HEADS_PER_QK_HEAD) {
-            // Step 7 release: after head1 OV completes, no later MMA reuses v1.
-            mbarrier_wait(ov_stage_barrier, qk_phase);
+        }
+        if (head_offset + 1U == HEADS_PER_QK_HEAD) {
+          // Step 7 release: after head1 OV completes, no later MMA reuses v1.
+          mbarrier_wait(ov_stage_barrier, qk_phase);
+          if (warp_elected) {
             tcgen05_fence_before_thread_sync();
             mbarrier_arrive(v_reuse_barriers + HEAD1_STAGE_INDEX * 8U);
           }
