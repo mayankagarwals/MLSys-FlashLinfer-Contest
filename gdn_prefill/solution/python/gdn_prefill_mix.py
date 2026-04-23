@@ -25,14 +25,14 @@ def run(
     T = q.shape[0]
     N = cu_seqlens.shape[0] - 1
 
-    # chunk_v12 for medium/large workloads
-    if T >= 64 or (N == 1 and T >= 46):
-        return chunk_v12(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
+    # CUDA recurrent for tiny workloads
+    if N <= 2 and T <= N * 30:
+        o = torch.empty_like(v)
+        new_state = torch.empty_like(state)
+        cuda_recurrent_v1(
+            q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, o, new_state
+        )
+        return o, new_state
 
-    # CUDA recurrent for tiny/small workloads
-    o = torch.empty_like(v)
-    new_state = torch.empty_like(state)
-    cuda_recurrent_v1(
-        q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale, o, new_state
-    )
-    return o, new_state
+    # chunk_v12 for medium/large workloads
+    return chunk_v12(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale)
