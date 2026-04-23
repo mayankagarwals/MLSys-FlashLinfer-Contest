@@ -5,33 +5,5 @@ author = "CUDA_ERROR_UNKNOWN"
 
 [build]
 language = "python"
-entry_point = "gdn_decode_v12_mix.py::run"
+entry_point = "gdn_decode_final.py::run"
 destination_passing_style = false
-
-#language = "python"
-#entry_point = "gdn_decode_mix.py::run"
-#destination_passing_style = false
-
-#language = "cuda"
-#entry_point = "gdn_decode_kernel_8.cu::gdn_decode_v8"
-#destination_passing_style = true
-
-#language = "cuda"
-#entry_point = "gdn_decode_kernel_7.cu::gdn_decode_v7"
-#destination_passing_style = true
-
-#language = "triton"
-#entry_point = "gdn_decode_v1.py::run"
-#destination_passing_style = false
-
-#language = "python"
-#entry_point = "gdn_decode_broadcast.py::run"
-#destination_passing_style = false
-
-#language = "tilelang"
-#entry_point = "gdn_decode.py::run"
-#destination_passing_style = false
-
-#language = "python"
-#entry_point = "gdn_decode_cutedsl.py::gated_delta_rule_decode"
-#destination_passing_style = false
