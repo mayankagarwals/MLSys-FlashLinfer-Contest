@@ -1,5 +1,5 @@
 [solution]
-name = "gdn-decode-mix"
+name = "gdn-decode-final"
 definition = "gdn_decode_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
