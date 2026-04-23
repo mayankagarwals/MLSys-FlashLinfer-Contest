@@ -1,5 +1,5 @@
 [solution]
-name = "gdn-prefill-triton"
+name = "gdn-prefill-final"
 definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
@@ -7,7 +7,3 @@ author = "CUDA_ERROR_UNKNOWN"
 language = "python"
 entry_point = "gdn_prefill_mix.py::run"
 destination_passing_style = false
-
-#language = "python"
-#entry_point = "main.py::run"
-#destination_passing_style = false
