@@ -26,7 +26,7 @@ def run(
     N = cu_seqlens.shape[0] - 1
 
     # CUDA recurrent for tiny workloads
-    if T / N <= 30:
+    if N <= 2 and T <= N * 30:
         o = torch.empty_like(v)
         new_state = torch.empty_like(state)
         cuda_recurrent_v1(
