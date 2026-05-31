@@ -25,9 +25,18 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+# Match the contest's docker/Dockerfile environment (CUDA 13.2 CI image with the
+# full toolchain: nvcc, CUDA headers, CUTLASS, tvm-ffi). The bare debian_slim
+# image lacks these, so the kernels fail to compile (COMPILE_ERROR).
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132", add_python=None)
+    # Modal needs `python` on PATH; the CI image ships `python3`.
+    .run_commands("ln -sf $(command -v python3) /usr/local/bin/python")
+    .pip_install(
+        "pandas",
+        "huggingface_hub",
+        "git+https://github.com/flashinfer-ai/flashinfer-bench.git",
+    )
 )
 
 
