@@ -37,6 +37,7 @@ The main question is therefore:
 > Can we rewrite the recurrence in a chunked form, instead of updating the state one token at a time?
 
 
+## Step 1: Exploration to find the state decay and update
 
 Start by expanding the recurrent equation:
 
@@ -128,7 +129,7 @@ S_i
 G_iH_iH_{i-1}\cdots H_1S_0
 +
 \sum_{j=1}^{i}
-\gamma_{ij}H_iH_{i-1}\cdots H_{j+1}\beta_jk_j^\top v_j,
+\Gamma_{ij}H_iH_{i-1}\cdots H_{j+1}\beta_jk_j^\top v_j,
 $$
 
 where
@@ -171,7 +172,7 @@ $$
 $$
 
 
-We first develop the compressed form for Term 1. Term 2 is developed below.
+## Step 2: Simpler composition for Term 1
 
 If we continue unrolling, we encounter products such as:
 
@@ -444,7 +445,23 @@ Thus, the claim holds for every $i$.
 
 </details>
 
-### Term 2 — inject new associations
+We also derived 
+
+$$
+\boxed{
+\hat{w}_i
+=
+\beta_i
+\left(
+k_i
+-
+\sum_{j=1}^{i-1}
+(k_i k_j^\top)\hat{w}_j
+\right)
+}
+$$
+
+## Step 3: Simpler composition for Term 2
 
 Define the accumulated new information:
 
@@ -484,7 +501,8 @@ H_i=I-\beta_i k_i^\top k_i.
 $$
 
 <details>
-<summary><strong>Term 2: Proof by Induction</strong></summary>
+
+<summary><strong>Proof by Induction</strong></summary>
 
 ## Representation Claim
 
@@ -682,7 +700,7 @@ which proves that the representation is preserved by induction.
 
 </details>
 
-## Substituting the Compressions Back into the State
+## Step 4: Substituting the Compressions Back into the State
 
 Recall the Gated DeltaNet recurrence:
 
@@ -928,7 +946,7 @@ $$
 
 which is algebraically identical to the unrolled GLA form, with $v_j$ replaced by the transformed value $v'_j$.
 
-## Converting the Tokenwise Recurrences into Matrix Form
+## Step 5:  Converting the Tokenwise Recurrences into Matrix Form
 
 We have already rewritten the state at position $i$ in a GLA-like form:
 
@@ -1019,13 +1037,13 @@ $$
 Let
 
 $$
-\boldsymbol{\beta}
-=
+B=
 \begin{bmatrix}
 \beta_1\\
 \vdots\\
 \beta_N
-\end{bmatrix},
+\end{bmatrix}
+\in\mathbb{R}^{N\times 1},
 \qquad
 G=
 \begin{bmatrix}
@@ -1036,7 +1054,7 @@ G_N
 \in\mathbb{R}^{N\times 1}.
 $$
 
-We use $\odot$ for elementwise multiplication.
+We use $\odot$ for elementwise multiplication. When $B$ or $G$ appears in an elementwise product with an $N\times N$ matrix, it broadcasts across columns (row $i$ is scaled by $\beta_i$ or $G_i$).
 
 ### 1. Deriving $T$ and $U$
 
@@ -1120,7 +1138,7 @@ Therefore,
 $$
 (I+C)U
 =
-\operatorname{diag}(\boldsymbol{\beta})V.
+\operatorname{diag}(B)V.
 $$
 
 Solving for $U$,
@@ -1129,7 +1147,7 @@ $$
 U
 =
 (I+C)^{-1}
-\operatorname{diag}(\boldsymbol{\beta})V.
+\operatorname{diag}(B)V.
 $$
 
 Define
@@ -1139,7 +1157,7 @@ $$
 T
 =
 (I+C)^{-1}
-\operatorname{diag}(\boldsymbol{\beta})
+\operatorname{diag}(B)
 }
 $$
 
@@ -1173,7 +1191,7 @@ C
 =
 \operatorname{strictLower}
 \left(
-(\boldsymbol{\beta}\mathbf 1^\top)
+B
 \odot
 \Gamma
 \odot
@@ -1184,7 +1202,7 @@ $$
 
 Here:
 
-- $\boldsymbol{\beta}\mathbf 1^\top$ places $\beta_i$ across row $i$;
+- $B\in\mathbb{R}^{N\times 1}$ broadcasts $\beta_i$ across row $i$;
 - $\Gamma_{ij}$ supplies the decay from token $j$ to token $i$;
 - $KK^\top$ supplies $k_i k_j^\top$;
 - `strictLower` retains only $j<i$.
@@ -1199,28 +1217,23 @@ T
 I+
 \operatorname{strictLower}
 \left(
-(\boldsymbol{\beta}\mathbf 1^\top)
-\odot\Gamma\odot(KK^\top)
+B\odot\Gamma\odot(KK^\top)
 \right)
 \right]^{-1}
-\operatorname{diag}(\boldsymbol{\beta}).
+\operatorname{diag}(B).
 }
 $$
 
-Using broadcasting, this is written as
+In code,
 
 ```python
 C = strictLower(B * Gamma * (K @ K.T))
 T = inverse(I + C) * B.T
 ```
 
-where $B\in\mathbb{R}^{N\times1}$.
+For $C$, `B` alone suffices: with shape `[N, 1]` it broadcasts across columns.
 
-The multiplication by `B.T` is elementwise broadcasting across the columns of the inverse. It is equivalent to right-multiplication by
-
-$$
-\operatorname{diag}(\boldsymbol{\beta}).
-$$
+For $T$, `B.T` is needed (not `B`): it broadcasts $\beta_j$ across rows of $(I+C)^{-1}$, which is equivalent to right-multiplication by $\operatorname{diag}(B)$.
 
 Because $I+C$ is unit lower triangular, an implementation can use a triangular solve instead of explicitly computing the inverse.
 
@@ -1264,7 +1277,7 @@ Stacking these equations gives
 $$
 (I+C)W
 =
-\operatorname{diag}(\boldsymbol{\beta})
+\operatorname{diag}(B)
 \operatorname{diag}(G)K.
 $$
 
@@ -1275,7 +1288,7 @@ $$
 W
 &=
 (I+C)^{-1}
-\operatorname{diag}(\boldsymbol{\beta})
+\operatorname{diag}(B)
 \operatorname{diag}(G)K\\
 &=
 T\operatorname{diag}(G)K.
@@ -1637,9 +1650,7 @@ C
 =
 \operatorname{strictLower}
 \left(
-(\boldsymbol{\beta}\mathbf1^\top)
-\odot\Gamma
-\odot(KK^\top)
+B\odot\Gamma\odot(KK^\top)
 \right).
 $$
 
@@ -1647,7 +1658,7 @@ Then
 
 $$
 \boxed{
-T=(I+C)^{-1}\operatorname{diag}(\boldsymbol{\beta})
+T=(I+C)^{-1}\operatorname{diag}(B)
 }
 $$
 
@@ -1712,8 +1723,7 @@ $$
 
 C = strictLower(B * Gamma * (K @ K.T))
 
-# Elementwise multiplication by B.T is equivalent to
-# right-multiplication by diag(beta).
+# B.T broadcasts beta_j across rows (= right-multiply by diag(B)).
 T = inverse(I + C) * B.T
 
 U = T @ V
