@@ -188,27 +188,14 @@ $$
 Therefore:
 
 $$
-S_t
-===
-
-S_{t-1}
-+
-\beta_t k_t^T \delta_t
+S_t = S_{t-1} + \beta_t k_t^T \delta_t
 $$
 
 Substituting the delta:
 
 $$
 \boxed{
-S_t
-===
-
-S_{t-1}
-+
-\beta_t k_t^T
-\left(
-v_t-k_tS_{t-1}
-\right)
+S_t = S_{t-1} + \beta_t k_t^T \left(v_t-k_tS_{t-1}\right)
 }
 $$
 
@@ -254,26 +241,13 @@ $$
 Then the delta is:
 
 $$
-\delta_t
-========
-
-v_t-k_tS_{t-1}
-
-0
+\delta_t = v_t-k_tS_{t-1} = 0
 $$
 
 Therefore the update is zero:
 
 $$
-S_t
-===
-
-S_{t-1}
-+
-\beta_tk_t^T(0)
-===============
-
-S_{t-1}
+S_t = S_{t-1} + \beta_tk_t^T(0) = S_{t-1}
 $$
 
 The same association is not written repeatedly.
@@ -306,7 +280,7 @@ Define the squared-error loss:
 
 $$
 L_t(S)
-======
+=
 
 \frac{1}{2}
 \left|
@@ -318,7 +292,7 @@ The gradient with respect to $S$ is:
 
 $$
 \nabla_S L_t
-============
+=
 
 k_t^T(k_tS-v_t)
 $$
@@ -327,7 +301,7 @@ Perform one gradient-descent step from $S_{t-1}$:
 
 $$
 S_t
-===
+=
 
 S_{t-1} -
 
@@ -339,7 +313,7 @@ Substitute the gradient:
 
 $$
 S_t
-===
+=
 
 S_{t-1} -
 
@@ -352,7 +326,7 @@ Move the negative sign inside:
 
 $$
 S_t
-===
+=
 
 S_{t-1}
 +
@@ -377,7 +351,7 @@ DeltaNet improves how information is written, but without gating it still begins
 
 $$
 S_t
-===
+=
 
 S_{t-1}
 +
@@ -419,70 +393,42 @@ Interpretation:
 After forgetting, the decayed memory predicts:
 
 $$
-\hat v_t
-========
-
-k_t\bar S_{t-1}
+\hat v_t = k_t\bar S_{t-1}
 $$
 
 Substitute the decayed state:
 
 $$
-\hat v_t
-========
-
-k_t(g_tS_{t-1})
+\hat v_t = k_t(g_tS_{t-1})
 $$
 
 For a scalar gate:
 
 $$
-\hat v_t
-========
-
-g_tk_tS_{t-1}
+\hat v_t = g_tk_tS_{t-1}
 $$
 
 The new residual is therefore:
 
 $$
-\delta_t
-========
-
-v_t-k_t\bar S_{t-1}
+\delta_t = v_t-k_t\bar S_{t-1}
 $$
 
 $$
-\delta_t
-========
-
-v_t-g_tk_tS_{t-1}
+\delta_t = v_t-g_tk_tS_{t-1}
 $$
 
 Now write this correction into the decayed state:
 
 $$
-S_t
-===
-
-\bar S_{t-1}
-+
-\beta_tk_t^T\delta_t
+S_t = \bar S_{t-1} + \beta_tk_t^T\delta_t
 $$
 
 Substitute both terms:
 
 $$
 \boxed{
-S_t
-===
-
-g_tS_{t-1}
-+
-\beta_tk_t^T
-\left(
-v_t-g_tk_tS_{t-1}
-\right)
+S_t = g_tS_{t-1} + \beta_tk_t^T \left(v_t-g_tk_tS_{t-1}\right)
 }
 $$
 
@@ -509,12 +455,7 @@ $$
 ### Step C: Correct the remaining memory
 
 $$
-S_t
-===
-
-\bar S_{t-1}
-+
-\beta_tk_t^T(v_t-\hat v_t)
+S_t = \bar S_{t-1} + \beta_tk_t^T(v_t-\hat v_t)
 $$
 
 In code-like form:
