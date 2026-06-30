@@ -72,8 +72,13 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
 
-    # Determine source directory based on language
-    if language == "python":
+    # Determine source directory. An explicit `source_dir` in [build] overrides
+    # the language->dir default, letting parallel solutions (e.g. a from-scratch
+    # CuTe DSL implementation under solution/cutedsl) coexist with the main one.
+    source_dir_override = build_config.get("source_dir")
+    if source_dir_override:
+        source_dir = PROJECT_ROOT / source_dir_override
+    elif language == "python":
         source_dir = PROJECT_ROOT / "solution" / "python"
     elif language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"

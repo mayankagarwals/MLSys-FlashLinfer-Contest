@@ -4,6 +4,16 @@ definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
 [build]
+#language = "python"
+#entry_point = "gdn_prefill_mix.py::run"
+#destination_passing_style = false
+
+# --- Parallel CuTe DSL reference solution -----------------------------------
+# To benchmark the from-scratch CuTe DSL implementation instead of the optimized
+# solution above, comment out the two lines above and uncomment the three below
+# (`source_dir` overrides the default solution/<language> directory):
+
 language = "python"
-entry_point = "gdn_prefill_mix.py::run"
+entry_point = "gdn_prefill_cutedsl.py::run"
+source_dir = "solution/cutedsl"
 destination_passing_style = false

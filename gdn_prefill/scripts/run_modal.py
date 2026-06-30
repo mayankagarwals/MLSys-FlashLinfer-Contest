@@ -76,7 +76,10 @@ def read_source_files() -> dict[str, str]:
         config = tomllib.load(f)
 
     language = config["build"]["language"]
-    source_dir = PROJECT_ROOT / "solution" / language
+    # An explicit `source_dir` in [build] overrides the language->dir default,
+    # letting parallel solutions (e.g. solution/cutedsl) coexist with the main one.
+    rel_source_dir = config["build"].get("source_dir") or f"solution/{language}"
+    source_dir = PROJECT_ROOT / rel_source_dir
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
@@ -102,15 +105,16 @@ def run_benchmark(config_toml: str, source_files: dict, workload_uuid: str = Non
     solution_config = config["solution"]
     build_config = config["build"]
     language = build_config["language"]
+    rel_source_dir = build_config.get("source_dir") or f"solution/{language}"
 
     # Reconstruct the source tree on the worker, then pack remotely.
     workspace = Path("/workspace")
     for rel_path, content in source_files.items():
-        if rel_path.startswith(f"solution/{language}/"):
+        if rel_path.startswith(f"{rel_source_dir}/"):
             out = workspace / rel_path
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(content)
-    source_dir = workspace / "solution" / language
+    source_dir = workspace / rel_source_dir
 
     spec = BuildSpec(
         language=language,
