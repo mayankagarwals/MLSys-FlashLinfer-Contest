@@ -1,4 +1,9 @@
 """
+gdn_prefill_triton_v2 -- parallel form, full sequence, no chunking (commit e665875).
+
+Processes the entire sequence as one N×N block per head (no BT chunk loop).
+Log-space gate cumsum: g = -exp(A_log)*softplus(...), then cumsum + exp for Gamma.
+
 GDN prefill -- from-scratch Triton workspace (parallel to solution/python).
 
 This file is the *entry point* for a from-scratch Triton implementation of
@@ -94,56 +99,46 @@ def _recurrent_sequence(
     seq_len, num_heads, _ = v_HV.shape
     out = []
     s_out = []
-    BT: int = 16
-    num_iter: int = (seq_len + BT - 1)//BT
 
     for head in range(num_heads):
-
-        for i in range(num_iter):
-
-            start = i*BT
-            end = min((i+1)*BT, seq_len)-1
-            chunk_len = end - start + 1
         
-            G: torch.Tensor = g_H[start:end+1, head] # [N]
-            G = torch.cumsum(G, dim=0)  # [N] in log space
+        G: torch.Tensor = g_H[:,head] # [N, 1]
+        G = torch.cumsum(G, dim=0)  # [N] in log space
 
-            B: torch.Tensor = beta_H[start:end+1, head]# [N, 1]
-            V: torch.Tensor = v_HV[start:end+1, head, :].float() # [N, V]
-            K: torch.Tensor = k_HK[start:end+1, head, :].float() # [N, K]
-            Q: torch.Tensor = q_HK[start:end+1, head, :].float() # [N, K]
-            S_in: torch.Tensor = state_HKV[head, :, :] # [K, V]
-            
+        B: torch.Tensor = beta_H[:, head]# [N, 1]
+        V: torch.Tensor = v_HV[:, head, :].float() # [N, V]
+        K: torch.Tensor = k_HK[:, head, :].float() # [N, K]
+        Q: torch.Tensor = q_HK[:, head, :].float() # [N, K]
+        S_in: torch.Tensor = state_HKV[head, :, :] # [K, V]
+        
 
-            Gamma: torch.Tensor = torch.exp(G[:, None] - G[None, :]) # [N, N]
-            C: torch.Tensor = K @ K.T # [N, N]
-            C = Gamma * C # [N, N] (pointwise mul)
-            C = B[:, None] * C # [N, N] (broadcast)
-            C = torch.tril(C, diagonal=-1)
+        Gamma: torch.Tensor = torch.exp(G[:, None] - G[None, :]) # [N, N]
+        C: torch.Tensor = K @ K.T # [N, N]
+        C = Gamma * C # [N, N] (pointwise mul)
+        C = B[:, None] * C # [N, N] (broadcast)
+        C = torch.tril(C, diagonal=-1)
 
-            I: torch.Tensor = torch.eye(chunk_len, chunk_len, device=q_HK.device, dtype=torch.float32)
-            C = I + C # [N, N]
-            T: torch.Tensor = torch.linalg.inv(C) # [N, N]
-            T: torch.Tensor = T * B[None, :]
+        I: torch.Tensor = torch.eye(seq_len, seq_len, device=q_HK.device, dtype=torch.float32)
+        C = I + C # [N, N]
+        T: torch.Tensor = torch.linalg.inv(C) # [N, N]
+        T: torch.Tensor = T * B[None, :]
 
-            U: torch.Tensor = T @ V  # [N, V]
-            W: torch.Tensor = (T * torch.exp(G[None, :])) @ K # [N, K]
+        U: torch.Tensor = T @ V  # [N, V]
+        W: torch.Tensor = (T * torch.exp(G[None, :])) @ K # [N, K]
 
-            V_p: torch.Tensor = U - (W @ S_in) #[N , V]
+        V_p: torch.Tensor = U - (W @ S_in) #[N , V]
 
-            M: torch.Tensor = torch.tril(torch.ones(chunk_len, chunk_len, device=q_HK.device), diagonal=0)
-            M_p: torch.Tensor = M * Gamma # [N, N]
+        M: torch.Tensor = torch.tril(torch.ones(seq_len, seq_len, device=q_HK.device), diagonal=0)
+        M_p: torch.Tensor = M * Gamma # [N, N]
 
 
-            O: torch.Tensor = torch.exp(G[:, None]) * (Q @ S_in) + ((Q @ K.T) * M_p) @ V_p # [N, V]
-            S_out: torch.Tensor = (
-                torch.exp(G[-1]) * S_in + 
-                K.T @ (V_p * torch.exp(G[-1] - G[:, None]))
-            )  # [K, V]
+        O: torch.Tensor = torch.exp(G[:, None]) * (Q @ S_in) + ((Q @ K.T) * M_p) @ V_p # [N, V]
+        S_out: torch.Tensor = (
+            torch.exp(G[-1]) * S_in + 
+            K.T @ (V_p * torch.exp(G[-1] - G[:, None]))
+        )  # [K, V]
 
-            S_in = S_out
-            out.append((scale * O).to(torch.bfloat16))
-
+        out.append((scale * O).to(torch.bfloat16))
         s_out.append(S_out)
     
     return (torch.stack(out , dim=1), torch.stack(s_out, dim = 0))
