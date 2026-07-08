@@ -91,30 +91,50 @@ def _recurrent_sequence(
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """One sequence of the gated delta rule. Returns (output[seq_len,HV,V], state)."""
-    seq_len, num_heads, head_v = v_HV.shape
-    out = torch.empty(
-        (seq_len, num_heads, head_v), dtype=torch.bfloat16, device=v_HV.device
-    )
+    seq_len, num_heads, _ = v_HV.shape
+    out = []
+    s_out = []
 
-    for i in range(seq_len):
-        q_H1K = q_HK[i].unsqueeze(1).float()
-        k_H1K = k_HK[i].unsqueeze(1).float()
-        v_H1V = v_HV[i].unsqueeze(1).float()
-        g_H11 = g_H[i].unsqueeze(1).unsqueeze(2)
-        beta_H11 = beta_H[i].unsqueeze(1).unsqueeze(2)
+    for head in range(num_heads):
+        
+        G: torch.Tensor = g_H[:,head] # [N, 1]
+        B: torch.Tensor = beta_H[:, head]# [N, 1]
+        V: torch.Tensor = v_HV[:, head, :] # [N, V]
+        K: torch.Tensor = k_HK[:, head, :] # [N, K]
+        Q: torch.Tensor = q_HK[:, head, :] # [N, K]
+        S_in: torch.Tensor = state_HKV[head, :, :] # [K, V]
+        
 
-        old_state_HKV = g_H11 * state_HKV
-        old_v_H1V = _matmul(k_H1K, old_state_HKV)
-        new_v_H1V = beta_H11 * v_H1V + (1 - beta_H11) * old_v_H1V
-        state_remove = torch.einsum("hkl,hlv->hkv", k_H1K.transpose(-1, -2), old_v_H1V)
-        state_update = torch.einsum("hkl,hlv->hkv", k_H1K.transpose(-1, -2), new_v_H1V)
-        state_HKV = old_state_HKV - state_remove + state_update
+        Gamma: torch.Tensor = G/G.T # [N, N]
+        C: torch.Tensor = K @ K.T # [N, N]
+        C = Gamma * C # [N, N] (pointwise mul)
+        C = C.to(torch.bfloat16)
+        C = B * C # [N, N] (broadcast)
+        
+        I: torch.Tensor = torch.ones(seq_len, seq_len, device=q_HK.device, dtype=torch.bfloat16)
+        C = I + C # [N, N]
+        C = C * B.T # [N, N] (broadcast)
+        T: torch.Tensor = torch.linalg.inv(C) # [N, N]
 
-        o_H1V = scale * _matmul(q_H1K, state_HKV)
-        out[i] = o_H1V.squeeze(1).to(torch.bfloat16)
+        U: torch.Tensor = T @ V  # [N, V]
+        W: torch.Tensor = (T * G.T) @ K # [N, K]
 
-    return out, state_HKV
+        V_p: torch.Tensor = U - (W @ S_in) #[N , V]
 
+        M: torch.Tensor = torch.tril(I, diagonal=0)# [N, N]
+        M_p: torch.Tensor = M * (G/G.T) # [N, N]
+
+
+        O: torch.Tensor = G * (Q @ S_in) + ((Q @ K.T) * M_p) @ V_p # [N, V]
+        S_out: torch.Tensor = (
+            G[-1] * S_in + 
+            K.T @ (V_p & (G[-1] / G))
+        )  # [K, V]
+
+        out.append(O)
+        s_out.append(S_out)
+    
+    return [torch.stack(out , dim=1), torch.stack(s_out, dim = 0)]
 
 @torch.no_grad()
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
