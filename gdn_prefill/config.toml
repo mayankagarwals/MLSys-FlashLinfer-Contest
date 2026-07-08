@@ -8,12 +8,10 @@ author = "CUDA_ERROR_UNKNOWN"
 #entry_point = "gdn_prefill_mix.py::run"
 #destination_passing_style = false
 
-# --- Parallel CuTe DSL reference solution -----------------------------------
-# To benchmark the from-scratch CuTe DSL implementation instead of the optimized
-# solution above, comment out the two lines above and uncomment the three below
-# (`source_dir` overrides the default solution/<language> directory):
+# --- Parallel Triton reference solution -------------------------------------
+# To benchmark the from-scratch Triton implementation instead of the optimized
+# solution above, comment out the two lines above and uncomment the three below:
 
-language = "python"
-entry_point = "gdn_prefill_cutedsl.py::run"
-source_dir = "solution/cutedsl"
+language = "triton"
+entry_point = "gdn_prefill_triton.py::run"
 destination_passing_style = false
