@@ -98,43 +98,45 @@ def _recurrent_sequence(
     for head in range(num_heads):
         
         G: torch.Tensor = g_H[:,head] # [N, 1]
+        G = torch.cumprod(G, dim=0)  # [N]
+
         B: torch.Tensor = beta_H[:, head]# [N, 1]
-        V: torch.Tensor = v_HV[:, head, :] # [N, V]
-        K: torch.Tensor = k_HK[:, head, :] # [N, K]
-        Q: torch.Tensor = q_HK[:, head, :] # [N, K]
+        V: torch.Tensor = v_HV[:, head, :].float() # [N, V]
+        K: torch.Tensor = k_HK[:, head, :].float() # [N, K]
+        Q: torch.Tensor = q_HK[:, head, :].float() # [N, K]
         S_in: torch.Tensor = state_HKV[head, :, :] # [K, V]
         
 
-        Gamma: torch.Tensor = G/G.T # [N, N]
+        Gamma: torch.Tensor = G[:, None] / G[None, :] # [N, N]
         C: torch.Tensor = K @ K.T # [N, N]
         C = Gamma * C # [N, N] (pointwise mul)
-        C = C.to(torch.bfloat16)
-        C = B * C # [N, N] (broadcast)
-        
-        I: torch.Tensor = torch.ones(seq_len, seq_len, device=q_HK.device, dtype=torch.bfloat16)
+        C = B[:, None] * C # [N, N] (broadcast)
+        C = torch.tril(C, diagonal=-1)
+
+        I: torch.Tensor = torch.eye(seq_len, seq_len, device=q_HK.device, dtype=torch.float32)
         C = I + C # [N, N]
-        C = C * B.T # [N, N] (broadcast)
         T: torch.Tensor = torch.linalg.inv(C) # [N, N]
+        T: torch.Tensor = T * B[None, :]
 
         U: torch.Tensor = T @ V  # [N, V]
-        W: torch.Tensor = (T * G.T) @ K # [N, K]
+        W: torch.Tensor = (T * G[None, :]) @ K # [N, K]
 
         V_p: torch.Tensor = U - (W @ S_in) #[N , V]
 
-        M: torch.Tensor = torch.tril(I, diagonal=0)# [N, N]
-        M_p: torch.Tensor = M * (G/G.T) # [N, N]
+        M: torch.Tensor = torch.tril(torch.ones(seq_len, seq_len, device=q_HK.device), diagonal=0)
+        M_p: torch.Tensor = M * Gamma # [N, N]
 
 
-        O: torch.Tensor = G * (Q @ S_in) + ((Q @ K.T) * M_p) @ V_p # [N, V]
+        O: torch.Tensor = G[:, None] * (Q @ S_in) + ((Q @ K.T) * M_p) @ V_p # [N, V]
         S_out: torch.Tensor = (
             G[-1] * S_in + 
-            K.T @ (V_p & (G[-1] / G))
+            K.T @ (V_p * (G[-1] / G[:, None]))
         )  # [K, V]
 
-        out.append(O)
+        out.append((scale * O).to(torch.bfloat16))
         s_out.append(S_out)
     
-    return [torch.stack(out , dim=1), torch.stack(s_out, dim = 0)]
+    return (torch.stack(out , dim=1), torch.stack(s_out, dim = 0))
 
 @torch.no_grad()
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
