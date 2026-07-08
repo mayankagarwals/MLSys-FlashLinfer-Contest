@@ -75,7 +75,7 @@ def _compute_gate_and_beta(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """g = exp(-exp(A_log) * softplus(a + dt_bias)),  beta = sigmoid(b)."""
     x = a.float() + dt_bias.float()  # [T, HV]
-    g = torch.exp(-torch.exp(A_log.float()) * F.softplus(x))  # [T, HV]
+    g = -torch.exp(A_log.float()) * F.softplus(x)  # [T, HV]
     beta = torch.sigmoid(b.float())  # [T, HV]
     return g, beta
 
@@ -98,7 +98,7 @@ def _recurrent_sequence(
     for head in range(num_heads):
         
         G: torch.Tensor = g_H[:,head] # [N, 1]
-        G = torch.cumprod(G, dim=0)  # [N]
+        G = torch.cumsum(G, dim=0)  # [N] in log space
 
         B: torch.Tensor = beta_H[:, head]# [N, 1]
         V: torch.Tensor = v_HV[:, head, :].float() # [N, V]
@@ -107,7 +107,7 @@ def _recurrent_sequence(
         S_in: torch.Tensor = state_HKV[head, :, :] # [K, V]
         
 
-        Gamma: torch.Tensor = G[:, None] / G[None, :] # [N, N]
+        Gamma: torch.Tensor = torch.exp(G[:, None] - G[None, :]) # [N, N]
         C: torch.Tensor = K @ K.T # [N, N]
         C = Gamma * C # [N, N] (pointwise mul)
         C = B[:, None] * C # [N, N] (broadcast)
@@ -119,7 +119,7 @@ def _recurrent_sequence(
         T: torch.Tensor = T * B[None, :]
 
         U: torch.Tensor = T @ V  # [N, V]
-        W: torch.Tensor = (T * G[None, :]) @ K # [N, K]
+        W: torch.Tensor = (T * torch.exp(G[None, :])) @ K # [N, K]
 
         V_p: torch.Tensor = U - (W @ S_in) #[N , V]
 
@@ -127,10 +127,10 @@ def _recurrent_sequence(
         M_p: torch.Tensor = M * Gamma # [N, N]
 
 
-        O: torch.Tensor = G[:, None] * (Q @ S_in) + ((Q @ K.T) * M_p) @ V_p # [N, V]
+        O: torch.Tensor = torch.exp(G[:, None]) * (Q @ S_in) + ((Q @ K.T) * M_p) @ V_p # [N, V]
         S_out: torch.Tensor = (
-            G[-1] * S_in + 
-            K.T @ (V_p * (G[-1] / G[:, None]))
+            torch.exp(G[-1]) * S_in + 
+            K.T @ (V_p * torch.exp(G[-1] - G[:, None]))
         )  # [K, V]
 
         out.append((scale * O).to(torch.bfloat16))
