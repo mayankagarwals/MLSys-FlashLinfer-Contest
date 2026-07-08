@@ -107,6 +107,7 @@ def _recurrent_sequence(
     num_iter: int = (seq_len + BT - 1)//BT
 
     for head in range(num_heads):
+        head_out = []
 
         for i in range(num_iter):
 
@@ -151,11 +152,12 @@ def _recurrent_sequence(
             )  # [K, V]
 
             S_in = S_out
-            out.append((scale * O).to(torch.bfloat16))
+            head_out.append((scale * O).to(torch.bfloat16))
 
+        out.append(torch.cat(head_out, dim=0))
         s_out.append(S_out)
     
-    return (torch.stack(out , dim=1), torch.stack(s_out, dim = 0))
+    return torch.stack(out, dim=1), torch.stack(s_out, dim=0)
 
 @torch.no_grad()
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
