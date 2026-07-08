@@ -108,6 +108,7 @@ def _recurrent_sequence(
 
     for head in range(num_heads):
         head_out = []
+        S_in = state_HKV[head, :, :].clone()
 
         for i in range(num_iter):
 
@@ -122,7 +123,6 @@ def _recurrent_sequence(
             V: torch.Tensor = v_HV[start:end+1, head, :].float() # [N, V]
             K: torch.Tensor = k_HK[start:end+1, head, :].float() # [N, K]
             Q: torch.Tensor = q_HK[start:end+1, head, :].float() # [N, K]
-            S_in: torch.Tensor = state_HKV[head, :, :] # [K, V]
             
 
             Gamma: torch.Tensor = torch.exp(G[:, None] - G[None, :]) # [N, N]
