@@ -218,7 +218,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
 
         if state is not None:
             # [H, V, K] (k-last, as stored) -> [H, K, V] internal (k-first).
-            state_HKV = state[seq_idx].clone().float().transpose(-1, -2)
+            state_HKV = state[seq_idx].clone().float().transpose(-1, -2).contiguous()
         else:
             state_HKV = torch.zeros(
                 (num_sab_heads, head_size, head_size),

@@ -70,11 +70,6 @@ def _alloc_fn(size: int, alignment: int, stream: int | None):
 triton.set_allocator(_alloc_fn)
 
 
-def _matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Float32 matmul for numerical stability (matches the contest reference)."""
-    return a.float() @ b.float()
-
-
 # === [Triton replacement point -- Stage 1: gate precompute] ==================
 def _compute_gate_and_beta(
     A_log: torch.Tensor,
