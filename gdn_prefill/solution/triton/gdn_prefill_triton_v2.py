@@ -1,0 +1,235 @@
+"""
+V2: Triton 
+"""
+
+import math
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+def _alloc_fn(size: int, alignment: int, stream: int | None):
+    return torch.empty(size, device="cuda", dtype=torch.int8)
+
+
+triton.set_allocator(_alloc_fn)
+
+
+def _matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Float32 matmul for numerical stability (matches the contest reference)."""
+    return a.float() @ b.float()
+
+
+# === [Triton replacement point -- Stage 1: gate precompute] ==================
+def _compute_gate_and_beta(
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """g = exp(-exp(A_log) * softplus(a + dt_bias)),  beta = sigmoid(b)."""
+    x = a.float() + dt_bias.float()  # [T, HV]
+    g = -torch.exp(A_log.float()) * F.softplus(x)  # [T, HV]
+    beta = torch.sigmoid(b.float())  # [T, HV]
+    return g, beta
+
+
+@triton.jit
+def _recurrent_sequence_kernel(
+    q_HK,  # [seq_len, HV, K]   (q broadcast to HV heads)
+    k_HK,  # [seq_len, HV, K]
+    v_HV,  # [seq_len, HV, V]
+    g_H,  # [seq_len, HV]
+    beta_H,  # [seq_len, HV]
+    state_HKV,  # [HV, K, V]  (k-first internal layout)
+    scale,
+    out, # [seq_len, HV, K], 
+    seq_len,
+    NUM_HEADS: tl.constexpr,
+    BT: tl.constexpr, 
+    HEAD_DIM: tl.constexpr
+):
+    head = tl.program_id(axis=0)
+    num_iter: int = (seq_len + BT - 1)//BT
+    state_head_offsets = head*(HEAD_DIM * HEAD_DIM) + (tl.arange(0, HEAD_DIM)[:, None])*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+    S_in = tl.load(state_HKV + state_head_offsets) # [HEAD_DIM, HEAD_DIM]
+    
+    for i in range(num_iter):
+
+        start = i*BT
+
+        seq = start + tl.arange(0, BT)          # [BT]
+
+        offsets = seq*NUM_HEADS + head
+        mask = seq < seq_len
+        G = tl.load(g_H + offsets, mask = mask, other=0.0) # [BT]
+        G = tl.cumsum(G, axis=0)  # [BT] in log space
+
+        B = tl.load(beta_H + offsets, mask = mask, other=0.0)# [BT]
+
+        dim = tl.arange(0, HEAD_DIM)            # [128]     
+        offsets = (
+            seq[:, None] * NUM_HEADS * HEAD_DIM
+            + head * HEAD_DIM
+            + dim[None, :]
+        )  # [BT, HEAD_DIM]
+        mask = seq[:, None] < seq_len 
+
+        V = tl.load(v_HV + offsets, mask = mask, other = 0.0).to(tl.float32)# [BT, V]
+        K = tl.load(k_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
+        Q = tl.load(q_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
+        
+
+        Gamma = tl.exp(G[:, None] - G[None, :]) # [N, N]
+        C = tl.dot(K, tl.trans(K)) # [N, N]
+        C = Gamma * C # [N, N] (pointwise mul)
+        C = B[:, None] * C # [N, N] (broadcast)
+
+        row = tl.arange(0, BT)[:, None]  # [BT, 1]
+        col = tl.arange(0, BT)[None, :]  # [1, BT]
+        lower_tri_mask = row > col 
+        C = tl.where(lower_tri_mask, C, 0.0)
+
+        I = tl.where(row == col, 1.0, 0.0)      # [N, N]
+
+        # C = I + C # [N, N]
+        # T: torch.Tensor = torch.linalg.inv(C) # [N, N]
+
+
+        # C is currently the strictly-lower part L
+        L = C
+
+        # T = inv(I + L)
+        T = I
+        P = I
+
+        for p in tl.static_range(1, BT):
+            P = tl.dot(P, L)  # P = L^p
+
+            if p % 2 == 1:
+                T = T - P
+            else:
+                T = T + P
+
+
+        T = T * B[None, :]
+
+        U = tl.dot(T , V)  # [N, V]
+        W = tl.dot((T * tl.exp(G[None, :])) , K) # [N, K]
+
+        V_p = U - tl.dot(W , S_in) #[N , V]
+
+        M = tl.where(row >= col, 1.0, 0.0)      # [CHUNK_LEN, CHUNK_LEN]        
+        M_p = M * Gamma # [N, N]
+
+
+        O = tl.exp(G[:, None]) * tl.dot(Q , S_in) + tl.dot((tl.dot(Q , K.T) * M_p) , V_p) # [N, V]
+        chunk_len = tl.minimum(BT, seq_len - start)
+        # Triton 1D tensors do not support dynamic or scalar indexing (G[i]).
+        last_G = tl.sum(tl.where(tl.arange(0, BT) == chunk_len - 1, G, 0.0))
+        S_out = (
+            tl.exp(last_G) * S_in + 
+            tl.dot(tl.trans(K) , (V_p * tl.exp(last_G - G[:, None])))
+        )  # [K, V]
+
+        S_in = S_out
+        scaled_O = (scale * O).to(tl.bfloat16)
+        
+        tl.store(out + offsets, scaled_O, mask)
+
+    tl.store(state_HKV + state_head_offsets , S_in)
+
+# === [Triton replacement point -- Stages 2-4: per-sequence delta rule] =======
+def _recurrent_sequence(
+    q_HK: torch.Tensor,  # [seq_len, HV, K]   (q broadcast to HV heads)
+    k_HK: torch.Tensor,  # [seq_len, HV, K]
+    v_HV: torch.Tensor,  # [seq_len, HV, V]
+    g_H: torch.Tensor,  # [seq_len, HV]
+    beta_H: torch.Tensor,  # [seq_len, HV]
+    state_HKV: torch.Tensor,  # [HV, K, V]  (k-first internal layout)
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One sequence of the gated delta rule. Returns (output[seq_len,HV,V], state)."""
+    seq_len, num_heads, head_dim = v_HV.shape
+    out = q_HK.new_zeros(seq_len, num_heads, head_dim)
+    BT: int = 16
+    
+    grid = lambda meta: (meta['NUM_HEADS'],)
+
+    _recurrent_sequence_kernel[grid](q_HK, k_HK, v_HV, 
+    g_H, beta_H, state_HKV, scale, out, seq_len, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim)
+
+    return out, state_HKV
+
+@torch.no_grad()
+def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
+    """Gated DeltaNet prefill (k-last state layout [H, V, K]).
+
+    Args / shapes match the contest definition gdn_prefill_qk4_v8_d128_k_last:
+      q: [T, Hq=4, K=128]   k: [T, Hk=4, K=128]   v: [T, Hv=8, V=128]
+      state: [num_seqs, Hv=8, V=128, K=128]
+      A_log, dt_bias: [Hv]   a, b: [T, Hv]   cu_seqlens: [num_seqs+1]
+    Returns (output: [T, Hv, V] bf16, new_state: [num_seqs, Hv, V, K] f32).
+    """
+    total_seq_len, num_q_heads, head_size = q.shape
+    num_v_heads = v.shape[1]
+    num_k_heads = k.shape[1]
+    num_sab_heads = max(num_q_heads, num_v_heads)
+    num_seqs = cu_seqlens.size(0) - 1
+    device = q.device
+
+    assert num_q_heads == 4
+    assert num_k_heads == 4
+    assert num_v_heads == 8
+    assert head_size == 128
+
+    if scale is None or scale == 0.0:
+        scale = 1.0 / math.sqrt(head_size)
+
+    g, beta = _compute_gate_and_beta(A_log, a, dt_bias, b)
+
+    # GQA: broadcast q/k heads up to the number of v heads.
+    q_exp = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)  # [T, HV, K]
+    k_exp = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)  # [T, HV, K]
+
+    output = torch.zeros(
+        (total_seq_len, num_sab_heads, head_size), dtype=torch.bfloat16, device=device
+    )
+    new_state = torch.zeros(
+        (num_seqs, num_sab_heads, head_size, head_size),
+        dtype=torch.float32,
+        device=device,
+    )
+
+    for seq_idx in range(num_seqs):
+        seq_start = int(cu_seqlens[seq_idx].item())
+        seq_end = int(cu_seqlens[seq_idx + 1].item())
+        seq_len = seq_end - seq_start
+        if seq_len <= 0:
+            continue
+
+        if state is not None:
+            # [H, V, K] (k-last, as stored) -> [H, K, V] internal (k-first).
+            state_HKV = state[seq_idx].clone().float().transpose(-1, -2)
+        else:
+            state_HKV = torch.zeros(
+                (num_sab_heads, head_size, head_size),
+                dtype=torch.float32,
+                device=device,
+            )
+
+        out_seq, state_HKV = _recurrent_sequence(
+            q_exp[seq_start:seq_end],
+            k_exp[seq_start:seq_end],
+            v[seq_start:seq_end],
+            g[seq_start:seq_end],
+            beta[seq_start:seq_end],
+            state_HKV,
+            scale,
+        )
+        output[seq_start:seq_end] = out_seq
+        new_state[seq_idx] = state_HKV.transpose(-1, -2)  # [H,K,V] -> [H,V,K]
+
+    return output, new_state
