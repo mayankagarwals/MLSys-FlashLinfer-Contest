@@ -37,20 +37,20 @@ def _compute_gate_and_beta(
 
 
 @triton.jit
-def _unit_lower_inverse(A_orig, BT: tl.constexpr, DOT_PRECISION: tl.constexpr):
-    """(I + A)^{-1}: fast tf32 Neumann on 16x16 + tf32x3 Newton-Schulz refine."""
+def _unit_lower_inverse(A_orig, BT: tl.constexpr):
+    """(I + A)^{-1}: tf32 Neumann on 16x16 + tf32x3 Newton-Schulz refinement."""
     idx = tl.arange(0, BT)
     m_I = tl.where(idx[:, None] == idx[None, :], 1.0, 0.0)
 
     # (I + A)^{-1} = (I - A)(I + A^2)(I + A^4)(I + A^8) for BT=16.
     A = A_orig
     Ai = m_I - A
-    A = tl.dot(A, A, input_precision=DOT_PRECISION)
-    Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
-    A = tl.dot(A, A, input_precision=DOT_PRECISION)
-    Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
-    A = tl.dot(A, A, input_precision=DOT_PRECISION)
-    Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
+    A = tl.dot(A, A)
+    Ai = tl.dot(Ai, m_I + A)
+    A = tl.dot(A, A)
+    Ai = tl.dot(Ai, m_I + A)
+    A = tl.dot(A, A)
+    Ai = tl.dot(Ai, m_I + A)
 
     # Newton-Schulz: Ai <- Ai @ (2I - (I+A) @ Ai), squares error E -> E^2.
     MAi = Ai + tl.dot(A_orig, Ai, input_precision="tf32x3")
@@ -72,7 +72,6 @@ def _recurrent_sequence_kernel(
     NUM_HEADS: tl.constexpr,
     BT: tl.constexpr, 
     HEAD_DIM: tl.constexpr,
-    INV_PREC: tl.constexpr,
 ):
     head = tl.program_id(axis=0)
     num_iter: int = (seq_len + BT - 1)//BT
@@ -106,8 +105,7 @@ def _recurrent_sequence_kernel(
         
 
         Gamma = tl.exp(G[:, None] - G[None, :]) # [N, N]
-        # 16x16 KKT: single-shot tf32 is enough; tf32x3 blows shared memory at HEAD_DIM=128.
-        C = tl.dot(K, tl.trans(K), input_precision="tf32") # [N, N]
+        C = tl.dot(K, tl.trans(K)) # [N, N]
         C = Gamma * C # [N, N] (pointwise mul)
         C = B[:, None] * C # [N, N] (broadcast)
 
@@ -118,7 +116,7 @@ def _recurrent_sequence_kernel(
 
         # L is strictly lower; T = (I + L)^{-1} diag(B)
         L = C
-        T = _unit_lower_inverse(L, BT=BT, DOT_PRECISION=INV_PREC)
+        T = _unit_lower_inverse(L, BT=BT)
         T = T * B[None, :]
 
         U = tl.dot(T , V)  # [N, V]
@@ -165,7 +163,7 @@ def _recurrent_sequence(
     grid = lambda meta: (meta['NUM_HEADS'],)
 
     _recurrent_sequence_kernel[grid](q_HK, k_HK, v_HV, 
-    g_H, beta_H, state_HKV, scale, out, seq_len, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim, INV_PREC = "tf32")
+    g_H, beta_H, state_HKV, scale, out, seq_len, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim)
 
     return out, state_HKV
 
