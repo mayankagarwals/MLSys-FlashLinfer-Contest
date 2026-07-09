@@ -37,6 +37,28 @@ def _compute_gate_and_beta(
 
 
 @triton.jit
+def _unit_lower_inverse(A_orig, BT: tl.constexpr, DOT_PRECISION: tl.constexpr):
+    """(I + A)^{-1}: fast tf32 Neumann on 16x16 + tf32x3 Newton-Schulz refine."""
+    idx = tl.arange(0, BT)
+    m_I = tl.where(idx[:, None] == idx[None, :], 1.0, 0.0)
+
+    # (I + A)^{-1} = (I - A)(I + A^2)(I + A^4)(I + A^8) for BT=16.
+    A = A_orig
+    Ai = m_I - A
+    A = tl.dot(A, A, input_precision=DOT_PRECISION)
+    Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
+    A = tl.dot(A, A, input_precision=DOT_PRECISION)
+    Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
+    A = tl.dot(A, A, input_precision=DOT_PRECISION)
+    Ai = tl.dot(Ai, m_I + A, input_precision=DOT_PRECISION)
+
+    # Newton-Schulz: Ai <- Ai @ (2I - (I+A) @ Ai), squares error E -> E^2.
+    MAi = Ai + tl.dot(A_orig, Ai, input_precision="tf32x3")
+    Ai = tl.dot(Ai, 2.0 * m_I - MAi, input_precision="tf32x3")
+    return Ai
+
+
+@triton.jit
 def _recurrent_sequence_kernel(
     q_HK,  # [seq_len, HV, K]   (q broadcast to HV heads)
     k_HK,  # [seq_len, HV, K]
@@ -49,7 +71,8 @@ def _recurrent_sequence_kernel(
     seq_len,
     NUM_HEADS: tl.constexpr,
     BT: tl.constexpr, 
-    HEAD_DIM: tl.constexpr
+    HEAD_DIM: tl.constexpr,
+    INV_PREC: tl.constexpr,
 ):
     head = tl.program_id(axis=0)
     num_iter: int = (seq_len + BT - 1)//BT
@@ -83,7 +106,8 @@ def _recurrent_sequence_kernel(
         
 
         Gamma = tl.exp(G[:, None] - G[None, :]) # [N, N]
-        C = tl.dot(K, tl.trans(K)) # [N, N]
+        # 16x16 KKT: single-shot tf32 is enough; tf32x3 blows shared memory at HEAD_DIM=128.
+        C = tl.dot(K, tl.trans(K), input_precision="tf32") # [N, N]
         C = Gamma * C # [N, N] (pointwise mul)
         C = B[:, None] * C # [N, N] (broadcast)
 
@@ -92,28 +116,9 @@ def _recurrent_sequence_kernel(
         lower_tri_mask = row > col 
         C = tl.where(lower_tri_mask, C, 0.0)
 
-        I = tl.where(row == col, 1.0, 0.0)      # [N, N]
-
-        # C = I + C # [N, N]
-        # T: torch.Tensor = torch.linalg.inv(C) # [N, N]
-
-
-        # C is currently the strictly-lower part L
+        # L is strictly lower; T = (I + L)^{-1} diag(B)
         L = C
-
-        # T = inv(I + L)
-        T = I
-        P = I
-
-        for p in tl.static_range(1, BT):
-            P = tl.dot(P, L)  # P = L^p
-
-            if p % 2 == 1:
-                T = T - P
-            else:
-                T = T + P
-
-
+        T = _unit_lower_inverse(L, BT=BT, DOT_PRECISION=INV_PREC)
         T = T * B[None, :]
 
         U = tl.dot(T , V)  # [N, V]
@@ -124,8 +129,9 @@ def _recurrent_sequence_kernel(
         M = tl.where(row >= col, 1.0, 0.0)      # [CHUNK_LEN, CHUNK_LEN]        
         M_p = M * Gamma # [N, N]
 
-
-        O = tl.exp(G[:, None]) * tl.dot(Q , S_in) + tl.dot((tl.dot(Q , K.T) * M_p) , V_p) # [N, V]
+        O = tl.exp(G[:, None]) * tl.dot(Q, S_in) + tl.dot(
+            (tl.dot(Q, tl.trans(K)) * M_p), V_p
+        ) # [N, V]
         chunk_len = tl.minimum(BT, seq_len - start)
         # Triton 1D tensors do not support dynamic or scalar indexing (G[i]).
         last_G = tl.sum(tl.where(tl.arange(0, BT) == chunk_len - 1, G, 0.0))
@@ -159,7 +165,7 @@ def _recurrent_sequence(
     grid = lambda meta: (meta['NUM_HEADS'],)
 
     _recurrent_sequence_kernel[grid](q_HK, k_HK, v_HV, 
-    g_H, beta_H, state_HKV, scale, out, seq_len, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim)
+    g_H, beta_H, state_HKV, scale, out, seq_len, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim, INV_PREC = "tf32")
 
     return out, state_HKV
 
