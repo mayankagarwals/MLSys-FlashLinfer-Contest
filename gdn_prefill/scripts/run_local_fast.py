@@ -7,15 +7,17 @@ process (no subprocess isolation), and reports latency + correctness.
 Usage:
   cd scripts/
   uv run python run_local_fast.py                          # download dataset from HuggingFace
-  uv run python run_local_fast.py --local /path/to/dataset  # use local dataset
-  uv run python run_local_fast.py --run_baseline gdn_prefill  # run FlashInfer baseline
+  uv run python run_local_fast.py --local /path/to/mlsys26-contest  # production dataset
+  uv run python run_local_fast.py --local /path/to/dataset --run_baseline gdn_prefill
 """
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
+import torch
 from flashinfer_bench.bench.evaluators import DefaultEvaluator
 from flashinfer_bench.bench.evaluators.utils import allocate_outputs
 from flashinfer_bench.bench.utils import ResolvedEvalConfig, gen_inputs, load_safetensors
@@ -24,17 +26,28 @@ from flashinfer_bench.data import Definition, Solution, Workload
 from pack_solution import pack_solution
 
 
-def main(args: argparse.Namespace):
-    # Resolve dataset path: local flag > HuggingFace download
-    if args.local:
-        repo_path = Path(args.local)
+def resolve_repo_path(local: str | None) -> Path:
+    if local:
+        repo_path = Path(local)
         if not repo_path.exists():
             raise FileNotFoundError(f"Local dataset not found: {repo_path}")
-    else:
-        from huggingface_hub import snapshot_download
+        return repo_path
 
-        REPO_NAME = "flashinfer-ai/mlsys26-contest"
-        repo_path = Path(snapshot_download(REPO_NAME, repo_type="dataset"))
+    fib_path = os.environ.get("FIB_FULL_DATASET_PATH")
+    if fib_path:
+        repo_path = Path(fib_path)
+        if not repo_path.exists():
+            raise FileNotFoundError(f"FIB_FULL_DATASET_PATH not found: {fib_path}")
+        return repo_path
+
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download("flashinfer-ai/mlsys26-contest", repo_type="dataset"))
+
+
+def main(args: argparse.Namespace):
+    repo_path = resolve_repo_path(args.local)
+    print("Repo path: ", repo_path)
 
     if args.run_baseline:
         # load hard-coded baseline path
@@ -72,6 +85,11 @@ def main(args: argparse.Namespace):
         Workload.model_validate(json.loads(line)["workload"])
         for line in open(repo_path / filename)
     ]
+
+    if args.uuid is not None:
+        workloads = [w for w in workloads if w.uuid == args.uuid]
+        if not workloads:
+            raise ValueError(f"No workload found for uuid={args.uuid}")
 
     # Build the solution
     device = "cuda"
@@ -135,6 +153,12 @@ if __name__ == "__main__":
         type=str,
         default=None,
         help="Path to local dataset (skip HuggingFace download)",
+    )
+    parser.add_argument(
+        "--uuid",
+        type=str,
+        default=None,
+        help="Run only the workload with this UUID",
     )
     args = parser.parse_args()
 
