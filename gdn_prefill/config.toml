@@ -13,5 +13,5 @@ author = "CUDA_ERROR_UNKNOWN"
 # solution above, comment out the two lines above and uncomment the three below:
 
 language = "triton"
-entry_point = "gdn_prefill_triton_v2.py::run"
+entry_point = "gdn_prefill_triton_v3.py::run"
 destination_passing_style = false

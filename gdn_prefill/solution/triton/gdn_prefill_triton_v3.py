@@ -233,10 +233,11 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     """Gated DeltaNet prefill (k-last state layout [H, V, K]).
 
     Args / shapes match the contest definition gdn_prefill_qk4_v8_d128_k_last:
-      q: [T, Hq=4, K=128]   k: [T, Hk=4, K=128]   v: [T, Hv=8, V=128]
-      state: [num_seqs, Hv=8, V=128, K=128]
-      A_log, dt_bias: [Hv]   a, b: [T, Hv]   cu_seqlens: [num_seqs+1]
-    Returns (output: [T, Hv, V] bf16, new_state: [num_seqs, Hv, V, K] f32).
+      q: bf16 [T, Hq=4, K=128]   k: bf16 [T, Hk=4, K=128]   v: bf16 [T, Hv=8, V=128]
+      state: f32 [num_seqs, Hv=8, V=128, K=128] (optional)
+      A_log: f32 [Hv]   dt_bias: f32 [Hv]   a: bf16 [T, Hv]   b: bf16 [T, Hv]
+      cu_seqlens: int64 [num_seqs+1]   scale: f32 (scalar, optional)
+    Returns (output: bf16 [T, Hv, V], new_state: f32 [num_seqs, Hv, V, K]).
     """
     total_seq_len, num_q_heads, head_size = q.shape
     num_v_heads = v.shape[1]
