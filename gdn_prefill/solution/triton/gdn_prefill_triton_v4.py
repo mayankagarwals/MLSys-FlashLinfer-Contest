@@ -278,7 +278,7 @@ def _recurrent_sequence(
     """One sequence of the gated delta rule. Returns (output[seq_len,HV,V], state)."""
     seq_len, num_heads, head_dim = v_HV.shape
     out = q_HK.new_zeros(seq_len, num_heads, head_dim)
-    BT: int = 64
+    BT: int = 16
     BV: int = 32
     assert head_dim % BV == 0
     num_chunks = (seq_len + BT - 1)//BT
