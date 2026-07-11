@@ -7,3 +7,8 @@ author = "CUDA_ERROR_UNKNOWN"
 language = "python"
 entry_point = "gdn_prefill_mix.py::run"
 destination_passing_style = false
+
+
+#language = "triton"
+#entry_point = "gdn_prefill_triton_v5.py::run"
+#destination_passing_style = false
