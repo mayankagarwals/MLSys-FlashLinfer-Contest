@@ -37,25 +37,84 @@ def _compute_gate_and_beta(
 
 
 @triton.jit
-def _unit_lower_inverse(A_orig, BT: tl.constexpr):
-    """(I + A)^{-1}: tf32 Neumann on 16x16 + tf32x3 Newton-Schulz refinement."""
-    idx = tl.arange(0, BT)
-    m_I = tl.where(idx[:, None] == idx[None, :], 1.0, 0.0)
+def _shift_block_rows(X, distance: tl.constexpr):
+    """Return Y[i] = X[i - distance], with out-of-range rows set to zero."""
+    dst = tl.arange(0, 4)[:, None, None, None]
+    src = tl.arange(0, 4)[None, :, None, None]
+    return tl.sum(tl.where(src + distance == dst, X[None, :, :, :], 0.0), axis=1)
 
-    # (I + A)^{-1} = (I - A)(I + A^2)(I + A^4)(I + A^8) for BT=16.
-    A = A_orig
-    Ai = m_I - A
-    A = tl.dot(A, A)
-    Ai = tl.dot(Ai, m_I + A)
-    A = tl.dot(A, A)
-    Ai = tl.dot(Ai, m_I + A)
-    A = tl.dot(A, A)
-    Ai = tl.dot(Ai, m_I + A)
 
-    # Newton-Schulz: Ai <- Ai @ (2I - (I+A) @ Ai), squares error E -> E^2.
-    MAi = Ai + tl.dot(A_orig, Ai, input_precision="tf32x3")
-    Ai = tl.dot(Ai, 2.0 * m_I - MAi, input_precision="tf32x3")
+@triton.jit
+def _block_subdiagonal(X, distance: tl.constexpr):
+    """Extract X[i, i - distance], keeping i as a four-element batch axis."""
+    row = tl.arange(0, 4)[:, None, None, None]
+    col = tl.arange(0, 4)[None, :, None, None]
+    return tl.sum(tl.where(row == col + distance, X, 0.0), axis=1)
+
+
+@triton.jit
+def _unit_lower_inverse_16(A):
+    """Invert four batched 16x16 unit-lower-triangular blocks."""
+    idx = tl.arange(0, 16)
+    I = tl.where(idx[:, None] == idx[None, :], 1.0, 0.0)
+    I = tl.broadcast_to(I[None, :, :], (4, 16, 16))
+
+    # Exact in real arithmetic because every strictly lower 16x16 A has A^16 = 0.
+    power = A
+    Ai = I - power
+    for _ in tl.static_range(3):
+        power = tl.dot(power, power)
+        Ai = tl.dot(Ai, I + power)
+
+    # Repair tensor-core rounding. Each step squares the inverse residual.
+    for _ in tl.static_range(3):
+        MAi = Ai + tl.dot(A, Ai, input_precision="tf32x3")
+        Ai = tl.dot(Ai, 2.0 * I - MAi, input_precision="tf32x3")
     return Ai
+
+
+@triton.jit
+def _unit_lower_inverse(A, BT: tl.constexpr):
+    """Invert a 64x64 unit-lower-triangular matrix as 4x4 blocks of 16x16."""
+    tl.static_assert(BT == 64)
+
+    # [64,64] -> [block_row, block_col, row_in_block, col_in_block]
+    A_blocks = tl.reshape(A, (4, 16, 4, 16))
+    A_blocks = tl.permute(A_blocks, (0, 2, 1, 3))
+
+    A0 = _block_subdiagonal(A_blocks, distance=0)
+    A1 = _block_subdiagonal(A_blocks, distance=1)
+    A2 = _block_subdiagonal(A_blocks, distance=2)
+    A3 = _block_subdiagonal(A_blocks, distance=3)
+
+    # Diagonal of B = (I + A)^-1.
+    B0 = _unit_lower_inverse_16(A0)
+
+    # First, second, and third inverse subdiagonals, batched by block row i.
+    B1 = -tl.dot(B0, tl.dot(A1, _shift_block_rows(B0, distance=1)))
+    B2 = -tl.dot(
+        B0,
+        tl.dot(A2, _shift_block_rows(B0, distance=2))
+        + tl.dot(A1, _shift_block_rows(B1, distance=1)),
+    )
+    B3 = -tl.dot(
+        B0,
+        tl.dot(A3, _shift_block_rows(B0, distance=3))
+        + tl.dot(A2, _shift_block_rows(B1, distance=2))
+        + tl.dot(A1, _shift_block_rows(B2, distance=1)),
+    )
+
+    # Place the four computed subdiagonals back into a 4x4 block matrix.
+    row = tl.arange(0, 4)[:, None, None, None]
+    col = tl.arange(0, 4)[None, :, None, None]
+    B_blocks = tl.where(row == col, B0[:, None, :, :], 0.0)
+    B_blocks += tl.where(row == col + 1, B1[:, None, :, :], 0.0)
+    B_blocks += tl.where(row == col + 2, B2[:, None, :, :], 0.0)
+    B_blocks += tl.where(row == col + 3, B3[:, None, :, :], 0.0)
+
+    # [block_row, block_col, row, col] -> [64,64]
+    B = tl.permute(B_blocks, (0, 2, 1, 3))
+    return tl.reshape(B, (BT, BT))
 
 
 
@@ -278,7 +337,7 @@ def _recurrent_sequence(
     """One sequence of the gated delta rule. Returns (output[seq_len,HV,V], state)."""
     seq_len, num_heads, head_dim = v_HV.shape
     out = q_HK.new_zeros(seq_len, num_heads, head_dim)
-    BT: int = 16
+    BT: int = 64
     BV: int = 32
     assert head_dim % BV == 0
     num_chunks = (seq_len + BT - 1)//BT
