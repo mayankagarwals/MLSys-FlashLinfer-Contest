@@ -69,16 +69,16 @@ def _recurrent_sequence_kernel_1(
     u, 
     w,
     NUM_HEADS: tl.constexpr,
-    CHUNK_LEN: tl.constexpr, 
+    NUM_CHUNKS: tl.constexpr,
+    BT: tl.constexpr,
     HEAD_DIM: tl.constexpr,
 ):
     head = tl.program_id(axis=0)
     chunk_idx = tl.program_id(axis=1)
-    
 
-    start = chunk_idx*CHUNK_LEN
+    start = chunk_idx * BT
 
-    seq = start + tl.arange(0, CHUNK_LEN)          # [BT]
+    seq = start + tl.arange(0, BT)          # [BT]
 
     offsets = seq*NUM_HEADS + head
     mask = seq < seq_len
@@ -104,14 +104,14 @@ def _recurrent_sequence_kernel_1(
     C = Gamma * C # [N, N] (pointwise mul)
     C = B[:, None] * C # [N, N] (broadcast)
 
-    row = tl.arange(0, CHUNK_LEN)[:, None]  # [BT, 1]
-    col = tl.arange(0, CHUNK_LEN)[None, :]  # [1, BT]
+    row = tl.arange(0, BT)[:, None]  # [BT, 1]
+    col = tl.arange(0, BT)[None, :]  # [1, BT]
     lower_tri_mask = row > col 
     C = tl.where(lower_tri_mask, C, 0.0)
 
     # L is strictly lower; T = (I + L)^{-1} diag(B)
     L = C
-    T = _unit_lower_inverse(L, BT=CHUNK_LEN)
+    T = _unit_lower_inverse(L, BT=BT)
     T = T * B[None, :]
 
     U = tl.dot(T , V)  # [N, V]
@@ -134,16 +134,18 @@ def _recurrent_sequence_kernel_2(
     seq_len,
     u,
     w,
+    chunk_state_out_ptr,
+    v_p_ptr,
+    NUM_CHUNKS: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     BT: tl.constexpr, 
     HEAD_DIM: tl.constexpr,
 ):
     head = tl.program_id(axis=0)
-    num_iter: int = (seq_len + BT - 1)//BT
     state_head_offsets = head*(HEAD_DIM * HEAD_DIM) + (tl.arange(0, HEAD_DIM)[:, None])*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
     S_in = tl.load(state_HKV + state_head_offsets) # [HEAD_DIM, HEAD_DIM]
     
-    for i in range(num_iter):
+    for i in range(NUM_CHUNKS):
 
         start = i*BT
 
@@ -153,7 +155,6 @@ def _recurrent_sequence_kernel_2(
         mask = seq < seq_len
         G = tl.load(g_H + offsets, mask = mask, other=0.0) # [BT]
         G = tl.cumsum(G, axis=0)  # [BT] in log space
-        Gamma = tl.exp(G[:, None] - G[None, :]) # [N, N]
 
 
         dim = tl.arange(0, HEAD_DIM)            # [128]     
@@ -165,21 +166,15 @@ def _recurrent_sequence_kernel_2(
         mask = seq[:, None] < seq_len 
 
         K = tl.load(k_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
-        Q = tl.load(q_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
         U = tl.load(u + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
         W = tl.load(w + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
 
         V_p = U - tl.dot(W , S_in) #[N , V]
+        tl.store(v_p_ptr + offsets, V_p, mask)
 
+        state_chunk_out_offsets = i*(NUM_HEADS*HEAD_DIM*HEAD_DIM) + state_head_offsets
+        tl.store(chunk_state_out_ptr + state_chunk_out_offsets, S_in)
 
-        row = tl.arange(0, BT)[:, None]  # [BT, 1]
-        col = tl.arange(0, BT)[None, :]  # [1, BT]
-        M = tl.where(row >= col, 1.0, 0.0)      # [CHUNK_LEN, CHUNK_LEN]        
-        M_p = M * Gamma # [N, N]
-
-        O = tl.exp(G[:, None]) * tl.dot(Q, S_in) + tl.dot(
-            (tl.dot(Q, tl.trans(K)) * M_p), V_p
-        ) # [N, V]
         chunk_len = tl.minimum(BT, seq_len - start)
         # Triton 1D tensors do not support dynamic or scalar indexing (G[i]).
         last_G = tl.sum(tl.where(tl.arange(0, BT) == chunk_len - 1, G, 0.0))
@@ -189,11 +184,70 @@ def _recurrent_sequence_kernel_2(
         )  # [K, V]
 
         S_in = S_out
-        scaled_O = (scale * O).to(tl.bfloat16)
+    
+    tl.store(state_HKV + state_head_offsets, S_in)
         
-        tl.store(out + offsets, scaled_O, mask)
 
-    tl.store(state_HKV + state_head_offsets , S_in)
+@triton.jit
+def _recurrent_sequence_kernel_3(
+    q_HK,  # [seq_len, HV, K]   (q broadcast to HV heads)
+    k_HK,  # [seq_len, HV, K]
+    g_H,  # [seq_len, HV]
+    state_HKV,  # [HV, K, V]  (k-first internal layout)
+    scale,
+    out, # [seq_len, HV, K], 
+    seq_len,
+    chunk_state_out_ptr,
+    v_p_ptr,
+    NUM_CHUNKS: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    BT: tl.constexpr, 
+    HEAD_DIM: tl.constexpr,
+):
+    head = tl.program_id(axis=0)
+    chunk_idx = tl.program_id(axis=1)
+
+    state_head_offsets = head*(HEAD_DIM * HEAD_DIM) + (tl.arange(0, HEAD_DIM)[:, None])*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+    chunk_state_out_offsets = chunk_idx*(NUM_HEADS * HEAD_DIM * HEAD_DIM) + state_head_offsets
+    chunk_state_out = tl.load(chunk_state_out_ptr + chunk_state_out_offsets)# [HEAD_DIM, HEAD_DIM]
+
+    start = chunk_idx*BT
+
+    seq = start + tl.arange(0, BT)          # [BT]
+
+    offsets = seq*NUM_HEADS + head
+    mask = seq < seq_len
+    G = tl.load(g_H + offsets, mask = mask, other=0.0) # [BT]
+    G = tl.cumsum(G, axis=0)  # [BT] in log space
+    Gamma = tl.exp(G[:, None] - G[None, :]) # [N, N]
+
+
+    dim = tl.arange(0, HEAD_DIM)            # [128]     
+    offsets = (
+        seq[:, None] * NUM_HEADS * HEAD_DIM
+        + head * HEAD_DIM
+        + dim[None, :]
+    )  # [BT, HEAD_DIM]
+    mask = seq[:, None] < seq_len 
+
+    K = tl.load(k_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
+    Q = tl.load(q_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
+
+    row = tl.arange(0, BT)[:, None]  # [BT, 1]
+    col = tl.arange(0, BT)[None, :]  # [1, BT]
+    M = tl.where(row >= col, 1.0, 0.0)      # [CHUNK_LEN, CHUNK_LEN]        
+    M_p = M * Gamma # [N, N]
+
+    V_p = tl.load(v_p_ptr + offsets, mask)
+    O = tl.exp(G[:, None]) * tl.dot(Q, chunk_state_out) + tl.dot(
+        (tl.dot(Q, tl.trans(K)) * M_p), V_p
+    ) # [N, V]
+
+    scaled_O = (scale * O).to(tl.bfloat16)
+    
+    tl.store(out + offsets, scaled_O, mask)
+
+
 
 # === [Triton replacement point -- Stages 2-4: per-sequence delta rule] =======
 def _recurrent_sequence(
@@ -213,18 +267,29 @@ def _recurrent_sequence(
 
     w = torch.zeros(seq_len, num_heads, head_dim, device = k_HK.device, dtype = torch.float32)
     u = torch.zeros(seq_len, num_heads, head_dim, device = v_HV.device, dtype = torch.float32)
-    CHUNK_LEN = 64
 
+    num_chunks = (seq_len + BT - 1)//BT
+    chunk_state_out_ptr = torch.zeros(num_chunks, num_heads, head_dim, head_dim, device = k_HK.device, dtype = torch.float32)
+    v_p_ptr = torch.zeros(seq_len, num_heads, head_dim, device = k_HK.device, dtype = torch.float32)
 
-    grid = lambda meta: (meta['NUM_HEADS'], meta['CHUNK_LEN'])
+    grid = lambda meta: (meta['NUM_HEADS'], meta['NUM_CHUNKS'])
 
     _recurrent_sequence_kernel_1[grid]( k_HK, v_HV, 
-    g_H, beta_H, seq_len, u, w, NUM_HEADS = num_heads, CHUNK_LEN = CHUNK_LEN, HEAD_DIM = head_dim)
+    g_H, beta_H, seq_len, u, w, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim, NUM_CHUNKS = num_chunks)
+
+
 
     grid = lambda meta: (meta['NUM_HEADS'],)
 
     _recurrent_sequence_kernel_2[grid](q_HK, k_HK, 
-    g_H, state_HKV, scale, out, seq_len, u, w, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim)
+    g_H, state_HKV, scale, out, seq_len, u, w, chunk_state_out_ptr, v_p_ptr, NUM_CHUNKS = num_chunks, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim)
+
+    grid = lambda meta: (meta['NUM_HEADS'], meta['NUM_CHUNKS'])
+    
+    _recurrent_sequence_kernel_3[grid](q_HK, k_HK, 
+    g_H, state_HKV, scale, out, seq_len, chunk_state_out_ptr, v_p_ptr, NUM_CHUNKS = num_chunks, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim)
+
+
 
     return out, state_HKV
 
