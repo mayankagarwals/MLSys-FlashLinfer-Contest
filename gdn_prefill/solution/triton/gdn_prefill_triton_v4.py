@@ -156,14 +156,16 @@ def _recurrent_sequence_kernel_1(
     V = tl.load(v_HV + offsets, mask = mask, other = 0.0).to(tl.float32)# [BT, V]
     K = tl.load(k_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
     
+    row = tl.arange(0, BT)[:, None]  # [BT, 1]
+    col = tl.arange(0, BT)[None, :]  # [1, BT]
+    lower = row >= col
 
-    Gamma = tl.exp(G[:, None] - G[None, :]) # [N, N]
+    Gamma = tl.exp(tl.where(lower, G[:, None] - G[None, :], -float("inf"))) # [N, N]
     C = tl.dot(K, tl.trans(K)) # [N, N]
     C = Gamma * C # [N, N] (pointwise mul)
     C = B[:, None] * C # [N, N] (broadcast)
 
-    row = tl.arange(0, BT)[:, None]  # [BT, 1]
-    col = tl.arange(0, BT)[None, :]  # [1, BT]
+
     lower_tri_mask = row > col 
     C = tl.where(lower_tri_mask, C, 0.0)
 
@@ -289,7 +291,7 @@ def _recurrent_sequence_kernel_3(
     mask = seq < seq_len
     G = tl.load(g_H + offsets, mask = mask, other=0.0) # [BT]
     G = tl.cumsum(G, axis=0)  # [BT] in log space
-    Gamma = tl.exp(G[:, None] - G[None, :]) # [N, N]
+
 
 
     dim = tl.arange(0, HEAD_DIM)            # [128]     
@@ -310,7 +312,13 @@ def _recurrent_sequence_kernel_3(
 
     row = tl.arange(0, BT)[:, None]  # [BT, 1]
     col = tl.arange(0, BT)[None, :]  # [1, BT]
-    M = tl.where(row >= col, 1.0, 0.0)      # [CHUNK_LEN, CHUNK_LEN]        
+    lower = row >= col
+
+    M = tl.where(row >= col, 1.0, 0.0)      # [CHUNK_LEN, CHUNK_LEN]    
+
+    # Do this masking to avoid exponentiating large values which we are going to find in upper diagonal
+    Gamma = tl.exp(tl.where(lower, G[:, None] - G[None, :], -float("inf"))) # [N, N]
+    
     M_p = M * Gamma # [N, N]
 
     V_p = tl.load(v_p_ptr + v_offsets, mask)
