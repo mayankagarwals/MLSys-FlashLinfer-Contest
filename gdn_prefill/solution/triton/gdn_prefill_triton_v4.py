@@ -215,10 +215,12 @@ def _recurrent_sequence_kernel_3(
 ):
     head = tl.program_id(axis=0)
     chunk_idx = tl.program_id(axis=1)
+    v_offset_id = tl.program_id(axis=2)
 
-    state_head_offsets = head*(HEAD_DIM * HEAD_DIM) + (tl.arange(0, HEAD_DIM)[:, None])*HEAD_DIM + tl.arange(0, HEAD_DIM)[None, :]
+    bv_offsets =  v_offset_id*BV + tl.arange(0, BV)
+    state_head_offsets = head*(HEAD_DIM * HEAD_DIM) + (tl.arange(0, HEAD_DIM)[:, None])*HEAD_DIM + bv_offsets[None, :]
     chunk_state_out_offsets = chunk_idx*(NUM_HEADS * HEAD_DIM * HEAD_DIM) + state_head_offsets
-    chunk_state_out = tl.load(chunk_state_out_ptr + chunk_state_out_offsets)# [HEAD_DIM, HEAD_DIM]
+    chunk_state_out = tl.load(chunk_state_out_ptr + chunk_state_out_offsets)# [HEAD_DIM, BV]
 
     start = chunk_idx*BT
 
@@ -232,29 +234,34 @@ def _recurrent_sequence_kernel_3(
 
 
     dim = tl.arange(0, HEAD_DIM)            # [128]     
-    offsets = (
+    k_offsets = (
         seq[:, None] * NUM_HEADS * HEAD_DIM
         + head * HEAD_DIM
         + dim[None, :]
     )  # [BT, HEAD_DIM]
+    v_offsets = (
+        seq[:, None] * NUM_HEADS * HEAD_DIM
+        + head * HEAD_DIM
+        + bv_offsets[None, :]
+    )  # [BT, BV]
     mask = seq[:, None] < seq_len 
 
-    K = tl.load(k_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
-    Q = tl.load(q_HK + offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
+    K = tl.load(k_HK + k_offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
+    Q = tl.load(q_HK + k_offsets, mask = mask, other = 0.0).to(tl.float32) # [BT, K]
 
     row = tl.arange(0, BT)[:, None]  # [BT, 1]
     col = tl.arange(0, BT)[None, :]  # [1, BT]
     M = tl.where(row >= col, 1.0, 0.0)      # [CHUNK_LEN, CHUNK_LEN]        
     M_p = M * Gamma # [N, N]
 
-    V_p = tl.load(v_p_ptr + offsets, mask)
+    V_p = tl.load(v_p_ptr + v_offsets, mask)
     O = tl.exp(G[:, None]) * tl.dot(Q, chunk_state_out) + tl.dot(
         (tl.dot(Q, tl.trans(K)) * M_p), V_p
     ) # [N, V]
 
     scaled_O = (scale * O).to(tl.bfloat16)
     
-    tl.store(out + offsets, scaled_O, mask)
+    tl.store(out + v_offsets, scaled_O, mask)
 
 
 
@@ -271,7 +278,7 @@ def _recurrent_sequence(
     """One sequence of the gated delta rule. Returns (output[seq_len,HV,V], state)."""
     seq_len, num_heads, head_dim = v_HV.shape
     out = q_HK.new_zeros(seq_len, num_heads, head_dim)
-    BT: int = 16
+    BT: int = 64
     BV: int = 32
     assert head_dim % BV == 0
     num_chunks = (seq_len + BT - 1)//BT
@@ -296,7 +303,7 @@ def _recurrent_sequence(
     _recurrent_sequence_kernel_2[grid](q_HK, k_HK, 
     g_H, state_HKV, scale, out, seq_len, u, w, chunk_state_out_ptr, v_p_ptr, NUM_CHUNKS = num_chunks, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim, BV = BV)
 
-    grid = lambda meta: (meta['NUM_HEADS'], num_chunks)
+    grid = lambda meta: (meta['NUM_HEADS'], num_chunks, num_v_blocks)
     
     _recurrent_sequence_kernel_3[grid](q_HK, k_HK, 
     g_H, state_HKV, scale, out, seq_len, chunk_state_out_ptr, v_p_ptr, NUM_HEADS = num_heads, BT = BT, HEAD_DIM = head_dim, BV = BV)
