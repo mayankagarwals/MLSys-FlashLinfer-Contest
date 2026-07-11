@@ -4,14 +4,11 @@ definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "CUDA_ERROR_UNKNOWN"
 
 [build]
-#language = "python"
-#entry_point = "gdn_prefill_mix.py::run"
-#destination_passing_style = false
-
-# --- Parallel Triton reference solution -------------------------------------
-# To benchmark the from-scratch Triton implementation instead of the optimized
-# solution above, comment out the two lines above and uncomment the three below:
-
-language = "triton"
-entry_point = "gdn_prefill_triton_v5.py::run"
+language = "python"
+entry_point = "gdn_prefill_mix.py::run"
 destination_passing_style = false
+
+
+#language = "triton"
+#entry_point = "gdn_prefill_triton_v5.py::run"
+#destination_passing_style = false
