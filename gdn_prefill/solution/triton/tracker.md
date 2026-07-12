@@ -1,3 +1,15 @@
+
+We've progressed to decent numbers! Going ahead we will be tracking two workloads. One small, one large. 
+
+
+V6:
+
+ba08a83e-e151-4e16-bc70-abee6851604c: 77.66399905
+5b8a0e4b-5ed7-45d0-aec3-c2c154e515b1: 451.1680007
+
+
+There is a regression in smaller workloads because we wanted to move away from separate paths for now. We can revisit at the end if we still think a specialized path is required post all optimizaitons
+
 Workload ba08a83e-e151-4e16-bc70-abee6851604c (Taken because running complete benchmark is too much at the current slowness ;-;)
 
 total_seq_len 134
