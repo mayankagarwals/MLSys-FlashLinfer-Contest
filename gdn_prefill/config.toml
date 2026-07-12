@@ -10,10 +10,5 @@ author = "CUDA_ERROR_UNKNOWN"
 
 
 language = "triton"
-entry_point = "gdn_prefill_triton_v6.py::run"
+entry_point = "gdn_prefill_triton_v7.py::run"
 destination_passing_style = false
-
-
-#language = "triton"
-#entry_point = "gdn_prefill_triton_v5.py::run"
-#destination_passing_style = false
