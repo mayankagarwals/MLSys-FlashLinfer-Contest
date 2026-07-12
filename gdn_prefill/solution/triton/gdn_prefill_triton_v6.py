@@ -148,7 +148,7 @@ def _unit_lower_inverse(A, BT: tl.constexpr):
 
 
 @triton.jit
-def _batched_recurrent_sequence_kernel_1(
+def _kkt_inv_uw_kernel(
     k_HK,  # [T, Hqk, K]
     v_HV,  # [T, HV, V]
     A_log,  # [HV]
@@ -241,7 +241,7 @@ def _batched_recurrent_sequence_kernel_1(
 
 
 @triton.jit
-def _batched_recurrent_sequence_kernel_2(
+def _h_kernel(
     k_HK,  # [T, Hqk, K]
     g_cu,  # [T, HV]
     state_in_HVK,  # [N, HV, V, K]
@@ -330,7 +330,7 @@ def _batched_recurrent_sequence_kernel_2(
         
 
 @triton.jit
-def _batched_recurrent_sequence_kernel_3(
+def _o_kernel(
     q_HK,  # [T, Hqk, K]
     k_HK,  # [T, Hqk, K]
     g_cu,  # [T, HV]
@@ -508,7 +508,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         BV=BV,
     )
 
-    _batched_recurrent_sequence_kernel_1[(num_v_heads, upper_bound_chunks)](
+    _kkt_inv_uw_kernel[(num_v_heads, upper_bound_chunks)](
         k,
         v,
         A_log,
@@ -523,7 +523,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         total_chunks_ptr,
         **k1_meta,
     )
-    _batched_recurrent_sequence_kernel_2[(num_v_heads, num_v_blocks, num_seqs)](
+    _h_kernel[(num_v_heads, num_v_blocks, num_seqs)](
         k,
         g_cu,
         state,
@@ -536,7 +536,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         chunk_offsets,
         **k23_meta,
     )
-    _batched_recurrent_sequence_kernel_3[(num_v_heads, upper_bound_chunks, num_v_blocks)](
+    _o_kernel[(num_v_heads, upper_bound_chunks, num_v_blocks)](
         q,
         k,
         g_cu,
