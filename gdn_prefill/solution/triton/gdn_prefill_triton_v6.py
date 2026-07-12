@@ -148,241 +148,6 @@ def _unit_lower_inverse(A, BT: tl.constexpr):
 
 
 @triton.jit
-def _recurrent_sequence_kernel_1(
-    k_HK,  # [seq_len, Hqk, K]
-    v_HV,  # [seq_len, HV, V]
-    A_log,  # [HV]
-    a,  # [seq_len, HV]
-    dt_bias,  # [HV]
-    b,  # [seq_len, HV]
-    g_cu,  # [seq_len, HV]
-    seq_len,
-    u,
-    w,
-    NUM_HEADS: tl.constexpr,
-    NUM_QK_HEADS: tl.constexpr,
-    BT: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-):
-    head = tl.program_id(axis=0)
-    chunk_idx = tl.program_id(axis=1)
-
-    start = chunk_idx * BT
-
-    seq = start + tl.arange(0, BT)          # [BT]
-
-    token_head_offsets = seq * NUM_HEADS + head
-    token_mask = seq < seq_len
-
-    x = tl.load(a + token_head_offsets, mask=token_mask, other=0.0).to(tl.float32)
-    x += tl.load(dt_bias + head).to(tl.float32)
-    softplus_x = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
-    g = -tl.exp(tl.load(A_log + head).to(tl.float32)) * softplus_x
-    g = tl.where(token_mask, g, 0.0)
-    G = tl.cumsum(g, axis=0)
-    tl.store(g_cu + token_head_offsets, G, mask=token_mask)
-
-    b_value = tl.load(b + token_head_offsets, mask=token_mask, other=0.0).to(tl.float32)
-    B = 1.0 / (1.0 + tl.exp(-b_value))
-
-    dim = tl.arange(0, HEAD_DIM)
-    v_offsets = (
-        seq[:, None] * NUM_HEADS * HEAD_DIM
-        + head * HEAD_DIM
-        + dim[None, :]
-    )
-
-    qk_head = head // (NUM_HEADS // NUM_QK_HEADS)
-    k_offsets = (
-        seq[:, None] * NUM_QK_HEADS * HEAD_DIM
-        + qk_head * HEAD_DIM
-        + dim[None, :]
-    )
-    matrix_mask = seq[:, None] < seq_len
-
-    V = tl.load(v_HV + v_offsets, mask=matrix_mask, other=0.0).to(tl.float32)
-    K = tl.load(k_HK + k_offsets, mask=matrix_mask, other=0.0).to(tl.float32)
-
-    row = tl.arange(0, BT)[:, None]
-    col = tl.arange(0, BT)[None, :]
-    lower = row >= col
-
-    Gamma = tl.exp(tl.where(lower, G[:, None] - G[None, :], -float("inf")))
-    C = tl.dot(K, tl.trans(K))
-    C = Gamma * C
-    C = B[:, None] * C
-
-    lower_tri_mask = row > col
-    C = tl.where(lower_tri_mask, C, 0.0)
-
-    L = C
-    T = _unit_lower_inverse(L, BT=BT)
-    T = T * B[None, :]
-
-    U = tl.dot(T, V)
-    W = tl.dot((T * tl.exp(G[None, :])), K)
-
-    tl.store(u + v_offsets, U, matrix_mask)
-    tl.store(w + v_offsets, W, matrix_mask)
-
-
-@triton.jit
-def _recurrent_sequence_kernel_2(
-    k_HK,  # [seq_len, Hqk, K]
-    g_cu,  # [seq_len, HV]
-    state_in_HVK,  # [HV, V, K]
-    state_out_HVK,  # [HV, V, K]
-    seq_len,
-    u,
-    w,
-    chunk_state_out_ptr,
-    v_p_ptr,
-    NUM_CHUNKS: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-    NUM_QK_HEADS: tl.constexpr,
-    BT: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BV: tl.constexpr,
-):
-    head = tl.program_id(axis=0)
-    v_offset_id = tl.program_id(axis=1)
-
-    bv_offsets = v_offset_id * BV + tl.arange(0, BV)
-    state_hkv_offsets = (
-        head * (HEAD_DIM * HEAD_DIM)
-        + (tl.arange(0, HEAD_DIM)[:, None]) * HEAD_DIM
-        + bv_offsets[None, :]
-    )
-    state_hvk_offsets = (
-        head * (HEAD_DIM * HEAD_DIM)
-        + bv_offsets[None, :] * HEAD_DIM
-        + tl.arange(0, HEAD_DIM)[:, None]
-    )
-    S_in = tl.load(state_in_HVK + state_hkv_offsets)
-
-    for i in range(NUM_CHUNKS):
-        start = i * BT
-        seq = start + tl.arange(0, BT)
-
-        offsets = seq * NUM_HEADS + head
-        mask = seq < seq_len
-        G = tl.load(g_cu + offsets, mask=mask, other=0.0)
-
-        dim = tl.arange(0, HEAD_DIM)
-        qk_head = head // (NUM_HEADS // NUM_QK_HEADS)
-        k_offsets = (
-            seq[:, None] * NUM_QK_HEADS * HEAD_DIM
-            + qk_head * HEAD_DIM
-            + dim[None, :]
-        )
-        w_offsets = (
-            seq[:, None] * NUM_HEADS * HEAD_DIM
-            + head * HEAD_DIM
-            + dim[None, :]
-        )
-        v_offsets = (
-            seq[:, None] * NUM_HEADS * HEAD_DIM
-            + head * HEAD_DIM
-            + bv_offsets[None, :]
-        )
-        mask = seq[:, None] < seq_len
-
-        K = tl.load(k_HK + k_offsets, mask=mask, other=0.0).to(tl.float32)
-        U = tl.load(u + v_offsets, mask=mask, other=0.0).to(tl.float32)
-        W = tl.load(w + w_offsets, mask=mask, other=0.0).to(tl.float32)
-
-        V_p = U - tl.dot(W, S_in)
-        tl.store(v_p_ptr + v_offsets, V_p, mask)
-
-        state_chunk_out_offsets = (
-            i * (NUM_HEADS * HEAD_DIM * HEAD_DIM) + state_hkv_offsets
-        )
-        tl.store(chunk_state_out_ptr + state_chunk_out_offsets, S_in)
-
-        chunk_len = tl.minimum(BT, seq_len - start)
-        last_G = tl.sum(tl.where(tl.arange(0, BT) == chunk_len - 1, G, 0.0))
-        S_out = tl.exp(last_G) * S_in + tl.dot(
-            tl.trans(K), (V_p * tl.exp(last_G - G[:, None]))
-        )
-
-        S_in = S_out
-
-    tl.store(state_out_HVK + state_hvk_offsets, S_in)
-
-
-@triton.jit
-def _recurrent_sequence_kernel_3(
-    q_HK,  # [seq_len, Hqk, K]
-    k_HK,  # [seq_len, Hqk, K]
-    g_cu,  # [seq_len, HV]
-    scale,
-    out,  # [seq_len, HV, V]
-    seq_len,
-    chunk_state_out_ptr,
-    v_p_ptr,
-    NUM_HEADS: tl.constexpr,
-    NUM_QK_HEADS: tl.constexpr,
-    BT: tl.constexpr,
-    HEAD_DIM: tl.constexpr,
-    BV: tl.constexpr,
-):
-    head = tl.program_id(axis=0)
-    chunk_idx = tl.program_id(axis=1)
-    v_offset_id = tl.program_id(axis=2)
-
-    bv_offsets = v_offset_id * BV + tl.arange(0, BV)
-    state_head_offsets = (
-        head * (HEAD_DIM * HEAD_DIM)
-        + (tl.arange(0, HEAD_DIM)[:, None]) * HEAD_DIM
-        + bv_offsets[None, :]
-    )
-    chunk_state_out_offsets = (
-        chunk_idx * (NUM_HEADS * HEAD_DIM * HEAD_DIM) + state_head_offsets
-    )
-    chunk_state_out = tl.load(chunk_state_out_ptr + chunk_state_out_offsets)
-
-    start = chunk_idx * BT
-    seq = start + tl.arange(0, BT)
-
-    offsets = seq * NUM_HEADS + head
-    mask = seq < seq_len
-    G = tl.load(g_cu + offsets, mask=mask, other=0.0)
-
-    dim = tl.arange(0, HEAD_DIM)
-    qk_head = head // (NUM_HEADS // NUM_QK_HEADS)
-    qk_offsets = (
-        seq[:, None] * NUM_QK_HEADS * HEAD_DIM
-        + qk_head * HEAD_DIM
-        + dim[None, :]
-    )
-    v_offsets = (
-        seq[:, None] * NUM_HEADS * HEAD_DIM
-        + head * HEAD_DIM
-        + bv_offsets[None, :]
-    )
-    mask = seq[:, None] < seq_len
-
-    K = tl.load(k_HK + qk_offsets, mask=mask, other=0.0).to(tl.float32)
-    Q = tl.load(q_HK + qk_offsets, mask=mask, other=0.0).to(tl.float32)
-
-    row = tl.arange(0, BT)[:, None]
-    col = tl.arange(0, BT)[None, :]
-    lower = row >= col
-
-    M = tl.where(row >= col, 1.0, 0.0)
-    Gamma = tl.exp(tl.where(lower, G[:, None] - G[None, :], -float("inf")))
-    M_p = M * Gamma
-
-    V_p = tl.load(v_p_ptr + v_offsets, mask)
-    O = tl.exp(G[:, None]) * tl.dot(Q, chunk_state_out) + tl.dot(
-        (tl.dot(Q, tl.trans(K)) * M_p), V_p
-    )
-
-    scaled_O = (scale * O).to(tl.bfloat16)
-    tl.store(out + v_offsets, scaled_O, mask)
-
-
-@triton.jit
 def _batched_recurrent_sequence_kernel_1(
     k_HK,  # [T, Hqk, K]
     v_HV,  # [T, HV, V]
@@ -395,6 +160,7 @@ def _batched_recurrent_sequence_kernel_1(
     w,
     cu_seqlens,
     chunk_indices,
+    total_chunks_ptr,
     NUM_HEADS: tl.constexpr,
     NUM_QK_HEADS: tl.constexpr,
     BT: tl.constexpr,
@@ -402,6 +168,9 @@ def _batched_recurrent_sequence_kernel_1(
 ):
     head = tl.program_id(axis=0)
     global_chunk_id = tl.program_id(axis=1)
+
+    if global_chunk_id >= tl.load(total_chunks_ptr).to(tl.int32):
+        return
 
     seq_id = tl.load(chunk_indices + global_chunk_id * 2).to(tl.int32)
     local_chunk_idx = tl.load(chunk_indices + global_chunk_id * 2 + 1).to(tl.int32)
@@ -571,6 +340,7 @@ def _batched_recurrent_sequence_kernel_3(
     v_p_ptr,
     cu_seqlens,
     chunk_indices,
+    total_chunks_ptr,
     NUM_HEADS: tl.constexpr,
     NUM_QK_HEADS: tl.constexpr,
     BT: tl.constexpr,
@@ -580,6 +350,9 @@ def _batched_recurrent_sequence_kernel_3(
     head = tl.program_id(axis=0)
     global_chunk_id = tl.program_id(axis=1)
     v_offset_id = tl.program_id(axis=2)
+
+    if global_chunk_id >= tl.load(total_chunks_ptr).to(tl.int32):
+        return
 
     seq_id = tl.load(chunk_indices + global_chunk_id * 2).to(tl.int32)
     local_chunk_idx = tl.load(chunk_indices + global_chunk_id * 2 + 1).to(tl.int32)
@@ -642,95 +415,6 @@ def _batched_recurrent_sequence_kernel_3(
     tl.store(out + v_offsets, scaled_O, mask)
 
 
-def _recurrent_sequence(
-    q_HK: torch.Tensor,
-    k_HK: torch.Tensor,
-    v_HV: torch.Tensor,
-    A_log: torch.Tensor,
-    a: torch.Tensor,
-    dt_bias: torch.Tensor,
-    b: torch.Tensor,
-    state_HVK: torch.Tensor,
-    state_out_HVK: torch.Tensor,
-    scale: float,
-    out: torch.Tensor,
-) -> None:
-    """Run one sequence into caller-owned output and state storage."""
-    seq_len, num_heads, head_dim = v_HV.shape
-    num_qk_heads = k_HK.shape[1]
-    BT = 64
-    BV = 32
-    num_chunks = (seq_len + BT - 1) // BT
-    num_v_blocks = head_dim // BV
-
-    w = torch.empty(
-        seq_len, num_heads, head_dim, device=k_HK.device, dtype=torch.float32
-    )
-    u = torch.empty(
-        seq_len, num_heads, head_dim, device=v_HV.device, dtype=torch.float32
-    )
-    g_cu = torch.empty(seq_len, num_heads, device=v_HV.device, dtype=torch.float32)
-    chunk_state_out_ptr = torch.empty(
-        num_chunks,
-        num_heads,
-        head_dim,
-        head_dim,
-        device=k_HK.device,
-        dtype=torch.float32,
-    )
-    v_p_ptr = torch.empty(
-        seq_len, num_heads, head_dim, device=k_HK.device, dtype=torch.float32
-    )
-
-    k_meta = dict(
-        NUM_HEADS=num_heads,
-        NUM_QK_HEADS=num_qk_heads,
-        BT=BT,
-        HEAD_DIM=head_dim,
-    )
-
-    _recurrent_sequence_kernel_1[(num_heads, num_chunks)](
-        k_HK,
-        v_HV,
-        A_log,
-        a,
-        dt_bias,
-        b,
-        g_cu,
-        seq_len,
-        u,
-        w,
-        **k_meta,
-    )
-    _recurrent_sequence_kernel_2[(num_heads, num_v_blocks)](
-        k_HK,
-        g_cu,
-        state_HVK,
-        state_out_HVK,
-        seq_len,
-        u,
-        w,
-        chunk_state_out_ptr,
-        v_p_ptr,
-        NUM_CHUNKS=num_chunks,
-        BV=BV,
-        **k_meta,
-    )
-    _recurrent_sequence_kernel_3[(num_heads, num_chunks, num_v_blocks)](
-        q_HK,
-        k_HK,
-        g_cu,
-        scale,
-        out,
-        seq_len,
-        chunk_state_out_ptr,
-        v_p_ptr,
-        BV=BV,
-        **k_meta,
-    )
-
-
-
 @torch.no_grad()
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     """Gated DeltaNet prefill (k-last state layout [H, V, K]).
@@ -756,39 +440,6 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
 
     if scale is None or scale == 0.0:
         scale = 1.0 / math.sqrt(head_size)
-
-    # The common single-sequence case spans the complete packed input. Avoid
-    # synchronizing cu_seqlens to the CPU and return the kernel outputs directly.
-    if num_seqs == 1:
-        if state is not None:
-            state_HVK = state[0]
-        else:
-            state_HVK = torch.zeros(
-                (num_sab_heads, head_size, head_size),
-                dtype=torch.float32,
-                device=device,
-            )
-
-        output = torch.empty(
-            (total_seq_len, num_sab_heads, head_size),
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        state_out_HVK = torch.empty_like(state_HVK)
-        _recurrent_sequence(
-            q,
-            k,
-            v,
-            A_log,
-            a,
-            dt_bias,
-            b,
-            state_HVK,
-            state_out_HVK,
-            scale,
-            output,
-        )
-        return output, state_out_HVK.unsqueeze(0)
 
     BT = 64
     BV = 32
@@ -817,7 +468,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         BT=BT,
         BLOCK_SIZE=triton.next_power_of_2(num_seqs),
     )
-    total_num_chunks = int(chunk_offsets[-1].item())
+    total_chunks_ptr = chunk_offsets[num_seqs:]
 
     if state is None:
         state = torch.zeros(
@@ -834,7 +485,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     w = torch.empty_like(u)
     g_cu = torch.empty(total_seq_len, num_v_heads, device=device, dtype=torch.float32)
     chunk_state_out = torch.empty(
-        total_num_chunks,
+        upper_bound_chunks,
         num_v_heads,
         head_size,
         head_size,
@@ -857,8 +508,20 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         BV=BV,
     )
 
-    _batched_recurrent_sequence_kernel_1[(num_v_heads, total_num_chunks)](
-        k, v, A_log, a, dt_bias, b, g_cu, u, w, cu_seqlens, chunk_indices, **k1_meta
+    _batched_recurrent_sequence_kernel_1[(num_v_heads, upper_bound_chunks)](
+        k,
+        v,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        g_cu,
+        u,
+        w,
+        cu_seqlens,
+        chunk_indices,
+        total_chunks_ptr,
+        **k1_meta,
     )
     _batched_recurrent_sequence_kernel_2[(num_v_heads, num_v_blocks, num_seqs)](
         k,
@@ -873,7 +536,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         chunk_offsets,
         **k23_meta,
     )
-    _batched_recurrent_sequence_kernel_3[(num_v_heads, total_num_chunks, num_v_blocks)](
+    _batched_recurrent_sequence_kernel_3[(num_v_heads, upper_bound_chunks, num_v_blocks)](
         q,
         k,
         g_cu,
@@ -883,6 +546,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         v_p,
         cu_seqlens,
         chunk_indices,
+        total_chunks_ptr,
         **k23_meta,
     )
     return output, new_state
