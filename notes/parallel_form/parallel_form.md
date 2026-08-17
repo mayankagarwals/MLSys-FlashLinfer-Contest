@@ -521,7 +521,7 @@ $$
 \boxed{
 R_i
 =
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top u_j
 }
 $$
@@ -691,7 +691,7 @@ $$
 \boxed{
 R_i
 =
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top u_j
 }
 $$
@@ -764,7 +764,7 @@ From the previous two sections, we derived the compressions
 $$
 H_iH_{i-1}\cdots H_1
 =
-I-\sum_{j\leq i}k_j^\top \hat{w}_j
+I-\sum_{j=1}^{i}k_j^\top \hat{w}_j
 $$
 
 and
@@ -772,7 +772,7 @@ and
 $$
 R_i
 =
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top u_j.
 $$
 
@@ -785,10 +785,10 @@ S_i
 =
 G_i
 \left(
-I-\sum_{j\leq i}k_j^\top\hat{w}_j
+I-\sum_{j=1}^{i}k_j^\top\hat{w}_j
 \right)S_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top u_j.
 $$
 
@@ -799,10 +799,10 @@ S_i
 =
 G_iS_0
 -
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 G_i k_j^\top\hat{w}_jS_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top u_j.
 $$
 
@@ -837,7 +837,7 @@ S_i
 =
 G_iS_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top
 \left(
 u_j-G_j\hat{w}_jS_0
@@ -868,7 +868,7 @@ S_i
 =
 G_iS_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top v'_j.
 }
 $$
@@ -912,7 +912,7 @@ S_i
 =
 G_iS_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top v_j.
 $$
 
@@ -939,7 +939,7 @@ S_i
 =
 G_iS_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top v'_j,
 }
 $$
@@ -955,7 +955,7 @@ S_i
 =
 G_iS_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top v'_j,
 $$
 
@@ -969,7 +969,7 @@ G_i=\prod_{t=1}^{i}g_t,
 \frac{G_i}{G_j}
 =
 \prod_{t=j+1}^{i}g_t,
-\qquad j\leq i.
+\qquad 1\leq j\leq i.
 $$
 
 The corrected value is
@@ -1398,7 +1398,7 @@ $$
 
 ### 4. Deriving the Decayed Causal Mask $M'$
 
-For an output at position $i$, only tokens $j\leq i$ may contribute.
+For an output at position $i$, only tokens $1\leq j\leq i$ may contribute.
 
 Define the ordinary causal mask
 
@@ -1406,7 +1406,7 @@ $$
 M_{ij}
 =
 \begin{cases}
-1, & j\leq i,\\
+1, & 1\leq j\leq i,\\
 0, & j>i.
 \end{cases}
 $$
@@ -1443,7 +1443,7 @@ $$
 M'_{ij}
 =
 \begin{cases}
-\Gamma_{ij}, & j\leq i,\\
+\Gamma_{ij}, & 1\leq j\leq i,\\
 0, & j>i.
 \end{cases}
 $$
@@ -1469,7 +1469,7 @@ S_i
 =
 G_iS_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top v'_j.
 $$
 
@@ -1555,7 +1555,7 @@ o_i
 q_i
 \left(
 G_iS_0+
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}k_j^\top v'_j
 \right).
 $$
@@ -1567,7 +1567,7 @@ o_i
 =
 G_iq_iS_0
 +
-\sum_{j\leq i}
+\sum_{j=1}^{i}
 \Gamma_{ij}
 (q_i k_j^\top)v'_j.
 $$
@@ -1604,7 +1604,7 @@ $$
 \left[(QK^\top)\odot M'\right]_{ij}
 =
 \begin{cases}
-\Gamma_{ij}(q_i k_j^\top), & j\leq i,\\
+\Gamma_{ij}(q_i k_j^\top), & 1\leq j\leq i,\\
 0, & j>i.
 \end{cases}
 $$
