@@ -30,7 +30,8 @@ def _compute_gate_and_beta(
     b: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """g = exp(-exp(A_log) * softplus(a + dt_bias)),  beta = sigmoid(b)."""
-    x = a.float() + dt_bias.float()  # [T, HV]
+    # Upcast bf16 activations to f32 before the numerically sensitive gate math.
+    x = a.float() + dt_bias.float()  # f32 [T, HV]
     g = -torch.exp(A_log.float()) * F.softplus(x)  # [T, HV]
     beta = torch.sigmoid(b.float())  # [T, HV]
     return g, beta
@@ -60,15 +61,15 @@ def _unit_lower_inverse(A_orig, BT: tl.constexpr):
 
 @triton.jit
 def _recurrent_sequence_kernel(
-    q_HK,  # [seq_len, HV, K]   (q broadcast to HV heads)
-    k_HK,  # [seq_len, HV, K]
-    v_HV,  # [seq_len, HV, V]
-    g_H,  # [seq_len, HV]
-    beta_H,  # [seq_len, HV]
-    state_HKV,  # [HV, K, V]  (k-first internal layout)
-    scale,
-    out, # [seq_len, HV, K], 
-    seq_len,
+    q_HK,  # bf16 [seq_len, HV, K] (q broadcast to HV heads)
+    k_HK,  # bf16 [seq_len, HV, K]
+    v_HV,  # bf16 [seq_len, HV, V]
+    g_H,  # f32 [seq_len, HV]
+    beta_H,  # f32 [seq_len, HV]
+    state_HKV,  # f32 [HV, K, V] (k-first internal layout; updated in place)
+    scale,  # f32 scalar
+    out,  # bf16 [seq_len, HV, V]
+    seq_len,  # i32 scalar
     NUM_HEADS: tl.constexpr,
     BT: tl.constexpr, 
     HEAD_DIM: tl.constexpr,
@@ -147,14 +148,14 @@ def _recurrent_sequence_kernel(
 
 # === [Triton replacement point -- Stages 2-4: per-sequence delta rule] =======
 def _recurrent_sequence(
-    q_HK: torch.Tensor,  # [seq_len, HV, K]   (q broadcast to HV heads)
-    k_HK: torch.Tensor,  # [seq_len, HV, K]
-    v_HV: torch.Tensor,  # [seq_len, HV, V]
-    g_H: torch.Tensor,  # [seq_len, HV]
-    beta_H: torch.Tensor,  # [seq_len, HV]
-    state_HKV: torch.Tensor,  # [HV, K, V]  (k-first internal layout)
-    scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    q_HK: torch.Tensor,  # bf16 [seq_len, HV, K] (q broadcast to HV heads)
+    k_HK: torch.Tensor,  # bf16 [seq_len, HV, K]
+    v_HV: torch.Tensor,  # bf16 [seq_len, HV, V]
+    g_H: torch.Tensor,  # f32 [seq_len, HV]
+    beta_H: torch.Tensor,  # f32 [seq_len, HV]
+    state_HKV: torch.Tensor,  # f32 [HV, K, V] (k-first internal layout)
+    scale: float,  # f32 scalar
+) -> tuple[torch.Tensor, torch.Tensor]:  # (bf16 [seq_len, HV, V], f32 [HV, K, V])
     """One sequence of the gated delta rule. Returns (output[seq_len,HV,V], state)."""
     seq_len, num_heads, head_dim = v_HV.shape
     out = q_HK.new_zeros(seq_len, num_heads, head_dim)
